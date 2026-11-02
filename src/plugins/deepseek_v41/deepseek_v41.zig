@@ -1497,6 +1497,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const Config, w: *Weights, s: S, opts:
     }
     try evalWeights(m);
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages\n", .{ n_layers, m.engrams.len, n_stages });
+    if (m.dec.moe_fp4 != null) log.info("deepseek_v41: fused mxfp4 MoE decode kernels on\n", .{});
     return m;
 }
 
