@@ -32,6 +32,19 @@ pub const DrafterStepResult = struct {
     accepted_tokens: u32,
 };
 
+/// The last budgeted token is already known. The caller checked stops and drained any pending forward.
+pub fn finishKnownToken(self: *Generator, allocator: std.mem.Allocator) !DrafterStepResult {
+    const tokens = try allocator.alloc(u32, 1);
+    errdefer allocator.free(tokens);
+    tokens[0] = self.next_token_id;
+    try self.generated_ids.append(allocator, tokens[0]);
+    self.advanceStep(1);
+    self.unforwarded_tail = 1;
+    self.done = true;
+    self.finish_reason = "length";
+    return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+}
+
 /// Drafter-assisted decode step. Mirrors `nextPld` but the draft comes
 /// from `block_size - 1` autoregressive forwards through the Gemma 4
 /// assistant drafter (cross-attending into target's KV) instead of an

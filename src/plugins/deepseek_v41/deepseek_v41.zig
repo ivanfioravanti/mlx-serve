@@ -500,6 +500,7 @@ pub const Dsv41Model = struct {
     /// from an arange per call otherwise): gate/up `[1, k]` zeros, down `[1, k]` 0..k-1.
     lhs_gu: A = none,
     lhs_dn: A = none,
+    sort_batch: bool = false,
     /// `qat` per kind, compiled at init (null: the op chain).
     /// Per trunk layer: its decode-width stretches compiled (`Region`).
     regions: []LayerRegions = &.{},
@@ -531,6 +532,10 @@ pub const Dsv41Model = struct {
     exact: Exact = .{},
     /// Exact verify blocks that fell to the batched kernels (`exactMiss`).
     exact_misses: u64 = 0,
+    exact_ffn_group: bool = false,
+    grouped_verify_layers: u64 = 0,
+    exact_attn_group: bool = false,
+    grouped_attn_layers: u64 = 0,
     /// A pair worker exact serves anyway: the gate's single-process worker (`decode/exact_test.zig`), whose host is
     /// the test itself. A real pair's processes do not agree on the setting, so exact leaves them alone.
     exact_pair_ok: bool = false,
@@ -1660,7 +1665,7 @@ pub fn buildIdxScoreKernel() !mlx.mlx_fast_metal_kernel {
     return buildKernel("dsv41_index_scores", &IDX_INS, &.{"scores"}, IDX_SCORE_SOURCE, "");
 }
 
-pub const ATTN_INS = [_][*:0]const u8{ "q", "ring", "comp", "topk", "sink", "meta", "scal" };
+pub const ATTN_INS = [_][*:0]const u8{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "fresh" };
 pub const ATTN_SOFTMAX_INS = [_][*:0]const u8{ "lw", "lc", "topk", "sink", "meta", "scal" };
 pub const ATTN_DEC_INS = ATTN_INS ++ [_][*:0]const u8{"periods"};
 pub const ATTN_MERGE_INS = [_][*:0]const u8{ "pacc", "pm", "pl", "sink", "meta", "periods" };
@@ -1941,8 +1946,18 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         const r = ci(R);
         u.* = .{ .pre = try ownConst(m, &.{ r, 1, ci(cfg.hidden_size) }, .bfloat16, 0), .post = try ownConst(m, &.{ r, 1 }, .float32, 1), .comb = try ownConst(m, &.{ r, 1, 1 }, .float32, 0) };
     };
+    m.sort_batch = env.one(.MLX_SERVE_DSV41_SORT_BATCH) and env.one(.MLX_SERVE_DSV41_PAIRED_QMV) and
+        mlx.streamIsGpu(s) and !device.naxAvailable() and device.deviceGeneration().gen == 15 and
+        opts.tp == null and opts.pair == null and !opts.streamed_experts and opts.quant == null and m.act == .bfloat16 and
+        cfg.hidden_size == 5120 and cfg.moe_intermediate_size == 2304 and cfg.num_experts == 384 and cfg.num_experts_per_tok == 6 and
+        (for (m.layers[0..n_layers]) |ly| {
+            const gu = ly.experts.gu orelse break false;
+            if (gu.qp.mode != .mxfp4 or ly.experts.down.qp.mode != .mxfp4) break false;
+        } else true);
     try compileRegions(m);
     m.exact = exactWanted();
+    m.exact_ffn_group = env.one(.MLX_SERVE_DSV41_VERIFY_FFN);
+    m.exact_attn_group = env.one(.MLX_SERVE_DSV41_VERIFY_ATTN);
     if (m.exact.on) {
         // Proven (decode/exact_test.zig, the live corpus) only where every verify row takes the fused decode kernels'
         // rows (`blockFusedRows`): an Apple GPU without NAX (the fused NAX indexer and attention give a verify row other
@@ -2274,6 +2289,11 @@ pub const Ring = struct {
     buf: A,
     cap: usize,
     width: usize,
+    /// While a decode block builds its attention (borrowed from its scope): the buffer before this step's write and
+    /// the step's rows from position `fresh_p0`, so attention does not wait for the write.
+    prev: A = none,
+    fresh: A = none,
+    fresh_p0: usize = 0,
 
     fn init(cap: usize, width: usize, dt: mlx.mlx_dtype, s: S) !Ring {
         var z = mlx.mlx_array_new();
@@ -3436,7 +3456,8 @@ pub fn attnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, q: A, win:
     if (m.dec.attn) |k| if (try dkern.attn.partials(sc, k, m, q, win, comp_rows, topk, p0, scale)) |p|
         return attnMerge(sc, m, ly, .{ p.acc, p.m, p.l }, p.splits, try attnMeta(sc, m, q, win, comp_rows, topk, p0), inv);
     const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
-    return attnDecodeSplit(sc, m, ly, q, win, comp_rows, topk, p0, scale, attnSplits(m.cfg.sliding_window + K), inv);
+    const spl: c_int = if (std.c.getenv("DSV41_ATTN_SPLITS")) |v| (std.fmt.parseInt(c_int, std.mem.span(v), 10) catch 1) else attnSplits(m.cfg.sliding_window + K);
+    return attnDecodeSplit(sc, m, ly, q, win, comp_rows, topk, p0, scale, spl, inv);
 }
 
 pub fn attnDecodeSplit(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, q: A, win: Ring, comp_rows: A, topk: A, p0: usize, scale: f32, splits: c_int, inv: ?A) !A {
@@ -3448,8 +3469,37 @@ pub fn attnDecodeSplit(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, q: A,
     const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
     const meta = try attnMeta(sc, m, q, win, comp_rows, topk, p0);
     const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
+    const fresh = win.fresh.ctx != null;
+    const ring = if (fresh) win.prev else win.buf;
+    const fmeta = if (fresh) try sc.ints(&.{ @intCast(p0), @intCast(L), @intCast(K), @intCast(m.cfg.sliding_window), @intCast(win.cap), if (K > 0) @intCast(dim(comp_rows, 0)) else 0, @intCast(win.fresh_p0) }, &.{7}) else meta;
     const comp = if (K > 0) try sc.astype(comp_rows, mlx.mlx_array_dtype(win.buf)) else win.buf;
     const ids = if (K > 0) try sc.astype(topk, .int32) else meta;
+    // PROF (temporary): DSV41_ATTN_ONE = the splits side by side in one 1024-thread threadgroup a (row, head), merged
+    // and inverse-roped in the same launch (`ATTN_ONE_SOURCE`): split + merge's bits.
+    if (splits > 1 and splits * ATTN_DEC_NSG * 32 <= 1024 and attnOneOn()) {
+        const tg: c_int = splits * ATTN_DEC_NSG * 32;
+        if (attn_one_kernel == null) attn_one_kernel = try buildKernel("dsv41_attn_one", &ATTN_DEC_INS, &.{"out"}, ATTN_ONE_SOURCE, UNROPE_HEADER);
+        const oc = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(oc);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(oc, &[_]c_int{ ci(L), ci(H), ci(D) }, 3, m.act));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(oc, ci(H) * tg, ci(L), 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(oc, tg, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(oc, "D", ci(D)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(oc, "NSG", ATTN_DEC_NSG));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(oc, "S", splits));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(oc, "KT", mlx.mlx_array_dtype(win.buf)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(oc, "OT", m.act));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(oc, "RD", rd));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(oc, "FRESH", fresh));
+        const oi = [_]A{ q, ring, comp, ids, ly.sink, fmeta, scal, if (fresh) win.fresh else win.buf, periods };
+        const oiv = mlx.mlx_vector_array_new_data(&oi, oi.len);
+        defer _ = mlx.mlx_vector_array_free(oiv);
+        var oov = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(oov);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&oov, attn_one_kernel.?, oiv, oc, sc.s));
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_vector_array_get(&o, oov, 0), &o);
+    }
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     if (splits == 1) {
@@ -3467,7 +3517,8 @@ pub fn attnDecodeSplit(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, q: A,
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "KT", mlx.mlx_array_dtype(win.buf)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", m.act));
     if (splits == 1) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RD", rd));
-    const inputs = [_]A{ q, win.buf, comp, ids, ly.sink, meta, scal, periods };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "FRESH", fresh));
+    const inputs = [_]A{ q, ring, comp, ids, ly.sink, fmeta, scal, if (fresh) win.fresh else win.buf, periods };
     const iv = mlx.mlx_vector_array_new_data(&inputs, if (splits == 1) inputs.len else inputs.len - 1);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -3484,6 +3535,247 @@ pub fn attnDecodeSplit(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, q: A,
         _ = try sc.keep(x.*);
     }
     return attnMerge(sc, m, ly, parts, splits, meta, inv);
+}
+
+/// `ATTN_SPLIT_SOURCE` for every split of a (row, head) at once, then `ATTN_MERGE_SOURCE`, in one launch: a split's
+/// NSG simdgroups are simdgroups [split * NSG, (split + 1) * NSG) of the threadgroup, their accumulators staged
+/// through threadgroup memory VP channels a pass (the whole set is past the 32 KB a threadgroup has).
+pub const ATTN_ONE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/attn_one.metal");
+// PROF (temporary)
+var attn_one_kernel: ?mlx.mlx_fast_metal_kernel = null;
+pub var attn_one_force: ?bool = null;
+fn attnOneOn() bool {
+    return attn_one_force orelse (std.c.getenv("DSV41_ATTN_ONE") != null);
+}
+var prof_tie: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
+/// PROF (temporary): a copy of `x` that waits for `dep`; `tiny`: a 32-thread launch writing 32 values of it.
+fn profTie(sc: *Scope, x: A, dep: A, tiny: bool) !A {
+    const slot = &prof_tie[@intFromBool(tiny)];
+    if (slot.* == null) slot.* = try buildKernel(if (tiny) "dsv41_tiny" else "dsv41_tie", &.{ "x", "d" }, &.{"y"}, "const uint e = thread_position_in_grid.x; y[e] = x[e]; if (e == 9999999) y[e] = d[0];", "");
+    const sh = mlx.getShape(x);
+    var n: c_int = 1;
+    for (sh) |v| n *= v;
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    if (tiny) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{32}, 1, mlx.mlx_array_dtype(x))) else try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, sh.ptr, sh.len, mlx.mlx_array_dtype(x)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, if (tiny) 32 else n, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, if (tiny) 32 else 256, 1, 1));
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, dep }, 2);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, slot.*.?, iv, c, sc.s));
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+fn profInt(name: [*:0]const u8) usize {
+    return if (std.c.getenv(name)) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0) else 0;
+}
+/// PROF (temporary): `attnDecode` with the bits unchanged and more launches, to read a cost off the slope:
+/// DSV41_TINY = k tiny chained launches ahead of it (and one copy of q), DSV41_ATTN_DUP = k more runs of it, each on a
+/// copy of q that waits for the run before.
+fn profAttn(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, q_in: A, win: Ring, comp_rows: A, topk: A, p0: usize, scale: f32, inv: ?A) !A {
+    var q = try profPages(sc, m, (@intFromPtr(ly) - @intFromPtr(m.layers.ptr)) / @sizeOf(Layer), q_in, 1);
+    const tiny = profInt("DSV41_TINY");
+    if (tiny > 0) {
+        var t = try profTie(sc, q, q, true);
+        for (1..tiny) |_| t = try profTie(sc, t, t, true);
+        q = try profTie(sc, q, t, false);
+    }
+    // DSV41_PF_WHAT (bits: 1 wo_a.w, 2 wo_a.s and b, 4 wo_b.w, 8 wo_b.s and b; +16: another layer's, the control) read
+    // ahead by `profTouch`. DSV41_PF_WHERE: 0 = its own launches between attention and attn_out, 1 = beside the split
+    // launch (the merge launch waits for them), 2 = beside the merge launch (a copy of the heads waits for them).
+    const what = profInt("DSV41_PF_WHAT");
+    const where = profInt("DSV41_PF_WHERE");
+    var toks: [4]A = @splat(none);
+    var nt: usize = 0;
+    if (what != 0) {
+        const li = (@intFromPtr(ly) - @intFromPtr(m.layers.ptr)) / @sizeOf(Layer);
+        const src = if (what & 16 != 0) &m.layers[(li + m.layers.len / 2) % m.layers.len] else ly;
+        for ([_]A{ src.wo_a.w, src.wo_a.s, src.wo_a.b, src.wo_b.w, src.wo_b.s, src.wo_b.b }, [_]usize{ 1, 2, 2, 4, 8, 8 }) |x, bit| {
+            if (what & bit == 0 or x.ctx == null) continue;
+            const t = try profTouch(sc, x);
+            if (nt < toks.len) {
+                toks[nt] = t;
+                nt += 1;
+            }
+        }
+    }
+    if (where == 1) prof_merge_deps = toks;
+    defer prof_merge_deps = @splat(none);
+    var y = try attnDecode(sc, m, ly, q, win, comp_rows, topk, p0, scale, inv);
+    for (0..profInt("DSV41_ATTN_DUP")) |_| y = try attnDecode(sc, m, ly, try profTie(sc, q, y, false), win, comp_rows, topk, p0, scale, inv);
+    if (where != 1 and nt > 0) {
+        // one copy waits for every token: the tokens share an epoch.
+        var dep = toks[0];
+        for (toks[1..nt]) |t| dep = try profJoin(sc, dep, t);
+        y = try profTie(sc, y, dep, false);
+    }
+    return y;
+}
+var prof_pages: ?mlx.mlx_fast_metal_kernel = null;
+/// PROF (temporary): `x` (the layer's stream at DSV41_PG_AT 0, the attention's heads q at 1) behind ONE launch that
+/// loads one word every DSV41_PG_STEP bytes (default 16384, a page) of layer li + DSV41_PG_LAYER's weights
+/// (DSV41_PG_WHAT bits: 1 wq_b, 2 wo_a, 4 wo_b, 8 wq_a + wkv, 16 the shared expert, 32 gate_w; +64 their scales and
+/// biases too), then a copy of `x` that waits for it. DSV41_PG_LAYER 99 = the layer half the stack away (control).
+fn profPages(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, at: usize) !A {
+    const what = profInt("DSV41_PG_WHAT");
+    if (what == 0 or profInt("DSV41_PG_AT") != at) return x;
+    const off = profInt("DSV41_PG_LAYER");
+    const lj = if (off == 99) (li + m.layers.len / 2) % m.layers.len else li + off;
+    if (lj >= m.layers.len) return x;
+    const ly = &m.layers[lj];
+    var arr: [8]A = undefined;
+    var n: usize = 0;
+    const lins = [_]struct { usize, ?*const Lin }{
+        .{ 1, &ly.wq_b },                                .{ 2, &ly.wo_a },                                .{ 4, &ly.wo_b },
+        .{ 8, &ly.wq_a },                                .{ 8, &ly.wkv },                                 .{ 8, if (ly.q_kv) |*v| v else null },
+        .{ 16, if (ly.shared_gu) |*v| v else null }, .{ 16, &ly.shared[0] }, .{ 16, &ly.shared[1] },
+        .{ 16, &ly.shared[2] },
+    };
+    for (lins) |e| {
+        const l = e[1] orelse continue;
+        if (what & e[0] == 0) continue;
+        for ([_]A{ l.w, l.s, l.b }, 0..) |w, k| {
+            if (w.ctx == null or (k > 0 and what & 64 == 0) or n == arr.len) continue;
+            arr[n] = w;
+            n += 1;
+        }
+    }
+    if (what & 32 != 0 and n < arr.len) {
+        arr[n] = ly.gate_w;
+        n += 1;
+    }
+    if (n == 0) return x;
+    if (prof_pages == null) prof_pages = try buildKernel("dsv41_pages", &.{ "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7" }, &.{"y"}, "const uint e = thread_position_in_grid.x; uint acc = 0; for (uint k = 0; k < 16; ++k) { const uint j = e * 16 + k; if (j * S0 < T0) acc += uint(x0[j * S0]); if (j * S1 < T1) acc += uint(x1[j * S1]); if (j * S2 < T2) acc += uint(x2[j * S2]); if (j * S3 < T3) acc += uint(x3[j * S3]); if (j * S4 < T4) acc += uint(x4[j * S4]); if (j * S5 < T5) acc += uint(x5[j * S5]); if (j * S6 < T6) acc += uint(x6[j * S6]); if (j * S7 < T7) acc += uint(x7[j * S7]); } y[e] = acc;", "");
+    const step_b = if (profInt("DSV41_PG_STEP") > 0) profInt("DSV41_PG_STEP") else 16384;
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    var threads: usize = 32;
+    var names: [8][3:0]u8 = undefined;
+    for (0..8) |k| {
+        const w = if (k < n) arr[k] else arr[0];
+        const step = @max(1, step_b / mlx.mlx_array_itemsize(w));
+        const total = if (k < n) mlx.mlx_array_size(w) else 0;
+        threads = @max(threads, (total / step + 15) / 16);
+        names[k] = .{ 'S', '0' + @as(u8, @intCast(k)), 0 };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, &names[k], ci(step)));
+        var tn: [3:0]u8 = .{ 'T', '0' + @as(u8, @intCast(k)), 0 };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, &tn, ci(total)));
+        if (k >= n) arr[k] = arr[0];
+    }
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ci(threads)}, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, ci(threads), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+    const iv = mlx.mlx_vector_array_new_data(&arr, 8);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, prof_pages.?, iv, c, sc.s));
+    var o = mlx.mlx_array_new();
+    return profTie(sc, x, try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o), false);
+}
+const ProfReader = struct {
+    stop: std.atomic.Value(bool) = .init(false),
+    sink: std.atomic.Value(u64) = .init(0),
+    fn run(self: *ProfReader, words: []const u32) void {
+        var acc: u64 = 0;
+        while (!self.stop.load(.monotonic)) {
+            var i: usize = 0;
+            while (i < words.len) : (i += 16) acc +%= words[i];
+        }
+        self.sink.store(acc, .monotonic);
+    }
+};
+/// PROF (temporary, DSV41_PF_BENCH): GPU line touches of the layers' wo_a words, us a touch: all different arrays; one
+/// array A between different ones; A alone; then the same while host threads keep reading A.
+fn profCpuWarm(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const iou = @import("../../sdk/util/io_util.zig");
+    const hot = m.layers[2].wo_a.w;
+    const words = mlx.mlx_array_data_uint32(hot).?[0..mlx.mlx_array_size(hot)];
+    const n_layers = m.layers.len;
+    for ([_]usize{ 0, 1, 4, 12 }) |readers| {
+        var rd: ProfReader = .{};
+        var threads: [12]std.Thread = undefined;
+        for (threads[0..readers], 0..) |*t, k| t.* = try std.Thread.spawn(.{}, ProfReader.run, .{ &rd, words[k * words.len / readers .. (k + 1) * words.len / readers] });
+        defer {
+            rd.stop.store(true, .monotonic);
+            for (threads[0..readers]) |t| t.join();
+        }
+        var us: [3]f64 = undefined;
+        for (&us, 0..) |*o, seq| {
+            var best: f64 = std.math.inf(f64);
+            for (0..3) |_| {
+                var sc = Scope.init(gpa, mlx.gpuStream());
+                defer sc.deinit();
+                const n = 240;
+                var toks: [n]A = undefined;
+                const t0 = iou.nowUsMonotonic(io);
+                for (&toks, 0..) |*t, i| {
+                    const other = m.layers[3 + i % (n_layers - 3)].wo_a.w;
+                    t.* = try profTouch(&sc, switch (seq) {
+                        0 => other,
+                        1 => if (i % 2 == 0) hot else other,
+                        else => hot,
+                    });
+                }
+                try evalAll(&toks);
+                best = @min(best, @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / n);
+            }
+            o.* = best;
+        }
+        std.debug.print("[pf] {d} host readers of A: different arrays {d:.1} us a touch, A between different ones {d:.1} (A itself {d:.1}), A alone {d:.1}\n", .{ readers, us[0], us[1], 2 * us[1] - us[0], us[2] });
+    }
+}
+var prof_merge_deps: [4]A = @splat(none);
+var prof_merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var prof_touch: ?mlx.mlx_fast_metal_kernel = null;
+var prof_join: ?mlx.mlx_fast_metal_kernel = null;
+/// PROF (temporary): a 32-value array that waits for `a` and `b`.
+fn profJoin(sc: *Scope, a: A, b: A) !A {
+    if (prof_join == null) prof_join = try buildKernel("dsv41_join", &.{ "a", "b" }, &.{"y"}, "const uint e = thread_position_in_grid.x; y[e] = uint(a[e]) + uint(b[e]);", "");
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{32}, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ a, b }, 2);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, prof_join.?, iv, c, sc.s));
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+/// PROF (temporary): one load every DSV41_PF_STEP bytes (default 64) of the first DSV41_PF_PCT percent (default 100)
+/// of `x`, DSV41_PF_LOADS (default 16) loads a thread; the token is the threads' sums.
+fn profTouch(sc: *Scope, x: A) !A {
+    if (prof_touch == null) prof_touch = try buildKernel("dsv41_touch", &.{"x"}, &.{"y"}, "const uint e = thread_position_in_grid.x; uint acc = 0; for (uint k = 0; k < LOADS; ++k) { const uint i = (e * LOADS + k) * STEP; if (i < TOTAL) acc += uint(x[i]); } y[e] = acc;", "");
+    const isz = mlx.mlx_array_itemsize(x);
+    var n: usize = mlx.mlx_array_size(x);
+    const pct = profInt("DSV41_PF_PCT");
+    if (pct > 0) n = n * pct / 100;
+    const step_b = profInt("DSV41_PF_STEP");
+    const step = @max(1, (if (step_b > 0) step_b else 64) / isz);
+    const loads_e = profInt("DSV41_PF_LOADS");
+    const loads = if (loads_e > 0) loads_e else 16;
+    const threads = @max(32, (n / step + loads - 1) / loads);
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ci(threads)}, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, ci(threads), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "LOADS", ci(loads)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "STEP", ci(step)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "TOTAL", ci(n)));
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{x}, 1);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, prof_touch.?, iv, c, sc.s));
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
 
 /// The decode attention kernels' meta: {p0, L, K, window, cap, n_comp}.
@@ -3510,11 +3802,18 @@ fn attnMerge(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, parts: [3]A, sp
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(mc, "S", splits));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(mc, "OT", m.act));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(mc, "RD", rd));
-    const mv = mlx.mlx_vector_array_new_data(&[_]A{ parts[0], parts[1], parts[2], ly.sink, meta, periods }, 6);
+    // PROF (temporary): the merge launch also waits for `prof_merge_deps`, which its text never reads.
+    var mi = [_]A{ parts[0], parts[1], parts[2], ly.sink, meta, periods, meta, meta, meta, meta };
+    const with_deps = prof_merge_deps[0].ctx != null;
+    if (with_deps) for (prof_merge_deps, mi[6..]) |d, *slot| {
+        if (d.ctx != null) slot.* = d;
+    };
+    if (with_deps and prof_merge_kernel == null) prof_merge_kernel = try buildKernel("dsv41_attn_merge_deps", &(ATTN_MERGE_INS ++ [_][*:0]const u8{ "dep0", "dep1", "dep2", "dep3" }), &.{"out"}, ATTN_MERGE_SOURCE, UNROPE_HEADER);
+    const mv = mlx.mlx_vector_array_new_data(&mi, if (with_deps) mi.len else 6);
     defer _ = mlx.mlx_vector_array_free(mv);
     var mo = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(mo);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&mo, m.attn_merge_kernel, mv, mc, sc.s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&mo, if (with_deps) prof_merge_kernel.? else m.attn_merge_kernel, mv, mc, sc.s));
     var o = mlx.mlx_array_new();
     return sc.res(mlx.mlx_vector_array_get(&o, mo, 0), &o);
 }
@@ -3873,8 +4172,16 @@ pub fn ffnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: 
     const sgu = ly.shared_gu orelse return null;
     const dn = &ly.experts.down;
     const sdn = &ly.shared[2];
-    if (m.dec.moe_fp4) |kf| if (try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts)) |act|
+    // The shared expert reads no route: its launch is encoded behind the router's last kernel and runs beside it.
+    if (m.dec.moe_fp4) |kf| if (m.tp == null and std.c.getenv("DSV41_NOSPLIT") == null and mlx.getShape(idx).len == 2 and dkern.moe_fp4.servesUp(sc, m, ly, h, dim(idx, 1))) {
+        const sact = try dkern.moe_fp4.sharedUp(sc, kf, ly, h, dim(idx, 1));
+        const ract = try dkern.moe_fp4.routedUp(sc, kf, ly, h, idx, wts, sact);
+        if (try dkern.moe_fp4.moeDownSplit(sc, kf, ly, ract, sact, idx, x1, sp)) |y| return y;
+    };
+    if (m.dec.moe_fp4) |kf| if (try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts)) |act0| {
+        const act = prof(8, (@intFromPtr(ly) - @intFromPtr(m.layers.ptr)) / @sizeOf(Layer), 0, act0);
         if (try dkern.moe_fp4.moeDown(sc, kf, ly, act, idx, x1, sp)) |y| return y;
+    };
     if (m.dec.moe_up) |ku| if (m.dec.moe_down) |kd| if (ly.experts.views) |v| if (try dkern.moe_up.moeUp(sc, m, ku, ly, h, idx, wts)) |act|
         if (try dkern.moe_down.moeDown(sc, kd, m.dec.moe_down_rb, &v[1], sdn, act, idx, x1, sp)) |y| return y;
     if (dim(h, 0) != 1 or mlx.mlx_array_dtype(h) == .float32 or !mlx.streamIsGpu(sc.s)) return null;
@@ -4002,6 +4309,35 @@ pub fn moeKernel(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, ins: []const A, sh
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, sc.s));
     var o = mlx.mlx_array_new();
     return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+
+/// Gather each expert's rows together, then restore each token's original pick order before the sum.
+fn routedSortedEight(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A) !A {
+    const L = dim(x, 0);
+    const k = dim(idx, 1);
+    const d = dim(x, 1);
+    const pairs = L * k;
+    const ids = try sc.reshape(idx, &.{ci(pairs)});
+    var o = mlx.mlx_array_new();
+    const order = try sc.res(mlx.mlx_argsort_axis(&o, ids, 0, sc.s), &o);
+    var oi = mlx.mlx_array_new();
+    const inv = try sc.res(mlx.mlx_argsort_axis(&oi, order, 0, sc.s), &oi);
+    const rows = try sc.op2(mlx.mlx_floor_divide, order, try sc.u(@intCast(k)));
+    const sorted = try sc.take(ids, order, 0);
+    const xe = try sc.reshape(try sc.take(x, rows, 0), &.{ ci(pairs), 1, ci(d) });
+    const gt, const up = try gateUp(sc, &ly.experts, xe, none, sorted, true);
+    const weights = try sc.reshape(try sc.take(try sc.reshape(wts, &.{ci(pairs)}), order, 0), &.{ ci(pairs), 1, 1 });
+    const act = try sc.astype(try sc.mul(try clampedSwiglu(sc, gt, up, m.cfg.dsv4_swiglu_limit), weights), m.act);
+    const dn = try gatherMm(sc, act, &ly.experts.down, none, sorted, true);
+    const original = try sc.reshape(try sc.take(dn, inv, 0), &.{ ci(L), ci(k), ci(d) });
+    const Marker = struct {
+        var logged = false;
+    };
+    if (!Marker.logged) {
+        log.info("[dsv41] sorted eight-slot expert reads engaged ({d} picks)\n", .{pairs});
+        Marker.logged = true;
+    }
+    return sc.sum(try sc.astype(original, .float32), 1, false);
 }
 
 pub fn routed(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A) !A {
@@ -4703,6 +5039,20 @@ pub const ENGRAM_INS = [_][*:0]const u8{ "x", "kv", "qk", "cst" };
 
 // ── the forward ──────────────────────────────────────────────────────────
 
+// PROF (temporary): a stage whose bit is set in DSV41_PROF computes once a layer, then replays that output.
+pub var prof_mask: u32 = 0;
+var prof_cache: [16][64][6]A = @splat(@splat(@splat(.{ .ctx = null })));
+pub fn prof(bit: u5, li: usize, slot: usize, x: A) A {
+    if (prof_mask & (@as(u32, 1) << bit) == 0 or x.ctx == null) return x;
+    const c = &prof_cache[bit][li][slot];
+    if (c.ctx == null) {
+        c.* = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(c, x);
+        return x;
+    }
+    return c.*;
+}
+
 /// `replay`: no logits. The rows rebuild their layers' windows with the band stopped at the chunk's first row; no
 /// compressor runs, so the global rows and index keys stay as they are (`rewind`).
 /// `encode`: no logits. A prompt chunk the same call continues with one that replays (`extendCold`): the encoder's
@@ -4779,15 +5129,39 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const ly = &m.layers[li];
     const ls = &st.layers[li];
     const L = dim(x, 0);
-    const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
-    const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, try dkern.wq_b.rowsAt(sc, p0, L)) orelse return null;
+    var a = try dkern.in_proj.run(sc, kp, m, ly, try profPages(sc, m, li, x, 0), pre.*) orelse return null;
+    a.h = prof(0, li, 0, a.h);
+    a.qa = prof(0, li, 1, a.qa);
+    a.kv = prof(0, li, 2, a.kv);
+    a.z = prof(0, li, 3, a.z);
+    if (a.iw) |v| a.iw = prof(0, li, 4, v);
+    if (a.comp) |v| a.comp = prof(0, li, 5, v);
+    var w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, try dkern.wq_b.rowsAt(sc, p0, L)) orelse return null;
+    w.q = prof(1, li, 0, w.q);
+    w.kv_row = prof(1, li, 1, w.kv_row);
+    w.sa.pre = prof(1, li, 2, w.sa.pre);
+    w.sa.post = prof(1, li, 3, w.sa.post);
+    w.sa.comb = prof(1, li, 4, w.sa.comb);
+    if (w.q_idx) |v| w.q_idx = prof(1, li, 5, v);
+    var old = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&old, ls.win.buf));
+    _ = try sc.keep(old);
     try ls.win.write(w.kv_row, p0, sc.s);
+    if (L <= ls.win.cap and std.c.getenv("DSV41_NOFRESH") == null) {
+        ls.win.prev = old;
+        ls.win.fresh = try sc.astype(w.kv_row, mlx.mlx_array_dtype(old));
+        ls.win.fresh_p0 = p0;
+    }
+    defer {
+        ls.win.prev = none;
+        ls.win.fresh = none;
+    }
     var comp_rows = none;
     var topk = none;
     if (ly.ratio > 0) {
         const clen = (p0 + L) / ly.ratio;
         if (ly.comp) |*cw| if (!try compressFused(sc, m, st, li, a.comp.?, p0)) try compressFrom(sc, m, st, li, cw, a.comp.?, p0);
-        if (ly.idx) |_| sh.topk = if (clen == 0) none else try indexerQ(sc, m, st, li, a.iw.?, w.q_idx.?, p0, sh);
+        if (ly.idx) |_| sh.topk = if (clen == 0) none else prof(2, li, 0, try indexerQ(sc, m, st, li, a.iw.?, w.q_idx.?, p0, sh));
         topk = sh.topk;
         if (clen > 0 and topk.ctx != null) comp_rows = try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s));
     }
@@ -4812,10 +5186,13 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
         return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
     };
     var ao: [1]A = undefined;
-    if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
+    if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{prof(3, li, 0, try profAttn(sc, m, ly, q, ls.win, comp_rows, topk, p0, scale, inv))}, &ao);
+    ao[0] = prof(4, li, 0, ao[0]);
     if (m.tp != null) return try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &sa, pre);
     var out: [2]A = undefined;
     try runRegion(sc, m, li, .ffn, &.{ x, ao[0], sa.pre, sa.post, sa.comb }, &out);
+    out[0] = prof(12, li, 0, out[0]);
+    out[1] = prof(12, li, 1, out[1]);
     pre.* = out[1];
     return out[0];
 }
@@ -4841,12 +5218,23 @@ fn blockRowsAttnOut(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, p0: usize
     const L = dim(w.q, 0);
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.cfg.head_dim)));
     const inv = ropeFor(m, li).inv;
-    var heads: [dkern.max_rows]A = undefined;
-    for (0..L) |l| {
-        const cr = try rowPicks(sc, m, st, li, p0, l, topk, tr);
-        heads[l] = try attnDecode(sc, m, ly, try sc.slice(w.q, 0, l, l + 1), ls.win, cr[0], cr[1], p0 + l, scale, inv);
-    }
-    const r = try sc.concat(heads[0..L], 0); // [L, H, hd], inverse-roped
+    // The indexer already masks each row's future picks. Its visible prefix fits this layer's
+    // compressed view when tr >= ratio. Equal pick widths also preserve each row's split boundaries.
+    const window_only = ly.ratio == 0 or topk.ctx == null;
+    const grouped = m.exact_attn_group and (window_only or (tr >= ly.ratio and
+        picksAt(tr, m.cfg.dsv4_index_topk, p0 + 1) == dim(topk, 1)));
+    const r = if (grouped) blk: {
+        const comp = if (window_only) none else try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view((p0 + L) / ly.ratio, sc.s));
+        m.grouped_attn_layers += 1;
+        break :blk try attnDecode(sc, m, ly, w.q, ls.win, comp, if (window_only) none else topk, p0, scale, inv);
+    } else blk: {
+        var heads: [dkern.max_rows]A = undefined;
+        for (0..L) |l| {
+            const cr = try rowPicks(sc, m, st, li, p0, l, topk, tr);
+            heads[l] = try attnDecode(sc, m, ly, try sc.slice(w.q, 0, l, l + 1), ls.win, cr[0], cr[1], p0 + l, scale, inv);
+        }
+        break :blk try sc.concat(heads[0..L], 0);
+    };
     const og = dim(ly.wo_a.w, 0);
     const ob = try sc.transpose(try sc.reshape(r, &.{ ci(L), ci(og), -1 }), &.{ 1, 0, 2 }); // [og, L, in]
     const oa = try rowQmv(sc, &ly.wo_a, ob) orelse return null; // [og, L, o_lora]
@@ -4879,6 +5267,15 @@ fn blockRowsFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const S
     if (ly.experts.gu == null or ly.shared_gu == null or ly.experts.gate.qp.mode == .gguf) return null;
     var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
     try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
+    if (m.exact_ffn_group) if (m.dec.moe_fp4) |kern| {
+        const split: Split = .{ .pre = p[1], .post = p[2], .comb = p[3] };
+        if (try dkern.moe_fp4.moeUp(sc, m, kern, ly, p[4], p[5], p[6])) |act| {
+            if (try dkern.moe_fp4.moeDown(sc, kern, ly, act, p[5], p[0], &split)) |y| {
+                m.grouped_verify_layers += 1;
+                return .{ y, p[1] };
+            }
+        }
+    };
     var ys: [dkern.max_rows]A = undefined;
     for (0..L) |l| {
         const sp: Split = .{ .pre = try sc.slice(p[1], 0, l, l + 1), .post = try sc.slice(p[2], 0, l, l + 1), .comb = try sc.slice(p[3], 0, l, l + 1) };
@@ -5360,7 +5757,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
         h = try sc.concat(parts.items, 0);
     }
     // A tensor rank past 0 holds no head: its last stream stands in for the logits.
-    const logits = if (!m.hasHead()) try sc.astype(h, .float32) else if (exact_head) try headRows(&sc, m, h) else try sc.astype(try m.head.apply(&sc, try sc.rms(h, m.norm, c.rms_norm_eps)), .float32);
+    const logits = prof(10, 0, 0, if (!m.hasHead()) try sc.astype(h, .float32) else if (exact_head) try headRows(&sc, m, h) else try sc.astype(try m.head.apply(&sc, try sc.rms(h, m.norm, c.rms_norm_eps)), .float32));
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     try ev.append(gpa, logits);
@@ -5421,6 +5818,18 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
                 // takes to run it: hand each layer over as it is built.
                 const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
                 defer _ = mlx.mlx_vector_array_free(vec);
+                if (std.c.getenv("DSV41_DUMP")) |path| if (li == 20 or li == 21) {
+                    const DumpN = struct { var n: usize = 0; };
+                    DumpN.n += 1;
+                    if (DumpN.n == 199 or DumpN.n == 200) {
+                        const f = std.c.fopen(path, "a").?;
+                        _ = std.c.fwrite("==== layer\n", 1, 11, f);
+                        const nm = mlx.mlx_node_namer_new();
+                        _ = mlx.mlx_print_graph(f, nm, vec);
+                        _ = mlx.mlx_node_namer_free(nm);
+                        _ = std.c.fclose(f);
+                    }
+                };
                 try mlx.check(mlx.mlx_async_eval(vec));
             }
         }
@@ -6053,7 +6462,7 @@ pub const region_rows = 16;
 /// With a streamed bank the FFN stretch runs as three (`ffn_pre`, `ffn_act`, `ffn_post`) around the source's host
 /// barrier, cut where `ffn` has no fusable op across the cut.
 
-pub const Region = enum { attn_in, q_kv, q_rows, attn_out, ffn, ffn_pre, ffn_act, ffn_post, ffn_shared, ffn_post_shared };
+pub const Region = enum { attn_in, q_kv, q_rows, attn_out, ffn, ffn_pre, ffn_act, ffn_post, ffn_shared, ffn_post_shared, ffn_sorted };
 const LayerRegions = struct {
     m: *Dsv41Model,
     li: usize,
@@ -6079,10 +6488,14 @@ pub fn compiledAt(m: *const Dsv41Model, rows: usize) bool {
 fn compileRegions(m: *Dsv41Model) !void {
     m.regions = try m.gpa.alloc(LayerRegions, m.n_layers);
     for (m.regions, 0..) |*r, li| r.* = .{ .m = m, .li = li };
+    if (std.c.getenv("DSV41_PROF")) |v| prof_mask = std.fmt.parseInt(u32, std.mem.span(v), 0) catch 0;
+    if (std.c.getenv("DSV41_PROF") != null) return;
     for (m.regions) |*r| inline for (comptime std.enums.values(Region)) |kind| {
-        const raw = mlx.mlx_closure_new_func_payload(&RegionBody(kind).call, @ptrCast(r), null);
-        defer _ = mlx.mlx_closure_free(raw);
-        try mlx.check(mlx.mlx_compile(&r.fns[@backingInt(kind)], raw, false));
+        if (kind != .ffn_sorted or m.sort_batch) {
+            const raw = mlx.mlx_closure_new_func_payload(&RegionBody(kind).call, @ptrCast(r), null);
+            defer _ = mlx.mlx_closure_free(raw);
+            try mlx.check(mlx.mlx_compile(&r.fns[@backingInt(kind)], raw, false));
+        }
     };
 }
 
@@ -6155,14 +6568,30 @@ fn RegionBody(comptime kind: Region) type {
                     res.* = mlx.mlx_vector_array_new_data(&.{ pj.q, pj.kv, pj.qr }, 3);
                 },
                 // the inverse-roped attention heads -> the attention's output
-                .attn_out => res.* = mlx.mlx_vector_array_new_data(&.{try attnOutRoped(&sc, m, ly, a[0])}, 1),
+                .attn_out => {
+                    const L = dim(a[0], 0);
+                    const og = dim(ly.wo_a.w, 0);
+                    const oa = prof(5, li, 0, try attnOutA(&sc, m, ly, try sc.transpose(try sc.reshape(a[0], &.{ ci(L), ci(og), -1 }), &.{ 1, 0, 2 }), null));
+                    res.* = mlx.mlx_vector_array_new_data(&.{try ly.wo_b.apply(&sc, oa)}, 1);
+                },
                 // x, the attention's output and mix -> the new stream and the FFN's pre
-                .ffn => {
+                .ffn, .ffn_sorted => {
                     const sa: Split = .{ .pre = a[2], .post = a[3], .comb = a[4] };
-                    const pf = try hcExpandPreNorm(&sc, m, a[0], a[1], &sa, a[2], &ly.hc_ffn, ly.ffn_norm);
+                    var pf = try hcExpandPreNorm(&sc, m, a[0], a[1], &sa, a[2], &ly.hc_ffn, ly.ffn_norm);
+                    pf.x1 = prof(6, li, 0, pf.x1);
+                    pf.h = prof(6, li, 1, pf.h);
+                    pf.sp.pre = prof(6, li, 2, pf.sp.pre);
+                    pf.sp.post = prof(6, li, 3, pf.sp.post);
+                    pf.sp.comb = prof(6, li, 4, pf.sp.comb);
                     const x1 = pf.x1;
-                    const r = try route(&sc, m, ly, pf.h, none);
-                    const y = try ffnDecode(&sc, m, ly, pf.h, r.idx, r.wts, x1, &pf.sp) orelse try hcExpand(&sc, x1, try withShared(&sc, m, ly, pf.h, try routed(&sc, m, ly, pf.h, r.idx, r.wts)), &pf.sp);
+                    var r = try route(&sc, m, ly, pf.h, none);
+                    r.idx = prof(7, li, 0, r.idx);
+                    r.wts = prof(7, li, 1, r.wts);
+                    const fd = try ffnDecode(&sc, m, ly, pf.h, r.idx, r.wts, x1, &pf.sp);
+                    const y = if (fd) |v| prof(9, li, 0, v) else blk: {
+                        const routes = if (kind == .ffn_sorted) try routedSortedEight(&sc, m, ly, pf.h, r.idx, r.wts) else try routed(&sc, m, ly, pf.h, r.idx, r.wts);
+                        break :blk try hcExpand(&sc, x1, try withShared(&sc, m, ly, pf.h, routes), &pf.sp);
+                    };
                     res.* = mlx.mlx_vector_array_new_data(&.{ y, pf.sp.pre }, 2);
                 },
                 // `ffn` up to the router: the new stream, the FFN's mix, its normed input and its routes
@@ -7000,7 +7429,13 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
     var o: [2]A = undefined; // the new stream, the FFN's mix
     if (m.tp != null) {
         o[0] = try tpFfn(&sc, m, li, x, try tpSum(&sc, m, ao[0]), &.{ .pre = a[0], .post = a[1], .comb = a[2] }, &o[1]);
-    } else try runRegion(&sc, m, li, .ffn, &.{ x, ao[0], a[0], a[1], a[2] }, &o);
+    } else {
+        const inputs = [_]A{ x, ao[0], a[0], a[1], a[2] };
+        if (m.sort_batch and N == 8 and sp.L == N and states[0].verify == null)
+            try runRegion(&sc, m, li, .ffn_sorted, &inputs, &o)
+        else
+            try runRegion(&sc, m, li, .ffn, &inputs, &o);
+    }
     for (0..N) |k| {
         const lo, const hi = sp.bounds(k);
         hold(&sp.xs[k], try sc.slice(o[0], 0, lo, hi));
@@ -8828,6 +9263,63 @@ test "dsv41 decode attention: rows split across threadgroups give the one-thread
     }
 }
 
+test "dsv41 decode attention: one launch writes the split and merge launches' heads, bit for bit" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var m: Dsv41Model = undefined;
+    m.cfg = .{};
+    m.cfg.sliding_window = 128;
+    m.cfg.dsv4_rope_head_dim = 64;
+    m.attn_dec_kernel = try buildKernel("dsv41_attn_decode", &ATTN_DEC_INS, &.{"out"}, ATTN_DEC_SOURCE, UNROPE_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.attn_dec_kernel);
+    m.attn_split_kernel = try buildKernel("dsv41_attn_split", &ATTN_INS, &.{ "pacc", "pm", "pl" }, ATTN_SPLIT_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.attn_split_kernel);
+    m.attn_merge_kernel = try buildKernel("dsv41_attn_merge", &ATTN_MERGE_INS, &.{"out"}, ATTN_MERGE_SOURCE, UNROPE_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.attn_merge_kernel);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 6));
+    var per: [32]f32 = undefined;
+    for (&per, 0..) |*v, k| v.* = -std.math.pow(f32, 10000, @as(f32, @floatFromInt(k)) / 32);
+    defer attn_one_force = null;
+    var cases: usize = 0;
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |act| for ([_]usize{ 1, 2, 3, 6 }) |L| for ([_]usize{ 0, 1, 37, 200, 352, 512 }) |K| for ([_]usize{ 0, 5, 126, 131, 3001 }) |p0| for ([_]bool{ false, true }) |fresh| {
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        m.act = act;
+        var ly: Layer = undefined;
+        var t: [5]A = undefined;
+        for ([_][]const c_int{ &.{64}, &.{ 144, 512 }, &.{ 700, 512 }, &.{ ci(L), 64, 512 }, &.{ ci(L), 512 } }, &t) |sh, *o| {
+            var r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, if (sh.len == 1) .float32 else act, 0, 1, key, sc.s));
+            o.* = try sc.keep(r);
+        }
+        ly.sink = t[0];
+        var win: Ring = .{ .buf = t[1], .cap = 144, .width = 512 };
+        if (fresh) {
+            win.prev = t[1];
+            win.fresh = t[4];
+            win.fresh_p0 = p0;
+        }
+        const ids = try gpa.alloc(i32, L * @max(K, 1));
+        defer gpa.free(ids);
+        for (ids, 0..) |*v, i| v.* = if (i % 37 == 5) -1 else if (i % 41 == 7) 900 else @intCast((i * 13 + p0) % 700);
+        const topk = if (K > 0) try sc.ints(ids, &.{ ci(L), ci(K) }) else none;
+        const inv = try sc.keep(mlx.mlx_array_new_data(&per, &[_]c_int{32}, 1, .float32));
+        for ([_]c_int{ 2, 3, 4 }) |splits| for ([_]?A{ null, inv }) |iv| {
+            attn_one_force = false;
+            const want = try hostF32(try attnDecodeSplit(&sc, &m, &ly, t[3], win, if (K > 0) t[2] else none, topk, p0, 0.05, splits, iv));
+            defer gpa.free(want);
+            attn_one_force = true;
+            const got = try hostF32(try attnDecodeSplit(&sc, &m, &ly, t[3], win, if (K > 0) t[2] else none, topk, p0, 0.05, splits, iv));
+            defer gpa.free(got);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+            cases += 1;
+        };
+    };
+    try testing.expectEqual(@as(usize, 2 * 4 * 6 * 5 * 2 * 3 * 2), cases);
+}
+
 test "dsv41 decode attention: the folded inverse rope is ropeTail of the heads, bit for bit" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
@@ -9423,6 +9915,141 @@ test "dsv41 prefill: chunk time against depth (DSV41_PREFILL)" {
     std.debug.print("[dsv41-prefill] chunk {d}: {d} tokens in {d:.2} s, peak transient {d} MB, bill {d} MB\n", .{ chunk, ctx, @as(f64, @floatFromInt(monoUs() - t_all)) / 1e6, transient >> 20, prefillBytes(&m.cfg, 0, ctx, chunk, 0) >> 20 });
 }
 
+
+// Temporary DSV41_COLD_READ meter. Each pass reads the same words from distinct layers.
+fn profColdRead(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
+    const body =
+        \\const uint t = thread_position_in_grid.x, lane = thread_index_in_simdgroup;
+        \\uint4 sum(0);
+        \\const device uint4* words = (const device uint4*)x;
+        \\for (uint k = 0; k < LOADS; ++k) {
+        \\    uint index;
+        \\    if (ORDER == 0) index = t * LOADS + k;
+        \\    else if (ORDER == 1) index = (t / 32 * LOADS + k) * 32 + lane;
+        \\    else if (ORDER == 2) index = k * THREADS + t;
+        \\    else index = (k % 2) * (THREADS * LOADS / 2) + (t / 32 * (LOADS / 2) + k / 2) * 32 + lane;
+        \\    sum += words[index];
+        \\}
+        \\uint check = simd_sum(sum.x + sum.y + sum.z + sum.w);
+        \\if (lane == 0) y[t / 32] = check;
+    ;
+    const kern = try buildKernel("dsv41_cold_read", &.{"x"}, &.{"y"}, body, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const Arm = struct { order: c_int, loads: c_int, tg: c_int };
+    const arms = [_]Arm{
+        .{ .order = 0, .loads = 16, .tg = 32 },
+        .{ .order = 1, .loads = 16, .tg = 32 },
+        .{ .order = 1, .loads = 16, .tg = 256 },
+        .{ .order = 2, .loads = 16, .tg = 32 },
+        .{ .order = 3, .loads = 16, .tg = 32 },
+        .{ .order = 1, .loads = 4, .tg = 32 },
+        .{ .order = 1, .loads = 32, .tg = 32 },
+    };
+    const count = 32;
+    if (m.layers.len < count) return error.MissingColdWeights;
+    var sums: [count]u32 = undefined;
+    for (0..4) |pass| {
+        for (0..arms.len * 2 - 1) |visit| {
+            const id = if (visit % 2 == 0) 0 else 1 + (visit / 2 + pass) % (arms.len - 1);
+            const arm = arms[id];
+            const threads = @divExact(@as(c_int, 2097152), arm.loads);
+            const cfg = mlx.mlx_fast_metal_kernel_config_new();
+            defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            inline for (.{ .{ "LOADS", arm.loads }, .{ "ORDER", arm.order }, .{ "THREADS", threads } }) |v|
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, v[0], v[1]));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{@divExact(threads, 32)}, 1, .uint32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, threads, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, arm.tg, 1, 1));
+            var scope = Scope.init(gpa, mlx.gpuStream());
+            defer scope.deinit();
+            var outputs: [count]A = undefined;
+            for (&outputs, m.layers[0..count]) |*output, ly| {
+                const x = ly.wo_a.w;
+                if (mlx.mlx_array_dtype(x) != .uint32 or mlx.mlx_array_size(x) != 8388608) return error.UnexpectedColdWeight;
+                const iv = mlx.mlx_vector_array_new_data(&.{x}, 1);
+                defer _ = mlx.mlx_vector_array_free(iv);
+                var ov = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(ov);
+                try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, scope.s));
+                var o = mlx.mlx_array_new();
+                output.* = try scope.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+            }
+            const start = monoUs();
+            try evalAll(&outputs);
+            const us = @as(f64, @floatFromInt(monoUs() - start)) / count;
+            for (outputs, 0..) |o, i| {
+                var sum: u32 = 0;
+                for (mlx.mlx_array_data_uint32(o).?[0..mlx.mlx_array_size(o)]) |v| sum +%= v;
+                if (pass == 0 and visit == 0) sums[i] = sum else try testing.expectEqual(sums[i], sum);
+            }
+            std.debug.print("[cold-read] pass={d} arm={d} order={d} loads={d} tg={d} us={d:.2} GB/s={d:.1}\n", .{ pass, id, arm.order, arm.loads, arm.tg, us, 33554.432 / us });
+        }
+    }
+}
+
+test "dsv41 decode rows: fresh prompts and eight independent greedy states (DSV41_ROW_METER)" {
+    const dir = std.mem.span(env.get(.DSV41_ROW_METER) orelse return error.SkipZigTest);
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    log.enableStderr();
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cfg = try testConfig(io, dir);
+    var weights = try loadPack(io, gpa, dir, false);
+    defer weights.deinit();
+    const m = try init(gpa, &cfg, &weights, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = true });
+    defer m.deinit();
+    const slots = 8;
+    var states: [slots]State = undefined;
+    var ptrs: [slots]*State = undefined;
+    var gens: [slots]u64 = undefined;
+    var next: [slots]u32 = undefined;
+    var allocated: usize = 0;
+    defer for (states[0..allocated]) |*st| st.deinit();
+    var prompt: [2081]u32 = undefined;
+    var prefill_hash = std.hash.Wyhash.init(0);
+    for (&states, 0..) |*st, slot| {
+        st.* = try initState(m, gpa);
+        allocated += 1;
+        ptrs[slot] = st;
+        gens[slot] = slot + 1;
+        for (&prompt, 0..) |*t, i| t.* = @intCast((i * 7919 + 13 + slot * 104729) % @min(m.vocab, 100000));
+        const start = monoUs();
+        const l = try meterPrefill(m, gpa, st, &prompt);
+        defer _ = mlx.mlx_array_free(l);
+        next[slot] = try argmaxHost(l);
+        const us = monoUs() - start;
+        const logits = try hostF32(l);
+        defer gpa.free(logits);
+        prefill_hash.update(std.mem.sliceAsBytes(logits));
+        std.debug.print("[row-meter] prompt={d} us={d}\n", .{ slot, us });
+    }
+    var decode_hash = std.hash.Wyhash.init(0);
+    var elapsed: i64 = 0;
+    const warm = 8;
+    const count = 32;
+    for (0..warm + count) |step| {
+        var chunks: [slots][]const u32 = undefined;
+        for (&chunks, &next) |*ch, *t| ch.* = t[0..1];
+        const start = monoUs();
+        const l = try extendBatched(m, gpa, &ptrs, &gens, &chunks, false);
+        defer _ = mlx.mlx_array_free(l);
+        var sc = Scope.init(gpa, m.s);
+        defer sc.deinit();
+        const best = try hostI32(try sc.astype(try sc.argmax(l, -1), .int32));
+        defer gpa.free(best);
+        for (&next, best) |*t, b| t.* = @intCast(b);
+        if (step >= warm) elapsed += monoUs() - start;
+        const logits = try hostF32(l);
+        defer gpa.free(logits);
+        decode_hash.update(std.mem.sliceAsBytes(logits));
+    }
+    std.debug.print("[row-meter] eight-step-us={d} prefill-hash={x} decode-hash={x}\n", .{ @divTrunc(elapsed, count), prefill_hash.final(), decode_hash.final() });
+    if (device.deviceGeneration().gen == 15 and !device.naxAvailable()) {
+        try testing.expectEqual(@as(u64, 0x4aef1fd941771d54), prefill_hash.final());
+        try testing.expectEqual(@as(u64, 0x3a662524b620cee8), decode_hash.final());
+    }
+}
+
 test "dsv41 decode step: serial one-token steps as the server pipelines them (DSV41_STEP)" {
     // DSV41_STEP = a pack dir; DSV41_STEP_CTX prompt tokens first (default 1024).
     const dir = std.mem.span(std.c.getenv("DSV41_STEP") orelse return error.SkipZigTest);
@@ -9437,6 +10064,51 @@ test "dsv41 decode step: serial one-token steps as the server pipelines them (DS
     const prompt = try gpa.alloc(u32, ctx);
     defer gpa.free(prompt);
     for (prompt, 0..) |*t, k| t.* = @intCast((k * 7919 + 13) % @min(m.vocab, 100000));
+    if (env.get(.DSV41_COLD_PAIR_CHECK) != null) {
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const experts = &m.layers[0].experts;
+        const ids = [_]i32{ 0, 0, 0, 4, 4, 4, 9, 10, 11, 11, 12, 13, 13, 17, 23, 23, 383 };
+        const idx = try sc.astype(try sc.ints(&ids, &.{ids.len}), .uint32);
+        const gu = experts.gu orelse return error.MissingColdWeights;
+        for ([_]Bank{ gu, experts.down }) |bank| {
+            const k = dim(bank.w, -1) * 8;
+            const steps = try sc.astype(try sc.arange(0, ids.len * k), .float32);
+            const x = try sc.reshape(try sc.astype(try sc.op1(mlx.mlx_sin, steps), .bfloat16), &.{ ids.len, 1, ci(k) });
+            const baseline = try gatherMm(&sc, x, &bank, none, idx, false);
+            const paired = try gatherMm(&sc, x, &bank, none, idx, true);
+            try evalAll(&.{ baseline, paired });
+            const n = mlx.mlx_array_size(baseline);
+            try testing.expectEqual(n, mlx.mlx_array_size(paired));
+            const want = mlx.mlx_array_data_bfloat16(baseline) orelse return error.NoData;
+            const got = mlx.mlx_array_data_bfloat16(paired) orelse return error.NoData;
+            try testing.expectEqualSlices(u16, want[0..n], got[0..n]);
+            std.debug.print("[cold-pair-check] {d} x {d}, {d} equal outputs\n", .{ k, dim(bank.w, 1), n });
+        }
+    }
+    if (env.get(.DSV41_COLD_PREFILL)) |option| {
+        const length = try std.fmt.parseInt(usize, std.mem.span(option), 10);
+        if (length == 0) return error.EmptyPrompt;
+        const input = try gpa.alloc(u32, length);
+        defer gpa.free(input);
+        for (input, 0..) |*t, k| t.* = @intCast((k * 7919 + 13) % @min(m.vocab, 100000));
+        const trials: usize = 4;
+        var reference: ?u64 = null;
+        for (0..trials) |pass| {
+            var fresh = try initState(m, gpa);
+            defer fresh.deinit();
+            const before = monoUs();
+            const logits = try meterPrefill(m, gpa, &fresh, input);
+            defer _ = mlx.mlx_array_free(logits);
+            try mlx.check(mlx.mlx_array_eval(logits));
+            const us = monoUs() - before;
+            const values = try hostF32(logits);
+            defer gpa.free(values);
+            const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(values));
+            std.debug.print("[cold-prefill] pass={d} ctx={d} moe_rows={d} us={d} logits={x}\n", .{ pass, length, m.moe_rows, us, hash });
+            if (reference) |expected| try testing.expectEqual(expected, hash) else reference = hash;
+        }
+    }
     var st = try initState(m, gpa);
     defer st.deinit();
     const tok: u32 = blk: {
@@ -9458,9 +10130,16 @@ test "dsv41 decode step: serial one-token steps as the server pipelines them (DS
         try mlx.check(mlx.mlx_argmax_axis(&o, l, -1, false, mlx.gpuStream()));
         _ = mlx.mlx_array_free(g);
         g = o;
+        if (k + 1 == n) {
+            const hv = try hostF32(l);
+            defer gpa.free(hv);
+            std.debug.print("[step] last logits hash {x}\n", .{std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(hv))});
+        }
         _ = mlx.mlx_array_free(l);
         total[k] = iou.nowUsMonotonic(io) - t0;
     }
+    if (env.get(.DSV41_COLD_READ) != null) try profColdRead(m, gpa);
+    if (std.c.getenv("DSV41_PF_BENCH") != null) try profCpuWarm(m, gpa);
     // Pipelined steps hand time to each other: the mean is the throughput.
     const steady = total[warm..];
     var sum: i64 = 0;
@@ -9497,6 +10176,25 @@ test "dsv41 DSpark round: draft, verify and finish timed apart, greedy (DSV41_RO
         if (ids.len < ctx) return error.SkipZigTest;
         @memcpy(prompt, ids[0..ctx]);
     }
+    if (env.get(.DSV41_ROUND_SERIES)) |v| {
+        var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
+        var reference_hashes: ?[3]u64 = null;
+        while (it.next()) |arm| {
+            m.exact_ffn_group = std.mem.eql(u8, arm, "ffn") or std.mem.eql(u8, arm, "both");
+            m.exact_attn_group = std.mem.eql(u8, arm, "attn") or std.mem.eql(u8, arm, "both");
+            if (!m.exact_ffn_group and !m.exact_attn_group and !std.mem.eql(u8, arm, "base")) return error.UnknownArm;
+            m.grouped_verify_layers = 0;
+            m.grouped_attn_layers = 0;
+            std.debug.print("[round-arm] {s}\n", .{arm});
+            const actual = try timeDsparkRounds(m, gpa, prompt, true);
+            if (reference_hashes) |want| try testing.expectEqual(want, actual) else reference_hashes = actual;
+        }
+    } else _ = try timeDsparkRounds(m, gpa, prompt, !std.mem.eql(u8, env.span(.DSV41_ROUND_PROOF) orelse "0", "0"));
+}
+
+fn timeDsparkRounds(m: *Dsv41Model, gpa: std.mem.Allocator, prompt: []const u32, proof: bool) ![3]u64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const ctx = prompt.len;
     var st = try initState(m, gpa);
     defer st.deinit();
     var t1: u32 = blk: {
@@ -9507,12 +10205,17 @@ test "dsv41 DSpark round: draft, verify and finish timed apart, greedy (DSV41_RO
     const iou = @import("../../sdk/util/io_util.zig");
     const n = 48;
     const warm = 8;
+    const widths = if (env.get(.DSV41_ROUND_PROOF)) |v| std.mem.eql(u8, std.mem.span(v), "widths") else false;
     var ms: [3]f64 = @splat(0); // draft (build + run + read), verify (+ argmax read), finish
+    var outputs = std.hash.Wyhash.init(0);
+    var decisions = std.hash.Wyhash.init(0);
+    var verify_logits = std.hash.Wyhash.init(0);
     var accepted: usize = 0;
     for (0..n) |k| {
         const t0 = iou.nowUsMonotonic(io);
         var d = try dsparkDraft(m, gpa, &st, t1);
         defer d.deinit(gpa);
+        if (widths) d.len = @min(d.len, 1 + k % m.ds_block);
         const t_d = iou.nowUsMonotonic(io);
         var pending = try dsparkBeginWith(m, gpa, &st, t1, &d);
         defer pending.deinit();
@@ -9524,19 +10227,35 @@ test "dsv41 DSpark round: draft, verify and finish timed apart, greedy (DSV41_RO
         var a: usize = 0;
         while (a < pending.b and @as(u32, @intCast(best[a])) == d.ids[a + 1]) a += 1;
         var r = try dsparkFinish(m, gpa, &st, &pending, a, @intCast(best[a]));
-        r.deinit(gpa);
+        const t_f = iou.nowUsMonotonic(io);
+        defer r.deinit(gpa);
+        if (proof) {
+            outputs.update(std.mem.sliceAsBytes(r.tokens));
+            std.hash.autoHash(&decisions, r.accepted);
+            std.hash.autoHash(&decisions, r.next_token);
+            decisions.update(std.mem.sliceAsBytes(d.ids[0 .. d.len + 1]));
+            const logits = try hostF32(pending.vl_g);
+            defer gpa.free(logits);
+            verify_logits.update(std.mem.sliceAsBytes(logits));
+        }
         t1 = @intCast(best[a]);
         if (k < warm) continue;
         ms[0] += @floatFromInt(t_d - t0);
         ms[1] += @floatFromInt(t_v - t_d);
-        ms[2] += @floatFromInt(iou.nowUsMonotonic(io) - t_v);
+        ms[2] += @floatFromInt(t_f - t_v);
         accepted += a;
     }
+    const hashes: [3]u64 = .{ outputs.final(), decisions.final(), verify_logits.final() };
+    if (proof) std.debug.print("[round-attn] grouped_layers={d}\n", .{m.grouped_attn_layers});
+    if (proof) std.debug.print("[round-proof] exact={} width={d} misses={d} grouped_layers={d} tokens={x} decisions={x} logits={x}\n", .{
+        exactServes(m), m.ds_block, m.exact_misses, m.grouped_verify_layers, hashes[0], hashes[1], hashes[2],
+    });
     const rounds: f64 = @floatFromInt(n - warm);
     for (&ms) |*v| v.* /= rounds * 1000;
     std.debug.print("[round] ctx {d}: draft {d:.2} ms, verify {d:.2} ms, finish {d:.2} ms, {d:.2} accepted/round -> {d:.1} tok/s\n", .{
         ctx, ms[0], ms[1], ms[2], @as(f64, @floatFromInt(accepted)) / rounds, (@as(f64, @floatFromInt(accepted)) / rounds + 1) * 1000 / (ms[0] + ms[1] + ms[2]),
     });
+    return hashes;
 }
 
 test "dsv41 verify width: time of a verify block per draft count (DSV41_VERIFY_ROWS)" {

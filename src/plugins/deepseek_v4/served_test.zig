@@ -1249,3 +1249,142 @@ test "deepseek_v4 served: mlx-community's withdrawn preview pack is refused by t
     try testing.expectError(error.PluginDeclinedNoLegacy, model.parseConfig(io, testing.allocator, dir));
 }
 
+
+test "deepseek_v41 served: time greedy DSpark with adaptive draft width and backoff" {
+    const dir = env.span(.DSV41_GENERATOR_METER) orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const text_path = env.span(.DSV41_ROUND_TEXT) orelse return error.MissingPrompt;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var cfg = try model.parseConfig(io, a, dir);
+    defer cfg.deinit(a);
+    var xfm = try driver.load(io, a, &cfg, dir, mlx.gpuStream());
+    defer xfm.deinit();
+    const series = env.span(.DSV41_ROUND_SERIES) orelse "";
+    const budget = env.span(.DSV41_GENERATOR_TOKENS) orelse "192";
+    const budgets: []const u32 = if (std.mem.eql(u8, budget, "all")) &.{ 1, 2, 8, 32, 192 } else &.{try std.fmt.parseInt(u32, budget, 10)};
+    var tok = try @import("../../sdk/tokenizer/tokenizer.zig").loadTokenizer(io, a, dir);
+    defer tok.deinit();
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, text_path, a, .limited(64 << 20));
+    defer a.free(text);
+    const ids = try tok.encode(a, text[0..@min(text.len, 8192)]);
+    defer a.free(ids);
+    const prompt = ids[0..@min(ids.len, 1024)];
+    for (budgets) |limit| try timeDsparkBudget(&xfm, &tok, prompt, series, limit);
+}
+
+fn timeDsparkBudget(xfm: *Transformer, tok: *Tokenizer, prompt: []const u32, series: []const u8, limit: u32) !void {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const mdl = intree.dsv41(xfm) orelse return error.WrongPack;
+    const exact = @import("../deepseek_v41/deepseek_v41.zig").exactServes(mdl);
+    const tail_series = std.mem.eql(u8, series, "tail");
+    const policy_series = std.mem.eql(u8, series, "policy");
+    const external = std.mem.eql(u8, series, "env") or policy_series or tail_series;
+    if (!std.mem.eql(u8, series, "env")) try testing.expect(exact);
+    if (limit == 0 or limit > 192) return error.BadBudget;
+    if (tail_series) std.debug.print("[budget] {d}\n", .{limit});
+    var reference: ?u64 = null;
+    var serial_ids: [192]u32 = undefined;
+    var serial_count: usize = 0;
+    if (exact) {
+        var slot: Slot = undefined;
+        try slot.init();
+        defer slot.kv.deinit();
+        var plain = try Generator.initWithOptions(io, a, xfm, tok, prompt, limit, .{ .temperature = 0 }, &.{}, .{ .ctx = slot.ctx });
+        defer plain.deinit(a);
+        try testing.expect(!plain.dspark_enabled);
+        var tokens = std.hash.Wyhash.init(0);
+        while (try plain.next(a)) |id| {
+            try testing.expect(serial_count < serial_ids.len);
+            serial_ids[serial_count] = id;
+            serial_count += 1;
+            tokens.update(std.mem.asBytes(&id));
+        }
+        reference = tokens.final();
+        std.debug.print("[adaptive-serial] tokens={d} hash={x}\n", .{ serial_count, reference.? });
+    }
+    const Arm = enum { base, grouped, configured, prior, wide, tail, eos_probe };
+    const visits: []const Arm = if (policy_series)
+        &.{ .configured, .prior, .wide, .configured, .prior, .configured, .wide, .configured, .wide, .configured, .prior, .configured, .prior, .configured, .wide, .configured }
+    else if (tail_series)
+        &.{ .configured, .tail, .configured, .tail, .configured, .tail, .configured, .tail, .configured, .eos_probe }
+    else if (external)
+        &.{ .configured, .configured }
+    else
+        &.{ .base, .base, .grouped, .base, .grouped, .base, .grouped, .base };
+    for (visits, 0..) |arm, visit| {
+        if (arm == .eos_probe and limit != 1) continue;
+        const tail_setting = if (tail_series) env.override(.MLX_SERVE_DSV41_BUDGET_TAIL, if (arm == .tail or arm == .eos_probe) "1" else "0") else null;
+        defer if (tail_setting) |o| o.restore();
+        if (!external) {
+            mdl.exact_ffn_group = arm == .grouped;
+            mdl.exact_attn_group = arm == .grouped;
+        }
+        const group = mdl.exact_ffn_group;
+        mdl.grouped_verify_layers = 0;
+        var slot: Slot = undefined;
+        try slot.init();
+        defer slot.kv.deinit();
+        var gen = try Generator.initWithOptions(io, a, xfm, tok, prompt, limit, .{ .temperature = 0 }, &.{}, .{
+            .ctx = slot.ctx, .mtp_enabled = true, .skip_lazy_preforward = true, .lookup_prompt = prompt,
+        });
+        defer gen.deinit(a);
+        try testing.expect(gen.dspark_enabled and gen.dspark_pol != null);
+        if (arm == .eos_probe) {
+            gen.eos_token_ids = serial_ids[0..1];
+            try testing.expect((try gen.nextDspark(a)) == null);
+            try testing.expectEqualStrings("stop", gen.finish_reason);
+            try testing.expectEqual(@as(u32, 0), gen.unforwarded_tail);
+            try testing.expectEqual(prompt.len, gen.ctx.cache.step);
+            std.debug.print("[tail] final EOS suppressed\n", .{});
+            continue;
+        }
+        var tokens = std.hash.Wyhash.init(0);
+        if (policy_series) {
+            try testing.expect(exact and mdl.exact_ffn_group and mdl.exact_attn_group);
+            switch (arm) {
+                .prior => gen.dspark_pol.?.plain.ms = 24,
+                .wide => gen.dspark_pol.?.pin_rows = 6,
+                else => {},
+            }
+            std.debug.print("[policy] arm={s} visit={d}\n", .{ if (arm == .configured) "base" else @tagName(arm), visit });
+        }
+        var emitted: [192]u32 = undefined;
+        var count: usize = 0;
+        const watch = @import("../../sdk/util/io_util.zig").Stopwatch.init(io);
+        while (try gen.nextDspark(a)) |r| {
+            defer a.free(r.tokens);
+            tokens.update(std.mem.sliceAsBytes(r.tokens));
+            try testing.expect(count + r.tokens.len <= emitted.len);
+            @memcpy(emitted[count..][0..r.tokens.len], r.tokens);
+            count += r.tokens.len;
+        }
+        const ms = @as(f64, @floatFromInt(watch.read())) / std.time.ns_per_ms;
+        if (exact) try testing.expectEqualSlices(u32, serial_ids[0..serial_count], emitted[0..count]);
+        const hash = tokens.final();
+        var rows_buf: [128]u8 = undefined;
+        std.debug.print("[adaptive] visit={d} group={} tokens={d} ms={d:.2} rate={d:.2} rounds={d} plain={d} copy={d} accepted={d} grouped_layers={d} hash={x} rows={s}\n", .{
+            visit, group, count, ms, @as(f64, @floatFromInt(count)) * 1000 / ms, gen.dspark_attempted, gen.dspark_plain,
+            gen.dspark_copies, gen.dspark_accepted_tokens, mdl.grouped_verify_layers, hash, gen.dspark_stats.formatRows(&rows_buf),
+        });
+        if (tail_series) {
+            std.debug.print("[tail] on={} unforwarded={d} cache={d} attempts={d}\n", .{ arm == .tail, gen.unforwarded_tail, gen.ctx.cache.step, gen.dspark_attempted });
+            if (limit == 1 and arm == .tail) {
+                try testing.expectEqual(@as(u32, 1), gen.unforwarded_tail);
+                try testing.expectEqual(@as(u64, 0), gen.dspark_attempted);
+                try testing.expectEqual(prompt.len, gen.ctx.cache.step);
+                try testing.expectEqual(prompt.len, mdl.dec_state.?.n);
+                try testing.expectEqualStrings("length", gen.finish_reason);
+            }
+            if (gen.unforwarded_tail == 1) {
+                try testing.expectEqual(prompt.len + count - 1, gen.ctx.cache.step);
+                try testing.expectEqual(gen.ctx.cache.step, mdl.dec_state.?.n);
+            }
+        } else {
+            try testing.expect(count > 0 and gen.dspark_attempted > 0);
+            try testing.expectEqual(group and exact, mdl.grouped_verify_layers > 0);
+        }
+        if (reference) |want| try testing.expectEqual(want, hash) else reference = hash;
+    }
+}

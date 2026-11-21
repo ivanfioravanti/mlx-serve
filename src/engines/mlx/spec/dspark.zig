@@ -148,10 +148,17 @@ pub fn moduleRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStep
         try plugin_settle.activate(self.xfm, &self.ctx);
         // An exact greedy accept masks what the serial sampler masks.
         mdl.suppress = self.xfm.suppress_mask orelse .{ .ctx = null };
+        if (self.max_tokens -| self.completion_tokens == 1 and budgetTail(self, mdl)) {
+            return try @import("drafter.zig").finishKnownToken(self, allocator);
+        }
         if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;
         return self.dsparkPolicyStep(allocator, mdl);
     }
     return self.dsparkStep(allocator, dsv4_mod, intree.dsv4(self.xfm).?);
+}
+
+fn budgetTail(self: *const Generator, mdl: *const dsv41_mod.Dsv41Model) bool {
+    return !self.dspark_stochastic and dsv41_mod.exactServes(mdl) and env.one(.MLX_SERVE_DSV41_BUDGET_TAIL);
 }
 
 /// A DSpark round whose drafts are the context's own continuation after `t1` (an echo, an edit):
@@ -219,6 +226,8 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     // An exact verify stays within the decode-width rows (`maxVerifyDrafts`; the block itself otherwise).
     d.len = @min(d.len, dsv41_mod.maxVerifyDrafts(mdl));
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+    // A kept row predicts one more token. Leave that position for finishKnownToken.
+    if (cap <= d.len and budgetTail(self, mdl)) d.len = cap -| 1;
     const round = if (self.dspark_stochastic)
         try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d)
     else

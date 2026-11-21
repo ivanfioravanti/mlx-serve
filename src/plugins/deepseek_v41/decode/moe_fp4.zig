@@ -15,8 +15,12 @@ const A = mlx.mlx_array;
 pub const UP_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_up.metal");
 pub const DOWN_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_down.metal");
 pub const HEADER = moe_up.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_header.metal");
-pub const UP_INS = [_][*:0]const u8{ "x", "w", "scales", "sw", "sscales", "inds", "wts", "lim" };
-pub const DOWN_INS = [_][*:0]const u8{ "x", "w", "scales", "sw", "sscales", "inds", "res", "post", "comb" };
+pub const UP_INS = [_][*:0]const u8{ "x", "w", "scales", "sw", "sscales", "inds", "wts", "lim", "after" };
+pub const DOWN_INS = [_][*:0]const u8{ "x", "w", "scales", "sw", "sscales", "inds", "res", "post", "comb", "xs" };
+
+/// How the gate/up launch is cut: every slot, the shared expert alone (it reads no route, so it runs beside the
+/// router), or the routed picks alone.
+pub const UpMode = enum(c_int) { all = 0, shared = 1, routed = 2 };
 
 /// Threads a threadgroup of the gate/up launch: two simdgroups.
 const up_threads = 64;
@@ -37,7 +41,10 @@ pub const Kernels = struct {
 pub fn build(limit: f32) !Kernels {
     const up = try dsv41.buildKernel("dsv41_dec_moe_fp4_up", &UP_INS, &.{"out"}, UP_SOURCE, HEADER);
     errdefer _ = mlx.mlx_fast_metal_kernel_free(up);
-    const down = try dsv41.buildKernel("dsv41_dec_moe_fp4_down", &DOWN_INS, &.{"out"}, DOWN_SOURCE, HEADER);
+    const device = @import("../../../mlx/device.zig");
+    const stripe = @import("../../../env.zig").one(.MLX_SERVE_DSV41_STRIPE_DOWN) and device.deviceGeneration().gen == 15 and !device.naxAvailable();
+    const down_header: [*:0]const u8 = if (stripe) HEADER ++ "\n#define DSV41_STRIPE_DOWN 1\n" else HEADER;
+    const down = try dsv41.buildKernel("dsv41_dec_moe_fp4_down", &DOWN_INS, &.{"out"}, DOWN_SOURCE, down_header);
     return .{ .up = up, .down = down, .lim = mlx.mlx_array_new_data(&[_]f32{limit}, &[_]c_int{1}, 1, .float32) };
 }
 
@@ -78,16 +85,64 @@ pub fn moeUp(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernels, ly: *c
     return try runUp(sc, kern, rows, k, n, topk, h2, vgu.w, vgu.s, sgu.w, sgu.s, idx, wts);
 }
 
+/// `moeUp`'s shape and format checks alone.
+pub fn servesUp(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, h2: A, topk: usize) bool {
+    const gu = ly.experts.gu orelse return false;
+    const sgu = ly.shared_gu orelse return false;
+    if (!mlx.streamIsGpu(sc.s) or gu.s.ctx == null or gu.b.ctx != null or sgu.s.ctx == null) return false;
+    if (mlx.getShape(h2).len != 2 or mlx.getShape(gu.w).len != 3) return false;
+    const rows = dims(h2, 0);
+    const k = dims(h2, 1);
+    const n2 = dims(gu.w, 1);
+    if (rows < 1 or rows > decode.max_rows or topk < 1 or topk > 16 or k == 0 or k % 1024 != 0 or n2 % 2 != 0) return false;
+    if (gu.qp.mode != .mxfp4 or gu.qp.bits != 4 or gu.qp.group_size != 32 or dims(gu.w, 2) != k / 8 or dims(gu.s, 1) != n2 or dims(gu.s, 2) != k / 32) return false;
+    if (sgu.qp.mode != .mxfp8 or sgu.qp.bits != 8 or sgu.qp.group_size != 32) return false;
+    if (mlx.mlx_array_dtype(h2) != .bfloat16 or h2.ctx == null or m.act != .bfloat16) return false;
+    if (mlx.mlx_array_dtype(gu.w) != .uint32 or mlx.mlx_array_dtype(gu.s) != .uint8) return false;
+    const sw = mlx.getShape(sgu.w);
+    const ss = mlx.getShape(sgu.s);
+    if (sw.len != 2 or ss.len != 2 or sw[0] != ci(n2) or sw[1] != ci(k / 4) or ss[0] != ci(n2) or ss[1] != ci(k / 32)) return false;
+    return mlx.mlx_array_dtype(sgu.w) == .uint32 and mlx.mlx_array_dtype(sgu.s) == .uint8;
+}
+
+/// The shared expert's slot of `moeUp` as its own launch, `[R, N]`: it needs no route. Call after `servesUp`.
+pub fn sharedUp(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, h2: A, topk: usize) !A {
+    const sgu = ly.shared_gu.?;
+    const n = dims(sgu.w, 0) / 2;
+    return launchUp(sc, kern, .shared, dims(h2, 0), dims(h2, 1), n, topk, h2, sgu.w, sgu.s, sgu.w, sgu.s, sgu.w, kern.lim, kern.lim);
+}
+
+/// The routed slots of `moeUp` as their own launch, `[R, k, N]`, encoded behind `after` (the shared launch, so the
+/// router's last kernel shares its span). Call after `servesUp`.
+pub fn routedUp(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, h2: A, idx: A, wts: A, after: A) !A {
+    const vgu = if (ly.experts.views) |v| v[0] else ly.experts.gu.?;
+    const sgu = ly.shared_gu.?;
+    return launchUp(sc, kern, .routed, dims(h2, 0), dims(h2, 1), dims(sgu.w, 0) / 2, dims(idx, 1), h2, vgu.w, vgu.s, sgu.w, sgu.s, idx, wts, after);
+}
+
 /// The gate/up launch over arrays already checked.
 pub fn runUp(sc: *dsv41.Scope, kern: Kernels, rows: usize, k: usize, n: usize, topk: usize, x: A, w: A, scales: A, sw: A, sscales: A, idx: A, wts: A) !A {
+    return launchUp(sc, kern, .all, rows, k, n, topk, x, w, scales, sw, sscales, idx, wts, kern.lim);
+}
+
+fn launchUp(sc: *dsv41.Scope, kern: Kernels, mode: UpMode, rows: usize, k: usize, n: usize, topk: usize, x: A, w: A, scales: A, sw: A, sscales: A, idx: A, wts: A, after: A) !A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(rows), ci(topk + 1), ci(n) }, 3, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(32 * n * (topk * rows + 1)), 1, 1));
+    const slots: usize = switch (mode) {
+        .all => topk * rows + 1,
+        .shared => 1,
+        .routed => topk * rows,
+    };
+    switch (mode) {
+        .all => try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(rows), ci(topk + 1), ci(n) }, 3, .bfloat16)),
+        .shared => try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(rows), ci(n) }, 2, .bfloat16)),
+        .routed => try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(rows), ci(topk), ci(n) }, 3, .bfloat16)),
+    }
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(32 * n * slots), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, up_threads, 1, 1));
-    inline for (.{ .{ "R", rows }, .{ "K", k }, .{ "N", n }, .{ "TOPK", topk } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    inline for (.{ .{ "R", rows }, .{ "K", k }, .{ "N", n }, .{ "TOPK", topk }, .{ "MODE", @as(usize, @intCast(@intFromEnum(mode))) } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
-    const ins = [_]A{ x, w, scales, sw, sscales, idx, wts, kern.lim };
+    const ins = [_]A{ x, w, scales, sw, sscales, idx, wts, kern.lim, after };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -112,6 +167,11 @@ pub fn downCols(k: usize, n: usize, hc: usize) ?usize {
 /// `act` `[R, k + 1, K]` (what `moeUp` makes). Null where the kernel does not serve the call: the down bank is not
 /// mxfp4 group 32, the shared is not mxfp8, the stream is not bf16, or K is not a multiple of 32.
 pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, idx: A, x1: A, sp: *const dsv41.Split) !?A {
+    return moeDownSplit(sc, kern, ly, act, null, idx, x1, sp);
+}
+
+/// `moeDown` with the shared expert's activation apart (`xs` `[R, K]`, `act` then `[R, k, K]`).
+pub fn moeDownSplit(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, xs: ?A, idx: A, x1: A, sp: *const dsv41.Split) !?A {
     if (!mlx.streamIsGpu(sc.s)) return null;
     const down = if (ly.experts.views) |v| &v[1] else &ly.experts.down;
     const shared = &ly.shared[2];
@@ -121,7 +181,7 @@ pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, 
     const N = dims(x1, 2);
     const hc = dims(x1, 1);
     const topk = dims(idx, 1);
-    if (R < 1 or R > decode.max_rows or dims(act, 1) != topk + 1 or dims(x1, 0) != R or dims(idx, 0) != R or topk < 1 or topk > 16 or hc < 1 or hc > 32) return null;
+    if (R < 1 or R > decode.max_rows or dims(act, 1) != topk + @intFromBool(xs == null) or dims(x1, 0) != R or dims(idx, 0) != R or topk < 1 or topk > 16 or hc < 1 or hc > 32) return null;
     if (K == 0 or K % 32 != 0 or sp.post.ctx == null or sp.comb.ctx == null) return null;
     if (down.qp.mode != .mxfp4 or down.qp.bits != 4 or down.qp.group_size != 32 or down.s.ctx == null or down.b.ctx != null) return null;
     if (shared.qp.mode != .mxfp8 or shared.qp.bits != 8 or shared.qp.group_size != 32 or shared.s.ctx == null) return null;
@@ -139,8 +199,10 @@ pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, 
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / nc * tg), ci(R), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
     inline for (.{ .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc }, .{ "NC", nc } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "SPLIT", xs != null));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
-    const ins = [_]A{ act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb };
+    if (xs) |v| if (mlx.mlx_array_dtype(v) != .bfloat16 or mlx.mlx_array_size(v) != R * K) return null;
+    const ins = [_]A{ act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb, xs orelse act };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();

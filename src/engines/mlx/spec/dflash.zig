@@ -90,15 +90,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     // stretch has no such token: its last one comes out of `next`.)
     if (!self.done and !self.spec_disabled_runtime and self.max_tokens -| self.completion_tokens == 1 and !self.has_pending_logits and !self.has_pending_token) {
         if (try self.checkStop()) return null;
-        const tokens = try allocator.alloc(u32, 1);
-        errdefer allocator.free(tokens);
-        tokens[0] = self.next_token_id;
-        try self.generated_ids.append(allocator, tokens[0]);
-        self.advanceStep(1);
-        self.unforwarded_tail = 1;
-        self.done = true;
-        self.finish_reason = "length";
-        return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+        return try @import("drafter.zig").finishKnownToken(self, allocator);
     }
     // The kv term is the same physics for either block decoder (one
     // forward, one KV read, shared across the block's rows), so a DFlash

@@ -15,7 +15,7 @@ const int sp = threadgroup_position_in_grid.z, chunk = (nw + K + S - 1) / S;
 const int t_lo = sp * chunk, t_hi = metal::min(nw + K, t_lo + chunk);
 for (int t = t_lo + sg; t < t_hi; t += NSG) {
   const device KT* row;
-  if (t < nw) row = ring + size_t((lo + t) % cap) * D;
+  if (t < nw) row = (FRESH && lo + t >= meta[6]) ? fresh + size_t(lo + t - meta[6]) * D : ring + size_t((lo + t) % cap) * D;
   else {
     const int c = topk[i * K + t - nw];
     if (c < 0 || c >= nc) continue;

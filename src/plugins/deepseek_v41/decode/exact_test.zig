@@ -184,13 +184,16 @@ fn checkCase(fx: *fixture.Fixture, in: Inputs, p0: usize, R: usize, keep: usize,
 }
 
 fn runGate(exact_on: bool) !Tally {
+    const fp4 = env.on(.DSV41_EXACT_GATE_FP4);
     const gpa = std.testing.allocator;
     var tally: Tally = .{};
     var ab: [64]u8 = undefined;
     std.debug.print("[exact-gate] gpu {s}, NAX {any}, exact={any}\n", .{ device.gpuArchitecture(&ab) orelse "?", device.naxAvailable(), exact_on });
     var misses: u64 = 0;
+    var grouped_ffn: u64 = 0;
+    var grouped_attn: u64 = 0;
     for (ranges) |rg| for (rg.p0s) |p0| {
-        const fx = try fixture.Fixture.init(gpa, .{ .lo = rg.lo, .hi = rg.hi, .ctx = p0 - 1, .seed = 7 + p0, .act = .bfloat16, .fused = true });
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = rg.lo, .hi = rg.hi, .ctx = p0 - 1, .seed = 7 + p0, .act = .bfloat16, .fused = true, .experts_fp4 = fp4 });
         defer fx.deinit();
         fx.m.exact = dsv41.exactBatched(.{ .on = exact_on }, env.get(.DSV41_EXACT_GATE_BATCHED));
         fx.m.exact_pair_ok = true;
@@ -209,7 +212,13 @@ fn runGate(exact_on: bool) !Tally {
         const label = try std.fmt.bufPrint(&label_buf, "layers {d}..{d}", .{ rg.lo, rg.hi });
         for (2..max_rows + 1) |R| for (1..R + 1) |keep| try checkCase(fx, in, p0, R, keep, &tally, label);
         misses += fx.m.exact_misses;
+        grouped_ffn += fx.m.grouped_verify_layers;
+        grouped_attn += fx.m.grouped_attn_layers;
     };
+    if (exact_on and fp4 and env.get(.DSV41_EXACT_GATE_BATCHED) == null) {
+        if (env.one(.MLX_SERVE_DSV41_VERIFY_FFN)) try std.testing.expect(grouped_ffn > 0);
+        if (env.one(.MLX_SERVE_DSV41_VERIFY_ATTN)) try std.testing.expect(grouped_attn > 0);
+    }
     tally.misses = misses;
     std.debug.print("[exact-gate] exact={any}: {d} cases, {d} rows differ, {d} probe steps differ, {d} states differ, {d} exact misses\n", .{ exact_on, tally.cases, tally.row_diffs, tally.probe_diffs, tally.state_diffs, misses });
     return tally;

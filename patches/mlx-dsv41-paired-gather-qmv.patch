@@ -1,0 +1,204 @@
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -1,4 +1,7 @@
+ // Copyright © 2023-2026 Apple Inc.
++
++#include <cstdio>
++#include <cstdlib>
+ 
+ #include "mlx/backend/common/quantized.h"
+ #include "mlx/backend/common/broadcasting.h"
+@@ -1730,7 +1733,8 @@
+     int K,
+     metal::Device& d,
+     const Stream& s,
+-    const std::string& mode) {
++    const std::string& mode,
++    bool right_sorted = false) {
+   int B = out.size() / M / N;
+ 
+   int bn = 8;
+@@ -1752,15 +1756,28 @@
+       bits,
+       global_scale ? "_hgs_1" : "_hgs_0");
+ 
+-  auto kernel = get_quantized_kernel_wrapped(
+-      d,
+-      kname,
+-      (fast ? "gather_qmv_fast" : "gather_qmv"),
+-      mode,
+-      type_string,
+-      group_size,
+-      bits,
+-      global_scale.has_value());
++  static const bool try_pairs = [] {
++    const char* flag = std::getenv("MLX_SERVE_DSV41_PAIRED_QMV");
++    return flag && flag[0] == '1' && flag[1] == '\0';
++  }();
++  const bool paired = try_pairs && right_sorted && M == 1 && B >= 16 &&
++      d.get_architecture_gen() == 15 && !metal::is_nax_available() &&
++      mode == "mxfp4" && !global_scale && x.dtype() == bfloat16 &&
++      group_size == 32 && bits == 4 && w.ndim() == 3 && w.shape(0) == 384 &&
++      x.ndim() == 3 && x.flags().row_contiguous && x.strides()[0] == K &&
++      lhs_indices.ndim() == 1 && lhs_indices.strides()[0] == 1 &&
++      rhs_indices.ndim() == 1 && rhs_indices.strides()[0] == 1 &&
++      ((K == 5120 && N == 4608) || (K == 2304 && N == 5120));
++  if (paired) {
++    static const int reported = std::fputs("[dsv41] paired MXFP4 gather engaged\n", stderr);
++    (void)reported;
++  }
++  const char* func = fast ? "gather_qmv_fast" : "gather_qmv";
++  auto kernel = paired
++      ? get_quantized_kernel_wrapped(
++            d, kname + "_paired", func, mode, type_string, group_size, bits, false, true)
++      : get_quantized_kernel_wrapped(
++            d, kname, func, mode, type_string, group_size, bits, global_scale.has_value());
+ 
+   auto& compute_encoder = metal::get_command_encoder(s);
+   compute_encoder.set_compute_pipeline_state(kernel);
+@@ -2451,7 +2468,8 @@
+         K,
+         d,
+         s,
+-        mode);
++        mode,
++        right_sorted_);
+     return;
+   }
+ 
+--- a/mlx/backend/metal/kernels/fp_quantized.h
++++ b/mlx/backend/metal/kernels/fp_quantized.h
+@@ -1958,7 +1958,82 @@
+       w, scales, nullptr, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
+ }
+ 
+-template <typename T, int group_size, int bits, bool has_global_scale = false>
++// Consecutive input rows assigned to the same expert share the packed words
++// and scale. Each row retains qdot's four-product groups and SIMD reduction.
++template <int V, typename T>
++METAL_FUNC bool fp_try_paired_rows(
++    const device uint32_t* w,
++    const device uint8_t* scales,
++    const device T* x,
++    const device uint32_t* lhs_indices,
++    const device uint32_t* rhs_indices,
++    device T* y,
++    int K,
++    int N,
++    int rows,
++    int64_t w_stride,
++    int64_t scale_stride,
++    uint3 tid,
++    uint simd_gid,
++    uint lane) {
++  const uint first = tid.z & ~1u;
++  if (first + 1 >= uint(rows) ||
++      rhs_indices[first] != rhs_indices[first + 1] ||
++      lhs_indices[first + 1] != lhs_indices[first] + 1) {
++    return false;
++  }
++  if (tid.z != first) {
++    return true;
++  }
++
++  w += size_t(rhs_indices[first]) * w_stride;
++  scales += size_t(rhs_indices[first]) * scale_stride;
++  x += size_t(lhs_indices[first]) * K;
++  y += size_t(first) * N;
++  const uint col = tid.y * 8 + simd_gid * 4;
++  float sum0[4] = {}, sum1[4] = {};
++  for (int k = lane * V; k < K; k += 32 * V) {
++    float x0[V], x1[V];
++    for (int v = 0; v < V; ++v) {
++      x0[v] = float(x[k + v]);
++      x1[v] = float(x[K + k + v]);
++    }
++    for (int j = 0; j < 4; ++j) {
++      const size_t row = col + j;
++      const device ushort* codes =
++          (const device ushort*)(w + row * (K / 8) + k / 8);
++      const float scale = dequantize_scale<float, 32>(
++          scales[row * (K / 32) + k / 32]);
++      float dot0 = 0, dot1 = 0;
++#pragma unroll
++      for (int v = 0; v < V; v += 4) {
++        const uint word = codes[v / 4];
++        const float w0 = Dequantize<4>{}(word);
++        const float w1 = Dequantize<4>{}(word >> 4);
++        const float w2 = Dequantize<4>{}(word >> 8);
++        const float w3 = Dequantize<4>{}(word >> 12);
++        dot0 += x0[v] * w0 + x0[v + 1] * w1 +
++            x0[v + 2] * w2 + x0[v + 3] * w3;
++        dot1 += x1[v] * w0 + x1[v + 1] * w1 +
++            x1[v + 2] * w2 + x1[v + 3] * w3;
++      }
++      sum0[j] += scale * dot0;
++      sum1[j] += scale * dot1;
++    }
++  }
++  for (int j = 0; j < 4; ++j) {
++    const float a = simd_sum(sum0[j]);
++    const float b = simd_sum(sum1[j]);
++    if (lane == 0) {
++      y[col + j] = T(a);
++      y[N + col + j] = T(b);
++    }
++  }
++  return true;
++}
++
++template <typename T, int group_size, int bits, bool has_global_scale = false,
++    bool paired = false>
+ [[kernel]] void fp_gather_qmv_fast(
+     const device uint32_t* w,
+     const device uint8_t* scales,
+@@ -1984,6 +2059,13 @@
+     uint simd_gid [[simdgroup_index_in_threadgroup]],
+     uint simd_lid [[thread_index_in_simdgroup]]) {
+   int M = x_shape[x_batch_ndims];
++  if constexpr (paired) {
++    if (fp_try_paired_rows<16>(w, scales, x, lhs_indices, rhs_indices, y,
++                               in_vec_size, out_vec_size, batch_shape[0],
++                               w_strides[0], s_strides[0], tid, simd_gid, simd_lid)) {
++      return;
++    }
++  }
+   adjust_matrix_offsets<has_global_scale>(
+       x,
+       w,
+@@ -2018,7 +2100,8 @@
+       simd_lid);
+ }
+ 
+-template <typename T, int group_size, int bits, bool has_global_scale = false>
++template <typename T, int group_size, int bits, bool has_global_scale = false,
++    bool paired = false>
+ [[kernel]] void fp_gather_qmv(
+     const device uint32_t* w,
+     const device uint8_t* scales,
+@@ -2044,6 +2127,13 @@
+     uint simd_gid [[simdgroup_index_in_threadgroup]],
+     uint simd_lid [[thread_index_in_simdgroup]]) {
+   int M = x_shape[x_batch_ndims];
++  if constexpr (paired) {
++    if (fp_try_paired_rows<8>(w, scales, x, lhs_indices, rhs_indices, y,
++                               in_vec_size, out_vec_size, batch_shape[0],
++                               w_strides[0], s_strides[0], tid, simd_gid, simd_lid)) {
++      return;
++    }
++  }
+   adjust_matrix_offsets<has_global_scale>(
+       x,
+       w,
+--- a/mlx/backend/metal/kernels/fp_quantized.metal
++++ b/mlx/backend/metal/kernels/fp_quantized.metal
+@@ -267,3 +267,9 @@
+ instantiate_quantized_all_quants_no_global_scale(float16_t)
+ instantiate_quantized_all_quants_no_global_scale(bfloat16_t)
+ // clang-format on
++
++
++instantiate_kernel("mxfp4_gather_qmv_fast_bfloat16_t_gs_32_b_4_hgs_0_paired",
++    fp_gather_qmv_fast, bfloat16_t, 32, 4, false, true)
++instantiate_kernel("mxfp4_gather_qmv_bfloat16_t_gs_32_b_4_hgs_0_paired",
++    fp_gather_qmv, bfloat16_t, 32, 4, false, true)
