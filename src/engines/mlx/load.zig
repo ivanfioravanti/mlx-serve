@@ -39,6 +39,12 @@ const engines_served = @import("../../host/engines/served.zig");
 const engines_load = @import("runtime/engine_load.zig");
 const publishHotCacheResidency = @import("cache/budget.zig").publishHotCacheResidency;
 const Scheduler = @import("scheduler.zig").Scheduler;
+
+/// Disk bytes of the drafter at `sidecar`: the one file when the trunk pack carries it, else the directory.
+fn drafterDiskBytes(sch: *Scheduler, sidecar: []const u8, model_dir: []const u8) u64 {
+    if (std.mem.eql(u8, sidecar, model_dir)) return dflash_mod.trunkDraftBytes(sch.io, sch.allocator, sidecar);
+    return modelDiskBytes(sch.io, sidecar);
+}
 const logWiredPolicy = @import("runtime/load_requests.zig").logWiredPolicy;
 const makeRoomInRam = @import("runtime/load_requests.zig").makeRoomInRam;
 const doLoadGenOnInferenceThread = @import("runtime/media_load.zig").doLoadGenOnInferenceThread;
@@ -120,7 +126,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (!scheduler_mod.skip_mem_preflight) {
         const gb = 1024.0 * 1024.0 * 1024.0;
         const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
-        const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
+        const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(drafterDiskBytes(sch, sidecar, params.model_dir), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
         const mtp_on = params.config.mtp_override orelse params.mtp_enabled;
         const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, mtp_on);
         const coarse_bytes = if (mtp_on) mtpCoarseBytes(params.config, mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) else 0;
@@ -159,7 +165,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     {
         const sidecar = chosen_drafter orelse in_dir_drafter orelse "";
-        const total = model_bytes + (if (sidecar.len > 0) modelDiskBytes(sch.io, sidecar) else 0);
+        const total = model_bytes + (if (sidecar.len > 0) drafterDiskBytes(sch, sidecar, params.model_dir) else 0);
         params.entry.load_progress.beginReading(total, status.getAppMemFootprintMb(), io_util.nowMsMonotonic(sch.io));
     }
 

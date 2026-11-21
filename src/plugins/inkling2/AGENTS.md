@@ -24,8 +24,15 @@ attention block, `rel_attn.zig` the attention read and its simdgroup kernel, `re
 - Images: no resize (the processor pads to whole 40-pixel blocks at -1/255; an image over the engine's pixel budget
   is shrunk first), one row per block, spliced AFTER the embedding norm. The host renders no-think (`reasoning_effort`
   none = `Thinking effort level: 0.0`) unless the client asks; the reference's default is 0.9.
-- Serial (`batched_rows` refused), spec off (the pack ships no `mtp.safetensors`); PLD's partial accepts roll the conv
-  windows back from `.conv_input`.
+- Serial (`batched_rows` refused). A verify forward leaves `.conv_input`, from which PLD's and the drafter's partial
+  accepts roll the conv windows back.
+- Drafter: the checkpoint's DSpark (`mtp.safetensors` beside the pack; `mtp_config` in the trunk's `config.json`) is
+  the engine's block drafter in its tap-mix variant (`spec/dflash`, `DflashConfig.tap_mix`). Its taps are the residual
+  ENTERING visits 5, 23 and 41 (captured as the outputs of 4, 22, 40) and the final-normed output, published at
+  capture id = the visit count. The mlx-community 4-bit pack ships no drafter file: copy the original repo's.
+- A drafted row and a decode row round differently (a verify chunk under 9 rows takes the fp32 op chain, a decode row
+  MLX's fused attention), so a tie between two tokens can fall the other way: drafted text is not serial's byte for
+  byte. Oracle: `tests/dump_inkling2_drafter_fixtures.py` (oMLX's drafter modules, vLLM's context windows).
 - Declined by name: a variable loop, shared experts, a core off the block boundaries, `use_value_norm_no_gamma` or
   `attn_res_normalize_values` off, q/o biases.
 - Oracle: mlx-lm PR #2086 on `mlx-community/Inkling-2-Mini-4bit` (`tests/dump_inkling2_fixtures.py`,

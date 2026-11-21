@@ -66,6 +66,38 @@ pub const DflashPol = struct {
     plain_watch: ?io_util.Stopwatch = null,
 };
 
+/// A tap-mix drafter's block: the trunk's normed embedding of `t1`, then `rows - 1` copies of its mask vector.
+fn mixNoise(xfm: *const Transformer, mix: *const dflash_mod.TapMix, t1: u32, rows: u32, eps: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const id: i32 = @intCast(t1);
+    const ids = mlx.mlx_array_new_data(&id, &[_]c_int{ 1, 1 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+    const raw = try xfm.rawEmbedding(ids);
+    defer _ = mlx.mlx_array_free(raw);
+    var anchor = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(anchor);
+    try mlx.check(mlx.mlx_fast_rms_norm(&anchor, raw, mix.embed_norm, eps, s));
+    if (rows == 1) {
+        var only = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&only, anchor));
+        return only;
+    }
+    const h = mlx.getShape(raw)[2];
+    var mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask);
+    try mlx.check(mlx.mlx_astype(&mask, mix.mask_embed, mlx.mlx_array_dtype(anchor), s));
+    var masks = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(masks);
+    try mlx.check(mlx.mlx_broadcast_to(&masks, mask, &[_]c_int{ 1, @intCast(rows - 1), h }, 3, s));
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    _ = mlx.mlx_vector_array_append_value(vec, anchor);
+    _ = mlx.mlx_vector_array_append_value(vec, masks);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
+    return out;
+}
+
 /// DFlash block-drafter step. ONE assistant forward proposes
 /// `block_size - 1` drafts, conditioned on the trunk's cached
 /// target_layer_ids hiddens (the per-request `dflash_ctx`); the trunk
@@ -260,7 +292,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     const noise_input = mlx.mlx_array_new_data(noise_ids.ptr, &noise_shape, 2, .int32);
     defer _ = mlx.mlx_array_free(noise_input);
     // RAW table rows — no embed norm, no scale (the DFlash contract).
-    const noise_embeds = try xfm.rawEmbedding(noise_input);
+    const noise_embeds = if (model.mix) |*mix| try mixNoise(xfm, mix, t1, noise_rows, model.config.rms_norm_eps, s) else try xfm.rawEmbedding(noise_input);
     defer _ = mlx.mlx_array_free(noise_embeds);
 
     const blk_hidden = try dflash_mod.forwardBlock(model, dctx, noise_embeds, anchor_pos);
@@ -355,6 +387,8 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         }
         var prev: u32 = t1;
         var step: u32 = 0;
+        var markov_round: dflash_mod.MarkovRound = .{};
+        defer markov_round.deinit();
         while (step < m) : (step += 1) {
             var base_row = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(base_row);
@@ -364,7 +398,15 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
                 const strides = [_]c_int{ 1, 1, 1 };
                 try mlx.check(mlx.mlx_slice(&base_row, draft_logits, &start, 3, &stop, 3, &strides, 3, s));
             }
-            const corrected = try mh.stepLogits(base_row, prev, s);
+            const corrected = if (mh.rnn) |*rnn| blk: {
+                // Mask row `step` of the block follows the anchor row.
+                var hidden_row = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(hidden_row);
+                const hsh = mlx.getShape(blk_hidden);
+                const at: c_int = @intCast(step + 1);
+                try mlx.check(mlx.mlx_slice(&hidden_row, blk_hidden, &[_]c_int{ 0, at, 0 }, 3, &[_]c_int{ 1, at + 1, hsh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+                break :blk try rnn.step(&markov_round, mh.w1, base_row, hidden_row, dctx.anchor, prev, s);
+            } else try mh.stepLogits(base_row, prev, s);
             defer _ = mlx.mlx_array_free(corrected);
             if (stochastic) {
                 // Sample the step from the request's own filtered

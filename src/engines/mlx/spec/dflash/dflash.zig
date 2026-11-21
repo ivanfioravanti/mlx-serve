@@ -42,6 +42,7 @@ const simd_qmm = @import("../../../../sdk/blocks/qmm/simd_qmm.zig");
 const lane_qmm = @import("../../../../sdk/blocks/qmm/lane_qmm.zig");
 const ane_mod = @import("../../../../sdk/ane/offload.zig");
 const lilicorr_mod = @import("lilicorr.zig");
+const Scope = @import("../../../../mlx/scope.zig").Scope;
 
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
@@ -116,8 +117,18 @@ pub const DflashConfig = struct {
     /// A trained sidecar head uses the target's token ids without remapping.
     has_own_lm_head: bool = false,
     draft_vocab_size: u32 = 0,
-    /// Owned when `lilicorr` (same length as `target_layer_ids`). Empty otherwise.
+    /// Owned when `lilicorr` or `tap_mix` (same length as `target_layer_ids`). Empty otherwise.
     capture_ids: []u32 = &.{},
+    /// Inkling 2's DSpark, read off the TRUNK's `mtp_config` (the drafter is `mtp.safetensors` beside the pack): the
+    /// context is the raw taps, mixed per drafter layer with softmax weights and projected by that layer's own
+    /// context K/V; the mask rows are one learned vector and the anchor row the trunk's normed embedding; the Markov
+    /// head is recurrent. A target id is the residual ENTERING that trunk layer; the last one, equal to the trunk's
+    /// depth, is its final-normed output. A local layer keeps the newest `sliding_window` context rows and the block
+    /// is never masked (vLLM's drafter; oMLX keeps `window - 1` rows on every layer).
+    tap_mix: bool = false,
+    /// The softcap the recurrent Markov head applies after its bias (the trunk's), and the vocab rows it drafts from.
+    markov_softcap: f32 = 0,
+    draft_rows: u32 = 0,
 
     pub fn isDflash2(self: *const DflashConfig) bool {
         return self.selector_rank > 0 or self.conv_kernel_size > 0;
@@ -175,7 +186,95 @@ pub fn probeIsDflash(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
+    if (trunkMtp(parsed.value.object) != null) return hasTrunkDraftFile(io, allocator, model_dir);
     return isDflashConfigJson(parsed.value.object);
+}
+
+/// The drafter a trunk pack carries beside its own shards (Inkling 2).
+pub const TRUNK_DRAFT_FILE = "mtp.safetensors";
+
+/// A trunk config's `mtp_config` when it describes the tap-mix block drafter (a recurrent Markov head).
+fn trunkMtp(root: std.json.ObjectMap) ?std.json.ObjectMap {
+    const mtp = root.get("mtp_config") orelse return null;
+    if (mtp != .object or root.get("text_config") == null) return null;
+    const kind = mtp.object.get("markov_head_type") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "rnn_hidden")) return null;
+    return mtp.object;
+}
+
+fn hasTrunkDraftFile(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    return trunkDraftBytes(io, allocator, model_dir) > 0;
+}
+
+/// Disk bytes of the drafter file a trunk pack carries at `dir`; 0 when it has none.
+pub fn trunkDraftBytes(io: std.Io, allocator: std.mem.Allocator, dir: []const u8) u64 {
+    const path = std.fs.path.join(allocator, &.{ dir, TRUNK_DRAFT_FILE }) catch return 0;
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return 0;
+    defer file.close(io);
+    return (file.stat(io) catch return 0).size;
+}
+
+/// The tap-mix drafter's config from the trunk's own `config.json`.
+fn parseTrunkMtp(allocator: std.mem.Allocator, root: std.json.ObjectMap, mtp: std.json.ObjectMap) !DflashConfig {
+    const text = root.get("text_config").?;
+    if (text != .object) return error.IncompleteDflashConfig;
+    const need = struct {
+        fn f(o: std.json.ObjectMap, key: []const u8) !u32 {
+            return jsonU32(o.get(key) orelse return error.IncompleteDflashConfig);
+        }
+    }.f;
+    inline for (.{ "q_bias", "o_bias" }) |k| if (mtp.get(k)) |v| {
+        if (v == .bool and v.bool) return error.UnsupportedDflashAttention;
+    };
+    const num_layers = try need(mtp, "num_hidden_layers");
+    const block_size = try need(mtp, "block_size");
+    const window = try need(mtp, "sliding_window_size");
+    if (num_layers == 0 or num_layers > 64 or block_size < 2 or window < 2) return error.InvalidDflashConfigValue;
+
+    const tl = mtp.get("target_layer_ids") orelse return error.IncompleteDflashConfig;
+    if (tl != .array or tl.array.items.len < 2 or tl.array.items.len > 16) return error.InvalidDflashTargetLayers;
+    const target_layer_ids = try allocator.alloc(u32, tl.array.items.len);
+    errdefer allocator.free(target_layer_ids);
+    const capture_ids = try allocator.alloc(u32, tl.array.items.len);
+    errdefer allocator.free(capture_ids);
+    for (tl.array.items, 0..) |elem, i| {
+        target_layer_ids[i] = try jsonU32(elem);
+        if (target_layer_ids[i] == 0 or (i > 0 and target_layer_ids[i] <= target_layer_ids[i - 1])) return error.InvalidDflashTargetLayers;
+        // The engine keeps a layer's OUTPUT; the last tap is the final-normed output, published at the trunk's depth.
+        capture_ids[i] = if (i + 1 == tl.array.items.len) target_layer_ids[i] else target_layer_ids[i] - 1;
+    }
+    // A local layer attends the newest `window` committed positions, the others all of them.
+    const layer_types = try allocator.alloc(LayerType, num_layers);
+    errdefer allocator.free(layer_types);
+    @memset(layer_types, .full_attention);
+    if (mtp.get("local_layer_ids")) |ll| if (ll == .array) for (ll.array.items) |elem| {
+        const i = try jsonU32(elem);
+        if (i >= num_layers) return error.InvalidDflashConfigValue;
+        layer_types[i] = .sliding_attention;
+    };
+
+    const vocab = try need(text.object, "vocab_size");
+    return .{
+        .hidden_size = try need(mtp, "hidden_size"),
+        .num_hidden_layers = num_layers,
+        .num_attention_heads = try need(mtp, "num_attention_heads"),
+        .num_key_value_heads = try need(mtp, "num_key_value_heads"),
+        .head_dim = try need(mtp, "head_dim"),
+        .intermediate_size = try need(mtp, "intermediate_size"),
+        .rms_norm_eps = if (mtp.get("rms_norm_eps")) |v| jsonFloat(v) else 1e-6,
+        .rope_theta = if (mtp.get("rope_theta")) |v| jsonFloat(v) else 1e6,
+        .sliding_window = window,
+        .layer_types = layer_types,
+        .block_size = block_size,
+        .mask_token_id = 0,
+        .target_layer_ids = target_layer_ids,
+        .capture_ids = capture_ids,
+        .markov_rank = try need(mtp, "markov_rank"),
+        .tap_mix = true,
+        .markov_softcap = if (text.object.get("final_logit_softcapping")) |v| jsonFloat(v) else 0,
+        .draft_rows = if (text.object.get("unpadded_vocab_size")) |v| try jsonU32(v) else vocab,
+    };
 }
 
 fn readConfigFile(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ![]u8 {
@@ -206,6 +305,8 @@ pub fn resolveInDirDrafter(io: std.Io, allocator: std.mem.Allocator, model_dir: 
     const own = std.fs.path.join(allocator, &.{ model_dir, IN_DIR_SUBDIR }) catch return null;
     if (probeIsDflash(io, allocator, own)) return own;
     allocator.free(own);
+    // A trunk that carries its drafter as one file is its own drafter dir.
+    if (probeIsDflash(io, allocator, model_dir)) return allocator.dupe(u8, model_dir) catch null;
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return null;
     defer dir.close(io);
     var pick: ?[]u8 = null;
@@ -252,6 +353,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
     if (parsed.value != .object) return error.NotDflashConfig;
     const root = parsed.value.object;
 
+    if (trunkMtp(root)) |mtp| return parseTrunkMtp(allocator, root, mtp);
     const contract = dflashContractObject(root) orelse return error.NotDflashConfig;
     const has_own_lm_head = if (root.get("has_own_lm_head")) |v| switch (v) {
         .bool => v.bool,
@@ -490,6 +592,12 @@ pub fn validateTargetLayers(ids: []const u32, trunk_num_layers: u32) !void {
     }
 }
 
+/// A tap-mix drafter's capture ids: layer outputs, then the trunk's final-normed output at its depth.
+fn validateTaps(ids: []const u32, trunk_num_layers: u32) !void {
+    if (ids.len == 0 or ids[ids.len - 1] != trunk_num_layers) return error.DflashTargetLayerOutOfRange;
+    try validateTargetLayers(ids[0 .. ids.len - 1], trunk_num_layers);
+}
+
 /// Widest verify a machine without the NAX m16 tile serves well: the block
 /// IS the verify width, and `transformer.vqmmLaneFor`'s split-K lane stops at
 /// M=7. Past it MLX's own 32x32-tiled `qmm_splitk` takes over and a trunk
@@ -720,17 +828,207 @@ pub const Selector = struct {
 /// uint32 words, not rows. `markov_w2` is an ordinary `rank → vocab` linear
 /// and rides the same load-time quantization as the rest of the sidecar —
 /// only the DRAFT sees it, so a lossier bias costs acceptance, never a token.
+/// One block's recurrent Markov state `[1, rank]`; null before the first step.
+pub const MarkovRound = struct {
+    state: mlx.mlx_array = .{ .ctx = null },
+
+    pub fn deinit(self: *MarkovRound) void {
+        if (self.state.ctx != null) _ = mlx.mlx_array_free(self.state);
+    }
+};
+
+/// The recurrent Markov head (`markov_head_type: rnn_hidden`): each step reads its state, the previous token's row
+/// of `w1`, the block's hidden row and the newest committed context row, and biases the vocabulary through the
+/// trunk's LM head. That head is folded into the latent projection once (`fold`), so a step reads `[rank, rows]`.
+pub const MarkovRnn = struct {
+    /// `[2 rank + 2 hidden, 3 rank]` and its bias.
+    proj_w: mlx.mlx_array,
+    proj_b: mlx.mlx_array,
+    /// `hidden_out` `[rank, hidden]` and its bias, until `fold`.
+    hidden_w: mlx.mlx_array,
+    hidden_b: mlx.mlx_array,
+    /// `[rank, rows]` and `[rows]`, bf16: the LM head over `hidden_out`.
+    fold_w: mlx.mlx_array = .{ .ctx = null },
+    fold_b: mlx.mlx_array = .{ .ctx = null },
+    /// The context row's norm.
+    norm: mlx.mlx_array,
+    rank: c_int,
+    softcap: f32,
+    rows: c_int,
+
+    fn deinit(self: *MarkovRnn) void {
+        for ([_]mlx.mlx_array{ self.proj_w, self.proj_b, self.hidden_w, self.hidden_b, self.fold_w, self.fold_b, self.norm }) |a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a);
+        }
+    }
+
+    /// Folds the trunk's head (`w` `[vocab, hidden]`, dense or quantized) into the latent projection, a slab of
+    /// rows at a time.
+    fn fold(self: *MarkovRnn, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, qp: transformer_mod.QuantParams, s: mlx.mlx_stream) !void {
+        var sx = Scope.init(std.heap.c_allocator, s);
+        defer sx.deinit();
+        const proj = try sx.astype(self.hidden_w, .float32);
+        const bias = try sx.reshape(try sx.astype(self.hidden_b, .float32), &.{ -1, 1 });
+        const rows_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(rows_vec);
+        const bias_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(bias_vec);
+        var at: c_int = 0;
+        while (at < self.rows) : (at += 16384) {
+            var t = Scope.init(std.heap.c_allocator, s);
+            defer t.deinit();
+            const hi = @min(self.rows, at + 16384);
+            var head = try t.slice(w, 0, at, hi);
+            if (sc.ctx != null) {
+                var dq = mlx.mlx_array_new();
+                const bslab: mlx.mlx_array = if (bi.ctx != null) try t.slice(bi, 0, at, hi) else .{ .ctx = null };
+                const rc = mlx.mlx_dequantize(&dq, head, try t.slice(sc, 0, at, hi), bslab, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), qp.mode.cstr(), .{}, .{ .value = .float32, .has_value = true }, s);
+                head = try t.res(rc, &dq);
+            } else head = try t.astype(head, .float32);
+            const fw = try t.astype(try t.matmul(head, try t.transpose(proj, &.{ 1, 0 })), .bfloat16);
+            const fb = try t.astype(try t.matmul(head, bias), .bfloat16);
+            try mlx.check(mlx.mlx_array_eval(fw));
+            try mlx.check(mlx.mlx_array_eval(fb));
+            _ = mlx.mlx_vector_array_append_value(rows_vec, fw);
+            _ = mlx.mlx_vector_array_append_value(bias_vec, fb);
+        }
+        var all = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(all);
+        try mlx.check(mlx.mlx_concatenate_axis(&all, rows_vec, 0, s));
+        var all_b = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(all_b);
+        try mlx.check(mlx.mlx_concatenate_axis(&all_b, bias_vec, 0, s));
+        var fw = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(fw);
+        try mlx.check(mlx.mlx_contiguous(&fw, try sx.transpose(all, &.{ 1, 0 }), false, s));
+        var fb = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(fb);
+        try mlx.check(mlx.mlx_reshape(&fb, all_b, &[_]c_int{-1}, 1, s));
+        try mlx.check(mlx.mlx_array_eval(fw));
+        try mlx.check(mlx.mlx_array_eval(fb));
+        for ([_]*mlx.mlx_array{ &self.fold_w, &self.fold_b }) |dst| if (dst.ctx != null) {
+            _ = mlx.mlx_array_free(dst.*);
+        };
+        self.fold_w = fw;
+        self.fold_b = fb;
+    }
+
+    /// One step: `base_row` `[1, 1, vocab]` (the block row's bare head logits), `hidden_row` `[1, 1, hidden]`,
+    /// `anchor` `[1, 1, hidden]` (the newest context row, mixed and normed). Returns `[1, 1, rows]` f32, softcapped.
+    pub fn step(self: *const MarkovRnn, round: *MarkovRound, w1: mlx.mlx_array, base_row: mlx.mlx_array, hidden_row: mlx.mlx_array, anchor: mlx.mlx_array, prev_token: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+        if (self.fold_w.ctx == null or anchor.ctx == null) return error.DflashMarkovUnbound;
+        var sx = Scope.init(std.heap.c_allocator, s);
+        defer sx.deinit();
+        const dt = mlx.mlx_array_dtype(self.proj_w);
+        const r = self.rank;
+        const state = if (round.state.ctx != null) round.state else try sx.zeros(&.{ 1, r }, dt);
+        const idx_i32: i32 = @intCast(prev_token);
+        const idx = try sx.keep(mlx.mlx_array_new_data(&idx_i32, &[_]c_int{1}, 1, .int32));
+        const h = mlx.getShape(hidden_row)[2];
+        const input = try sx.concat(&.{
+            state,
+            try sx.astype(try sx.take(w1, idx), dt),
+            try sx.astype(try sx.reshape(hidden_row, &.{ 1, h }), dt),
+            try sx.astype(try sx.reshape(anchor, &.{ 1, h }), dt),
+        }, 1);
+        const proj = try sx.astype(try sx.add(try sx.matmul(input, self.proj_w), self.proj_b), .float32);
+        const gate = try sx.astype(try sx.sigmoid(try sx.slice(proj, 1, 0, r)), dt);
+        const cand = try sx.astype(try sx.tanh(try sx.slice(proj, 1, r, 2 * r)), dt);
+        const one = try sx.keep(try scalarAs(1.0, dt, s));
+        const next = try sx.add(try sx.mul(gate, state), try sx.mul(try sx.sub(one, gate), cand));
+        const latent = try sx.astype(try sx.tanh(try sx.slice(proj, 1, 2 * r, 3 * r)), dt);
+        const bias = try sx.add(try sx.matmul(latent, self.fold_w), self.fold_b);
+        const base = try sx.reshape(try sx.slice(base_row, 2, 0, self.rows), &.{ 1, self.rows });
+        var logits = try sx.add(try sx.astype(base, .float32), try sx.astype(bias, .float32));
+        if (self.softcap > 0) {
+            const cap = try sx.keep(mlx.mlx_array_new_float(self.softcap));
+            logits = try sx.mul(try sx.tanh(try sx.div(logits, cap)), cap);
+        }
+        try mlx.check(mlx.mlx_array_eval(next));
+        if (round.state.ctx != null) _ = mlx.mlx_array_free(round.state);
+        round.state = sx.out(next);
+        return sx.out(try sx.reshape(logits, &.{ 1, 1, self.rows }));
+    }
+};
+
+/// The tap-mix variant's weights beside the block's own (`DflashConfig.tap_mix`).
+pub const TapMix = struct {
+    /// `[layers + 1, taps, 1]` f32: each drafter layer's softmax weights over the taps; the last row is the Markov head's.
+    alpha: mlx.mlx_array,
+    /// The mask rows' vector `[hidden]`, and the trunk's embedding norm for the anchor row.
+    mask_embed: mlx.mlx_array,
+    embed_norm: mlx.mlx_array,
+    layers: []Ctx,
+
+    pub const Ctx = struct {
+        norm: mlx.mlx_array,
+        k: DflashLinear,
+        v: DflashLinear,
+        k_norm: mlx.mlx_array,
+    };
+
+    fn deinit(self: *TapMix, allocator: std.mem.Allocator) void {
+        for ([_]mlx.mlx_array{ self.alpha, self.mask_embed, self.embed_norm }) |a| _ = mlx.mlx_array_free(a);
+        for (self.layers) |*c| {
+            _ = mlx.mlx_array_free(c.norm);
+            _ = mlx.mlx_array_free(c.k_norm);
+            c.k.deinit();
+            c.v.deinit();
+        }
+        allocator.free(self.layers);
+    }
+
+    fn appendEval(self: *const TapMix, vec: mlx.mlx_vector_array) void {
+        for ([_]mlx.mlx_array{ self.alpha, self.mask_embed, self.embed_norm }) |a| _ = mlx.mlx_vector_array_append_value(vec, a);
+        for (self.layers) |*c| {
+            _ = mlx.mlx_vector_array_append_value(vec, c.norm);
+            _ = mlx.mlx_vector_array_append_value(vec, c.k_norm);
+            c.k.appendEval(vec);
+            c.v.appendEval(vec);
+        }
+    }
+
+    /// The taps (`[1, n, hidden]` each) mixed with row `row` of `alpha` in f32 and RMS-normed by `norm`, as bf16.
+    pub fn mixed(self: *const TapMix, captures: []const mlx.mlx_array, row: usize, norm: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+        var sx = Scope.init(std.heap.c_allocator, s);
+        defer sx.deinit();
+        var parts: [16]mlx.mlx_array = undefined;
+        if (captures.len == 0 or captures.len > parts.len) return error.DflashCaptureMissing;
+        for (captures, 0..) |c, i| {
+            if (c.ctx == null) return error.DflashCaptureMissing;
+            const sh = mlx.getShape(c);
+            parts[i] = try sx.reshape(try sx.astype(c, .float32), &.{ sh[0], sh[1], 1, sh[2] });
+        }
+        const sh = mlx.getShape(captures[0]);
+        const taps: c_int = @intCast(captures.len);
+        const lo: c_int = @intCast(row);
+        const w = try sx.reshape(try sx.slice(self.alpha, 0, lo, lo + 1), &.{ taps, 1 });
+        const sum = try sx.reshape(try sx.sumAxis(try sx.mul(try sx.concat(parts[0..captures.len], 2), w), 2), &.{ sh[0], sh[1], sh[2] });
+        const normed = try sx.keep(try rmsNormFn(sum, try sx.astype(norm, .float32), eps, s));
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_astype(&out, normed, .bfloat16, s));
+        return out;
+    }
+};
+
 pub const MarkovHead = struct {
     w1: mlx.mlx_array,
     w2: DflashLinear,
+    rnn: ?MarkovRnn = null,
 
     pub fn deinit(self: *MarkovHead) void {
         _ = mlx.mlx_array_free(self.w1);
         self.w2.deinit();
+        if (self.rnn) |*r| r.deinit();
     }
 
     pub fn appendEval(self: *const MarkovHead, vec: mlx.mlx_vector_array) void {
         _ = mlx.mlx_vector_array_append_value(vec, self.w1);
+        if (self.rnn) |*r| {
+            for ([_]mlx.mlx_array{ r.proj_w, r.proj_b, r.hidden_w, r.hidden_b, r.norm }) |a| _ = mlx.mlx_vector_array_append_value(vec, a);
+            return;
+        }
         self.w2.appendEval(vec);
     }
 
@@ -851,9 +1149,13 @@ pub const DflashModel = struct {
     /// Bolt correlation head. Null on a stock DFlash assistant.
     lilicorr: ?lilicorr_mod.Head = null,
 
+    /// The tap-mix variant's weights; null on every other drafter.
+    mix: ?TapMix = null,
+
     pub fn deinit(self: *DflashModel) void {
         const allocator = self.allocator;
         lane_qmm.release(@intFromPtr(self));
+        if (self.mix) |*m| m.deinit(allocator);
         if (self.selector) |*sel| sel.deinit();
         if (self.markov) |*mh| mh.deinit();
         if (self.lilicorr) |*hd| hd.deinit();
@@ -882,7 +1184,7 @@ pub const DflashModel = struct {
                 return lane_qmm.tileInPlace(own, lin.w, lin.scales, lin.biases, lin.bits, lin.group_size, &.{}, st);
             }
         };
-        bytes += try Tile.one(owner, &self.fc, s);
+        if (self.mix == null) bytes += try Tile.one(owner, &self.fc, s);
         for (self.layers) |*lw| {
             for ([_]*const DflashLinear{ &lw.q, &lw.k, &lw.v, &lw.o, &lw.gate, &lw.up, &lw.down }) |lin| bytes += try Tile.one(owner, lin, s);
             inline for (.{ lw.attention_conv, lw.mlp_conv }) |conv| if (conv) |c| {
@@ -890,7 +1192,9 @@ pub const DflashModel = struct {
             };
         }
         if (self.selector) |*sel| bytes += try Tile.one(owner, &sel.hidden_projection, s);
-        if (self.markov) |*mh| bytes += try Tile.one(owner, &mh.w2, s);
+        if (self.markov) |*mh| if (mh.rnn == null) {
+            bytes += try Tile.one(owner, &mh.w2, s);
+        };
         if (self.own_lm_head) |*head| bytes += try Tile.one(owner, head, s);
         return bytes;
     }
@@ -915,7 +1219,10 @@ pub const DflashModel = struct {
             log.err("[dflash] own head vocab {d} differs from target vocab {d}\n", .{ self.config.draft_vocab_size, target.config.vocab_size });
             return error.DflashTargetMismatch;
         }
-        validateTargetLayers(self.config.target_layer_ids, target.config.num_hidden_layers) catch |err| {
+        (if (self.config.tap_mix)
+            validateTaps(self.config.captureIds(), target.config.num_hidden_layers)
+        else
+            validateTargetLayers(self.config.target_layer_ids, target.config.num_hidden_layers)) catch |err| {
             log.err("[dflash] target_layer_ids {any} out of range for {d}-layer target\n", .{
                 self.config.target_layer_ids, target.config.num_hidden_layers,
             });
@@ -946,6 +1253,14 @@ pub const DflashModel = struct {
             });
             return error.DflashTargetMismatch;
         }
+        if (self.markov) |*mh| if (mh.rnn) |*r| {
+            if (target.lm_head_w.ctx == null or r.rows > mlx.getShape(target.lm_head_w)[0]) return error.DflashTargetMismatch;
+            const qp: transformer_mod.QuantParams = if (target.lm_head_s.ctx == null)
+                .{ .bits = 0, .group_size = 0, .mode = .affine }
+            else
+                transformer_mod.computeQuantParams(.of(&target.config), target.lm_head_w, target.lm_head_s, target.config.hidden_size);
+            try r.fold(target.lm_head_w, target.lm_head_s, target.lm_head_b, qp, self.s);
+        };
         target.config.dflash_bound = true;
         self.buildDraftHead(target, DEFAULT_DRAFT_HEAD_BITS) catch |err| {
             log.warn("[dflash] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
@@ -1265,7 +1580,11 @@ pub fn loadDflashQuant(
     var cfg = try parseConfig(io, allocator, model_dir);
     errdefer cfg.deinit(allocator);
 
-    var weights = try model_mod.loadWeights(io, allocator, model_dir);
+    var weights = if (cfg.tap_mix) blk: {
+        const path = try std.fs.path.join(allocator, &.{ model_dir, TRUNK_DRAFT_FILE });
+        defer allocator.free(path);
+        break :blk try model_mod.loadWeightsSingleFile(allocator, path);
+    } else try model_mod.loadWeights(io, allocator, model_dir);
     defer weights.deinit();
 
     var own_lm_head: ?DflashLinear = null;
@@ -1280,9 +1599,13 @@ pub fn loadDflashQuant(
     // `encoder.fc` + `encoder.output_norm_enc`, z-lab DFlash2 ships root
     // `fc` + `hidden_norm`. Same tensors, keyed on which one the file has.
     const zlab_names = weights.get("fc.weight") != null;
-    var fc = try loadLinear(&weights, if (zlab_names) "fc" else "encoder.fc", fc_in, bits, s);
+    // A tap-mix drafter has no encoder: its layers project the taps themselves (`enc_norm` then only names the dtype).
+    var fc: DflashLinear = if (cfg.tap_mix)
+        .{ .w = mlx.mlx_array_new(), .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() }
+    else
+        try loadLinear(&weights, if (zlab_names) "fc" else "encoder.fc", fc_in, bits, s);
     errdefer fc.deinit();
-    const enc_norm = try ownWeight(&weights, if (zlab_names) "hidden_norm.weight" else "encoder.output_norm_enc.weight");
+    const enc_norm = try ownWeight(&weights, if (cfg.tap_mix) "norm.weight" else if (zlab_names) "hidden_norm.weight" else "encoder.output_norm_enc.weight");
     errdefer _ = mlx.mlx_array_free(enc_norm);
     const final_norm = try ownWeight(&weights, "norm.weight");
     errdefer _ = mlx.mlx_array_free(final_norm);
@@ -1342,9 +1665,30 @@ pub fn loadDflashQuant(
         selector = .{ .pred_codebook = pred, .succ_codebook = succ, .hidden_projection = hp };
     }
 
+    var mix: ?TapMix = null;
+    errdefer if (mix) |*m| m.deinit(allocator);
+    if (cfg.tap_mix) mix = try loadTapMix(io, allocator, &weights, &cfg, model_dir, bits, s);
+
     var markov: ?MarkovHead = null;
     errdefer if (markov) |*mh| mh.deinit();
-    if (cfg.markov_rank > 0) {
+    if (cfg.tap_mix) {
+        const w1 = try ownWeight(&weights, "markov_head.markov_w1.weight");
+        errdefer _ = mlx.mlx_array_free(w1);
+        var rnn: MarkovRnn = .{
+            .proj_w = try transposedWeight(&weights, "markov_head.rnn_proj.weight", s),
+            .proj_b = try ownWeight(&weights, "markov_head.rnn_proj.bias"),
+            .hidden_w = try transposedWeight(&weights, "markov_head.hidden_out.weight", s),
+            .hidden_b = try ownWeight(&weights, "markov_head.hidden_out.bias"),
+            .norm = try ownWeight(&weights, "markov_head.dflare_norm.weight"),
+            .rank = @intCast(cfg.markov_rank),
+            .softcap = cfg.markov_softcap,
+            .rows = @intCast(cfg.draft_rows),
+        };
+        errdefer rnn.deinit();
+        const psh = mlx.getShape(rnn.proj_w);
+        if (psh.len != 2 or psh[0] != @as(c_int, @intCast(2 * cfg.markov_rank + 2 * hidden)) or psh[1] != @as(c_int, @intCast(3 * cfg.markov_rank))) return error.InvalidDflashConfigValue;
+        markov = .{ .w1 = w1, .w2 = .{ .w = mlx.mlx_array_new(), .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() }, .rnn = rnn };
+    } else if (cfg.markov_rank > 0) {
         const w1 = try ownWeight(&weights, "markov_head.markov_w1.weight");
         errdefer _ = mlx.mlx_array_free(w1);
         const w2 = try loadLinear(&weights, "markov_head.markov_w2", cfg.markov_rank, bits, s);
@@ -1380,12 +1724,13 @@ pub fn loadDflashQuant(
     {
         const eval_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(eval_vec);
-        fc.appendEval(eval_vec);
+        if (!cfg.tap_mix) fc.appendEval(eval_vec);
         _ = mlx.mlx_vector_array_append_value(eval_vec, enc_norm);
         _ = mlx.mlx_vector_array_append_value(eval_vec, final_norm);
         for (layers) |*lw| lw.appendEval(eval_vec);
         if (selector) |*sel| sel.appendEval(eval_vec);
         if (markov) |*mh| mh.appendEval(eval_vec);
+        if (mix) |*m| m.appendEval(eval_vec);
         if (head) |*hd| hd.appendEval(eval_vec);
         if (own_lm_head) |*lm_head| lm_head.appendEval(eval_vec);
         _ = mlx.mlx_eval(eval_vec);
@@ -1394,6 +1739,7 @@ pub fn loadDflashQuant(
     // instead of leaving them in MLX's buffer pool.
     _ = mlx.mlx_clear_cache();
 
+    if (cfg.tap_mix) log.info("[dflash] tap-mix drafter ({s}): recurrent markov head rank={d}, {d} taps\n", .{ TRUNK_DRAFT_FILE, cfg.markov_rank, cfg.target_layer_ids.len });
     if (fc.isQuantized()) {
         log.info("[dflash] loaded {d} layers, hidden={d}, block_size={d}, targets={any}, weights={d}-bit/gs{d}\n", .{
             cfg.num_hidden_layers, cfg.hidden_size, cfg.block_size, cfg.target_layer_ids, fc.bits, fc.group_size,
@@ -1429,7 +1775,61 @@ pub fn loadDflashQuant(
         .selector = selector,
         .markov = markov,
         .lilicorr = head,
+        .mix = mix,
     };
+}
+
+/// A dense `[out, in]` weight as `[in, out]`, evaluated.
+fn transposedWeight(w: *const Weights, key: []const u8, s: mlx.mlx_stream) !mlx.mlx_array {
+    const raw = try ownWeight(w, key);
+    defer _ = mlx.mlx_array_free(raw);
+    var t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t);
+    try mlx.check(mlx.mlx_transpose_axes(&t, raw, &[_]c_int{ 1, 0 }, 2, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_contiguous(&out, t, false, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
+/// The tap-mix weights of `mtp.safetensors`, and the trunk's embedding norm off the pack's own shards.
+fn loadTapMix(io: std.Io, allocator: std.mem.Allocator, weights: *Weights, cfg: *const DflashConfig, model_dir: []const u8, bits: u32, s: mlx.mlx_stream) !TapMix {
+    const taps: c_int = @intCast(cfg.target_layer_ids.len);
+    const rows: c_int = @intCast(cfg.num_hidden_layers + 1);
+    const fuse = try ownWeight(weights, "fuse_weight");
+    defer _ = mlx.mlx_array_free(fuse);
+    const fsh = mlx.getShape(fuse);
+    if (fsh.len != 2 or fsh[0] != rows or fsh[1] != taps) return error.InvalidDflashConfigValue;
+    var alpha = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(alpha);
+    {
+        // The reference rounds the softmax to bf16 before it mixes in f32.
+        var sx = Scope.init(std.heap.c_allocator, s);
+        defer sx.deinit();
+        const soft = try sx.softmax(try sx.astype(fuse, .float32), -1);
+        const a = try sx.reshape(try sx.astype(try sx.astype(soft, .bfloat16), .float32), &.{ rows, taps, 1 });
+        try mlx.check(mlx.mlx_array_eval(a));
+        try mlx.check(mlx.mlx_array_set(&alpha, a));
+    }
+    const mask_embed = try ownWeight(weights, "mask_embed");
+    errdefer _ = mlx.mlx_array_free(mask_embed);
+    var trunk = try model_mod.loadWeights(io, allocator, model_dir);
+    defer trunk.deinit();
+    const embed_norm = try ownWeight(&trunk, "model.language_model.embed_norm.weight");
+    errdefer _ = mlx.mlx_array_free(embed_norm);
+    try mlx.check(mlx.mlx_array_eval(embed_norm));
+
+    const layers = try allocator.alloc(TapMix.Ctx, cfg.num_hidden_layers);
+    errdefer allocator.free(layers);
+    var kb: [256]u8 = undefined;
+    for (layers, 0..) |*c, li| c.* = .{
+        .norm = try ownWeight(weights, try std.fmt.bufPrint(&kb, "layers.{d}.dflare_norm.weight", .{li})),
+        .k = try loadLinear(weights, try std.fmt.bufPrint(&kb, "layers.{d}.self_attn.k_proj_ctx", .{li}), cfg.hidden_size, bits, s),
+        .v = try loadLinear(weights, try std.fmt.bufPrint(&kb, "layers.{d}.self_attn.v_proj_ctx", .{li}), cfg.hidden_size, bits, s),
+        .k_norm = try ownWeight(weights, try std.fmt.bufPrint(&kb, "layers.{d}.self_attn.k_norm_ctx.weight", .{li})),
+    };
+    return .{ .alpha = alpha, .mask_embed = mask_embed, .embed_norm = embed_norm, .layers = layers };
 }
 
 /// Load one DFlash2 dynamic conv pair (`base_kernel` + `kernel_projection`)
@@ -2452,6 +2852,34 @@ pub fn appendContext(
     const cfg = &model.config;
     std.debug.assert(first_pos == ctx.absLen()); // contiguity — no holes
 
+    if (model.mix) |*mix| {
+        for (mix.layers, 0..) |*c, li| {
+            const taps = try mix.mixed(captures, li, c.norm, cfg.rms_norm_eps, s);
+            defer _ = mlx.mlx_array_free(taps);
+            const k = try projectHeads(taps, &c.k, c.k_norm, cfg.num_key_value_heads, cfg.head_dim, cfg.rms_norm_eps, cfg.rope_theta, first_pos, true, cfg.rope_traditional, s);
+            defer _ = mlx.mlx_array_free(k);
+            const v = try projectHeadsNoNorm(taps, &c.v, cfg.num_key_value_heads, cfg.head_dim, s);
+            defer _ = mlx.mlx_array_free(v);
+            _ = try ctx.cache.update(@intCast(li), k, v, s, 0);
+        }
+        // The Markov head reads the newest committed row under its own mix.
+        var last: [16]mlx.mlx_array = undefined;
+        var n_last: usize = 0;
+        defer for (last[0..n_last]) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        for (captures) |c| {
+            const sh = mlx.getShape(c);
+            last[n_last] = mlx.mlx_array_new();
+            n_last += 1;
+            try mlx.check(mlx.mlx_slice(&last[n_last - 1], c, &[_]c_int{ 0, sh[1] - 1, 0 }, 3, &[_]c_int{ sh[0], sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        }
+        const anchor = try mix.mixed(last[0..n_last], mix.layers.len, model.markov.?.rnn.?.norm, cfg.rms_norm_eps, s);
+        if (ctx.anchor.ctx != null) _ = mlx.mlx_array_free(ctx.anchor);
+        ctx.anchor = anchor;
+        return;
+    }
+
     const enc = try encodeContext(model, captures);
     defer _ = mlx.mlx_array_free(enc);
     if (model.lilicorr != null) {
@@ -2592,10 +3020,13 @@ pub fn forwardBlock(
         const view = try ctx.cache.update(@intCast(li), bk, bv, s, 0);
         // A sliding layer never sees context before the first query's window:
         // attend over the rest, so the cost stops growing with the context.
-        const skip: usize = if (lw.layer_type == .sliding_attention)
-            @min(ctx_len, (anchor_pos -| (cfg.sliding_window - 1)) -| ctx.base_pos)
+        // A tap-mix drafter's local layer keeps a ring of `window` context rows, whatever the block's width.
+        const skip: usize = if (lw.layer_type != .sliding_attention)
+            0
+        else if (model.mix != null)
+            ctx_len -| cfg.sliding_window
         else
-            0;
+            @min(ctx_len, (anchor_pos -| (cfg.sliding_window - 1)) -| ctx.base_pos);
         var kv_k = view.k;
         var kv_v = view.v;
         var cut: [2]mlx.mlx_array = .{ .{ .ctx = null }, .{ .ctx = null } };
@@ -2613,7 +3044,7 @@ pub fn forwardBlock(
             kv_v = cut[1];
         }
 
-        const mask = try buildBlockMask(lw.layer_type, ctx.base_pos + skip, ctx_len - skip, anchor_pos, q_len, cfg.sliding_window, s);
+        const mask = try buildBlockMask(if (model.mix != null) .full_attention else lw.layer_type, ctx.base_pos + skip, ctx_len - skip, anchor_pos, q_len, cfg.sliding_window, s);
         defer if (mask) |m| {
             _ = mlx.mlx_array_free(m);
         };
@@ -4621,6 +5052,87 @@ fn parityVs(got: mlx.mlx_array, want: []const f32, allocator: std.mem.Allocator,
     const g = try TinyFix.readF32(got, allocator, s);
     defer allocator.free(g);
     return paritySlices(g, want);
+}
+
+// Bar: a trunk config carrying an `rnn_hidden` `mtp_config` is the tap-mix drafter's own config.
+test "dflash: an Inkling 2 trunk config's mtp_config parses as the tap-mix drafter" {
+    const json =
+        \\{"model_type":"inkling2_loop","text_config":{"vocab_size":201024,"unpadded_vocab_size":200058,
+        \\"final_logit_softcapping":30.0},"mtp_config":{"hidden_size":2304,"num_hidden_layers":3,
+        \\"num_attention_heads":24,"num_key_value_heads":8,"head_dim":128,"intermediate_size":9216,"q_bias":false,
+        \\"o_bias":false,"rms_norm_eps":1e-06,"rope_theta":1000000.0,"local_layer_ids":[0,2],
+        \\"sliding_window_size":1024,"block_size":8,"markov_rank":256,"markov_head_type":"rnn_hidden",
+        \\"target_layer_ids":[5,23,41,48]}}
+    ;
+    var cfg = try parseConfigFromJson(testing.allocator, json);
+    defer cfg.deinit(testing.allocator);
+    try testing.expect(cfg.tap_mix and !cfg.anchor_row_drafts and cfg.isDspark());
+    try testing.expectEqual(@as(u32, 8), cfg.block_size);
+    // A tap is a layer's input, kept as the output of the one before; the last is the final-normed output.
+    try testing.expectEqualSlices(u32, &.{ 4, 22, 40, 48 }, cfg.captureIds());
+    try testing.expectEqualSlices(LayerType, &.{ .sliding_attention, .full_attention, .sliding_attention }, cfg.layer_types);
+    try testing.expectEqual(@as(u32, 200058), cfg.draft_rows);
+    try testing.expectEqual(@as(f32, 30), cfg.markov_softcap);
+    try validateTaps(cfg.captureIds(), 48);
+    try testing.expectError(error.DflashTargetLayerOutOfRange, validateTaps(cfg.captureIds(), 24));
+    // Another Markov head on a trunk config is no drafter here.
+    const vanilla = try std.mem.replaceOwned(u8, testing.allocator, json, "rnn_hidden", "vanilla");
+    defer testing.allocator.free(vanilla);
+    try testing.expectError(error.NotDflashConfig, parseConfigFromJson(testing.allocator, vanilla));
+}
+
+// Bar: the tap mix, the per-layer context K/V and the block forward land on oMLX's drafter's hidden rows (cos and rms).
+test "inkling2 drafter fixture parity: one tap-mix draft round vs oMLX's drafter" {
+    const fixtures_path = env.get(.INKLING2_DRAFT_FIXTURES) orelse return error.SkipZigTest;
+    const pack = env.get(.INKLING2_DRAFT_PACK) orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const file = try std.Io.Dir.openFileAbsolute(io, std.mem.span(fixtures_path), .{});
+    var rb: [65536]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = try rs.interface.allocRemaining(allocator, .limited(1 << 30));
+    file.close(io);
+    defer allocator.free(content);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const h: usize = @intCast(root.get("hidden_size").?.integer);
+    const nt: usize = @intCast(root.get("n_targets").?.integer);
+    const bs: usize = @intCast(root.get("block_size").?.integer);
+    const n_ctx: usize = @intCast(root.get("n_ctx").?.integer);
+    const ctx_stream = try fixtureF32Slice(allocator, root.get("ctx_stream").?);
+    defer allocator.free(ctx_stream);
+    const noise1 = try fixtureF32Slice(allocator, root.get("noise1").?);
+    defer allocator.free(noise1);
+    const round1_hidden = try fixtureF32Slice(allocator, root.get("round1_hidden").?);
+    defer allocator.free(round1_hidden);
+
+    // Dense projections: the bar is the math, not the engine's 8-bit draft weights.
+    var m = try loadDflashQuant(io, allocator, s, std.mem.span(pack), 0);
+    defer m.deinit();
+    try testing.expect(m.config.tap_mix and m.mix != null);
+    try testing.expectEqual(bs, m.config.block_size);
+    try testing.expectEqual(nt, m.config.target_layer_ids.len);
+
+    const caps = try fixtureCaptures(allocator, ctx_stream, n_ctx, nt, h, s);
+    defer {
+        for (caps) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(caps);
+    }
+    var dctx = try DflashCtx.init(allocator, &m, 0);
+    defer dctx.deinit();
+    try appendContext(&m, &dctx, caps, 0);
+    const noise = try fixtureArr(noise1, bs, h, s);
+    defer _ = mlx.mlx_array_free(noise);
+    const hidden = try forwardBlock(&m, &dctx, noise, n_ctx);
+    defer _ = mlx.mlx_array_free(hidden);
+    const p = try parityVs(hidden, round1_hidden, allocator, s);
+    std.debug.print("[inkling2-drafter-fixture] round cos={d:.6} rms_ratio={d:.4}\n", .{ p.cos, p.rms_ratio });
+    try testing.expect(p.cos > 0.9999);
+    try testing.expect(@abs(p.rms_ratio - 1.0) < 0.005);
 }
 
 test "dflash fixture parity: encoder + two draft rounds vs transformers reference" {

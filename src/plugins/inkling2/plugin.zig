@@ -42,6 +42,7 @@ pub const table = abi.ModelTable{
     .cache = &.{ .layout = config.layout },
     .media = &.{ .tower = &vision.tower, .prepare = &vision.prepare },
     .weights = &.{},
+    .spec = &.{ .trunk_weight = &trunkWeight },
 };
 
 /// Every term is the engine's default arithmetic over the shell and the layout.
@@ -221,6 +222,8 @@ pub const Model = struct {
         const normed = try blocks.rms(g, try blocks.f32Of(g, t.h), 1e-6);
         const mixed = try blocks.row(g, try blocks.depth(g, t.bank[0..t.blocks], normed, w.final_query), 0);
         const final = try g.astype(try g.rmsNorm(mixed, w.final_norm, w.eps), ops.dtype(t.h));
+        // A drafter's last tap: the final-normed output, published one past the last visit.
+        try run.capture(g, t.visits, final);
         return run.finish(g, &c, final, Head, &w.head);
     }
 };
@@ -239,6 +242,16 @@ pub const Loaded = struct {
         m.base.shared.deinit();
     }
 };
+
+/// The bare embedding table and LM head a drafter reads (no embedding norm, softcap or vocab trim).
+fn trunkWeight(mp: *anyopaque, which: abi.TrunkWeight, out: *@import("../../abi/quant.zig").Weight) callconv(.c) abi.Verdict {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    b.trunk_weight.trunkWeight(switch (which) {
+        .embed => &m.base.weights.embed.table,
+        .head => &m.base.weights.head.lin,
+    }, out);
+    return .ok;
+}
 
 fn unload(mp: *anyopaque) callconv(.c) void {
     const m: *Loaded = @ptrCast(@alignCast(mp));
