@@ -28,8 +28,8 @@ const launch = metal.Launch{
     .header = rel_attn.HEADER,
     .contiguous = false,
     .tg_bytes = @intCast(rel_attn.tgBytes(D)),
-    .m1 = 1024,
-    .m2 = 1024,
+    .m1 = 512,
+    .m2 = 512,
 };
 
 /// One dispatch of the key range: all of it, or a pass that hands its state on (out), takes and hands it
