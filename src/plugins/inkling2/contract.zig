@@ -13,6 +13,7 @@ const rel_attn = @import("rel_attn.zig");
 const depth = @import("contract_depth.zig");
 const gates = @import("contract_gate.zig");
 const l2clip = @import("contract_l2clip.zig");
+const conv = @import("contract_sconv.zig");
 const rel_attn_nax = @import("rel_attn_nax.zig");
 
 const spec = kc.spec;
@@ -614,6 +615,7 @@ pub fn register(set: *kc.Set) !void {
     try depth.register(set);
     try gates.register(set);
     try l2clip.register(set);
+    try conv.register(set);
 }
 
 // ── tests ──
