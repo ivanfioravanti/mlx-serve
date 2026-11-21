@@ -95,8 +95,9 @@ pub fn parts(w: *const Weights, g: *Graph, x: Array, x32: ?Array) !Parts {
     var rows: Array = undefined;
     const experts_n = ops.shape(w.gate_up.w)[0];
     // Under four pairs an expert MLX gathers one pair at a time, reading each expert's weights again for every row
-    // that picked it; padding to four takes its sorted row-block kernel, which reads each expert once.
-    const pad: c_int = if (sort and t * k < 4 * experts_n) 4 * experts_n - t * k else 0;
+    // that picked it; padding to four takes its sorted row-block kernel, which reads each expert once. Below 1.5
+    // pairs an expert the padding costs more than the reads it saves (M3 Ultra: even at 24 rows of top-8 of 128).
+    const pad: c_int = if (sort and t * k < 4 * experts_n and 2 * t * k >= 3 * experts_n) 4 * experts_n - t * k else 0;
     if (sort and pad > 0) {
         // Padded pairs repeat the chunk's own experts on a zero row, so no other expert is read.
         const fill = try g.take(ids, try g.astype(try g.call(mlx.mlx_remainder, .{ try g.arange(0, @floatFromInt(pad), 1, .int32), try g.adopt(mlx.mlx_array_new_int(t * k)) }), .uint32), 0);
@@ -158,7 +159,7 @@ test "inkling2 moe: a short chunk's padded pairs leave every real pair's output 
             .up_softcap = 25,
         };
         w.gate_up_scale = try g.addScalar(try g.call(mlx.mlx_random_uniform, .{ try g.scalar(0, .float32), try g.scalar(1, .float32), &[_]c_int{E}, @as(usize, 1), ops.Dtype.float32, key }), 0.5);
-        for ([_]c_int{ 17, 31, 63 }) |t| {
+        for ([_]c_int{ 24, 31, 63 }) |t| {
             const x = try g.astype(try g.call(mlx.mlx_random_normal, .{ &[_]c_int{ 1, t, H }, @as(usize, 3), ops.Dtype.float32, @as(f32, 0), @as(f32, 1), key }), .bfloat16);
             const got = try parts(&w, &g, x, null);
             // The same pairs one at a time: unsorted, each its own row.
