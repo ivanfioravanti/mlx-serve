@@ -346,9 +346,9 @@ const Load = struct {
 
     fn gate(l: *Load, i: usize, comptime which: []const u8) !blocks.MessageGate {
         return .{
-            .down = try l.made("layers.{d}." ++ which ++ "_message_gate.down_proj.weight", .{i}, .{ .t = true, .dt = null }),
-            .forget = try l.made("layers.{d}." ++ which ++ "_message_gate.forget_gate_proj.weight", .{i}, .{ .t = true }),
-            .message = try l.made("layers.{d}." ++ which ++ "_message_gate.message_gate_proj.weight", .{i}, .{ .t = true }),
+            .down = try l.made("layers.{d}." ++ which ++ "_message_gate.down_proj.weight", .{i}, .{ .dt = null }),
+            .forget = try l.made("layers.{d}." ++ which ++ "_message_gate.forget_gate_proj.weight", .{i}, .{}),
+            .message = try l.made("layers.{d}." ++ which ++ "_message_gate.message_gate_proj.weight", .{i}, .{}),
         };
     }
 
@@ -572,4 +572,5 @@ test {
     _ = blocks;
     _ = attention;
     _ = vision;
+    _ = @import("l2_clip.zig");
 }

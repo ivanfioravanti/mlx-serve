@@ -101,14 +101,14 @@ const Proj = struct {
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
         try self.in.draw(a, rng, shape, self.dt, fill);
-        self.down = try host.uniform(a, rng, 2 * shape.k * R, -0.1, 0.1, self.dt);
+        self.down = try host.uniform(a, rng, R * 2 * shape.k, -0.1, 0.1, self.dt);
         const rig = &self.rig;
         rig.reset();
         self.args = .{
             try rig.input(self.dt, &.{ 1, ci(shape.rows), ci(shape.k) }, self.in.hidden),
             try rig.input(.float32, &.{ 1, ci(shape.rows), NQ, ci(shape.k) }, self.in.messages),
             try rig.input(.int32, &.{1}, &.{@floatFromInt(shape.n)}),
-            try rig.input(self.dt, &.{ ci(2 * shape.k), R }, self.down),
+            try rig.input(self.dt, &.{ R, ci(2 * shape.k) }, self.down),
         };
         return true;
     }
@@ -146,7 +146,7 @@ const Proj = struct {
                 var e: f64 = 0;
                 var abs: f64 = 0;
                 for (x, terms, 0..) |xi, *t, i| {
-                    const d = self.down[i * R + r];
+                    const d = self.down[r * 2 * h + i];
                     t.* = xi.v * d;
                     e += xi.e * @abs(d);
                     abs += @abs(t.*);
@@ -209,8 +209,8 @@ const Mix = struct {
         const rng = prng.random();
         try self.in.draw(a, rng, shape, self.dt, fill);
         self.st = try host.uniform(a, rng, shape.rows * R, -2, 2, .float32);
-        self.forget = try host.uniform(a, rng, R * shape.k, -0.1, 0.1, .float32);
-        self.gain = try host.uniform(a, rng, R * shape.k, -0.1, 0.1, .float32);
+        self.forget = try host.uniform(a, rng, shape.k * R, -0.1, 0.1, .float32);
+        self.gain = try host.uniform(a, rng, shape.k * R, -0.1, 0.1, .float32);
         try self.bind();
         return true;
     }
@@ -221,8 +221,8 @@ const Mix = struct {
         rig.reset();
         self.args = .{
             try rig.input(.float32, &.{ ci(shape.rows), R }, self.st),
-            try rig.input(.float32, &.{ R, ci(shape.k) }, self.forget),
-            try rig.input(.float32, &.{ R, ci(shape.k) }, self.gain),
+            try rig.input(.float32, &.{ ci(shape.k), R }, self.forget),
+            try rig.input(.float32, &.{ ci(shape.k), R }, self.gain),
             try rig.input(self.dt, &.{ 1, ci(shape.rows), ci(shape.k) }, self.in.hidden),
             try rig.input(.float32, &.{ 1, ci(shape.rows), NQ, ci(shape.k) }, self.in.messages),
             try rig.input(.int32, &.{1}, &.{@floatFromInt(shape.n)}),
@@ -247,8 +247,8 @@ const Mix = struct {
             var abs = [2]f64{ 0, 0 };
             for (0..R) |k| {
                 const s = self.st[row * R + k];
-                terms[0][k] = s * self.forget[k * h + d];
-                terms[1][k] = s * self.gain[k * h + d];
+                terms[0][k] = s * self.forget[d * R + k];
+                terms[1][k] = s * self.gain[d * R + k];
                 abs[0] += @abs(terms[0][k]);
                 abs[1] += @abs(terms[1][k]);
             }
