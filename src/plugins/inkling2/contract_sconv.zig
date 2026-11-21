@@ -33,17 +33,22 @@ const Conv = struct {
     rig: metal.Rig,
     launch: *const metal.Launch,
     dynamic: bool,
+    /// Experts summed into the chunk (0: the chunk is x itself).
+    experts: usize,
     arena: std.heap.ArenaAllocator,
     shape: Shape = undefined,
     x: []f64 = &.{},
+    /// With `experts`: their outputs `[L, KE, C]` and weights `[L, KE]`, whose sum is `x`.
+    parts: []f64 = &.{},
+    wts: []f64 = &.{},
     prev: []f64 = &.{},
     w: []f64 = &.{},
     dyn: []f64 = &.{},
     scale: f64 = 0,
     args: [sconv.INPUTS.len]mlx.mlx_array = undefined,
 
-    fn init(a: std.mem.Allocator, l: *const metal.Launch, dynamic: bool) Conv {
-        return .{ .rig = metal.Rig.init(a), .launch = l, .dynamic = dynamic, .arena = .init(a) };
+    fn init(a: std.mem.Allocator, l: *const metal.Launch, dynamic: bool, experts: usize) Conv {
+        return .{ .rig = metal.Rig.init(a), .launch = l, .dynamic = dynamic, .experts = experts, .arena = .init(a) };
     }
 
     pub fn deinit(self: *Conv) void {
@@ -61,6 +66,7 @@ const Conv = struct {
         g.dtype("TW", .bfloat16);
         g.int("C", shape.n);
         g.int("K", K);
+        g.int("KE", self.experts);
         g.int("HD", if (self.dynamic) shape.n / HEADS else 1);
         g.flag("PREV", true);
         g.flag("DYN", self.dynamic);
@@ -88,12 +94,23 @@ const Conv = struct {
             self.w = try host.uniform(a, rng, K * c, -1, 1, .bfloat16);
             self.dyn = try host.uniform(a, rng, l * HEADS * K, -1, 1, .bfloat16);
         }
-        if (fill == .nonfinite) host.plant(self.x, l, c);
+        if (self.experts > 0) {
+            // x is the experts' weighted sum, in f32 in expert order, rounded to bf16 (the kernel's own sum).
+            const ke = self.experts;
+            self.parts = if (fill == .stress) try host.ints(a, rng, l * ke * c, -8, 8) else try host.uniform(a, rng, l * ke * c, -3, 3, .bfloat16);
+            self.wts = if (fill == .stress) try host.ints(a, rng, l * ke, 0, 1) else try host.uniform(a, rng, l * ke, 0, 1, .float32);
+            if (fill == .nonfinite) host.plant(self.parts, l * ke, c);
+            for (0..l) |t| for (0..c) |ch| {
+                var acc: f64 = 0;
+                for (0..ke) |j| acc = spec.roundTo(.f32, acc + spec.roundTo(.f32, self.parts[(t * ke + j) * c + ch] * self.wts[t * ke + j]));
+                self.x[t * c + ch] = spec.roundTo(.bf16, acc);
+            };
+        } else if (fill == .nonfinite) host.plant(self.x, l, c);
         self.scale = host.rt(.float32, 1 / @sqrt(@as(f64, if (self.dynamic) 2 * K + 1 else K + 1)));
 
         const rig = &self.rig;
         rig.reset();
-        self.args[0] = try rig.input(.bfloat16, &.{ 1, ci(l), ci(c) }, self.x);
+        self.args[0] = if (self.experts > 0) try rig.input(.bfloat16, &.{ ci(l), ci(self.experts), ci(c) }, self.parts) else try rig.input(.bfloat16, &.{ 1, ci(l), ci(c) }, self.x);
         self.args[1] = try rig.input(.float32, &.{ 1, K - 1, ci(c) }, self.prev);
         // Static taps `[C, K, 1]` hold w[k * C + c] at c * K + k.
         const taps = try a.alloc(f64, K * c);
@@ -102,7 +119,8 @@ const Conv = struct {
         };
         self.args[2] = if (self.dynamic) try rig.input(.bfloat16, &.{ K, ci(c) }, self.w) else try rig.input(.bfloat16, &.{ ci(c), K, 1 }, taps);
         self.args[3] = if (self.dynamic) try rig.input(.bfloat16, &.{ 1, ci(l), HEADS * K }, self.dyn) else self.args[0];
-        self.args[4] = try rig.input(.float32, &.{1}, &.{self.scale});
+        self.args[4] = if (self.experts > 0) try rig.input(.float32, &.{ ci(l), ci(self.experts) }, self.wts) else self.args[0];
+        self.args[5] = try rig.input(.float32, &.{1}, &.{self.scale});
         return true;
     }
 
@@ -158,7 +176,7 @@ const Conv = struct {
     fn wrapper(self: *Conv) ![]const u8 {
         var g = ops.Graph.init(self.rig.a, self.rig.stream());
         defer g.deinit();
-        const got = (try sconv.fused(&g, self.args[0], self.args[2], self.args[1], if (self.dynamic) .{ .dyn = self.args[3], .heads = HEADS } else null, @floatCast(self.scale))) orelse return error.Declined;
+        const got = (try sconv.fusedSum(&g, self.args[0], if (self.experts > 0) self.args[4] else null, self.args[2], self.args[1], if (self.dynamic) .{ .dyn = self.args[3], .heads = HEADS } else null, @floatCast(self.scale))) orelse return error.Declined;
         return self.rig.bytesOf(&.{ got.out, got.win });
     }
 };
@@ -191,13 +209,15 @@ fn convSpec(comptime name: []const u8, comptime dynamic: bool, served: []const S
 }
 
 /// A decode row and a verify window at the widths the pack convolves: k and v (1024), the hidden width (2304).
+/// The post-MLP conv also takes the 8 experts' outputs and sums them itself.
 const registrations = .{
-    .{ "inkling2_sconv (static)", false, &[_]Shape{ .{ .rows = 1, .n = 2304, .k = K }, .{ .rows = 9, .n = 1024, .k = K } } },
-    .{ "inkling2_sconv (dynamic, 8 heads)", true, &[_]Shape{ .{ .rows = 1, .n = 1024, .k = K }, .{ .rows = 9, .n = 1024, .k = K } } },
+    .{ "inkling2_sconv (static)", false, 0, &[_]Shape{ .{ .rows = 1, .n = 2304, .k = K }, .{ .rows = 9, .n = 1024, .k = K } } },
+    .{ "inkling2_sconv (dynamic, 8 heads)", true, 0, &[_]Shape{ .{ .rows = 1, .n = 1024, .k = K }, .{ .rows = 9, .n = 1024, .k = K } } },
+    .{ "inkling2_sconv (static, 8 experts summed)", false, 8, &[_]Shape{ .{ .rows = 1, .n = 2304, .k = K }, .{ .rows = 9, .n = 2304, .k = K } } },
 };
 
 pub fn register(set: *kc.Set) !void {
-    inline for (registrations) |r| try set.add(Conv, .init(set.a, &launch, r[1]), convSpec(r[0], r[1], r[2]), null);
+    inline for (registrations) |r| try set.add(Conv, .init(set.a, &launch, r[1], r[2]), convSpec(r[0], r[1], r[3]), null);
 }
 
 // ── tests ──

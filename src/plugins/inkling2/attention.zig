@@ -75,7 +75,7 @@ pub fn forward(w: *const Weights, c: *Ctx, qs: Array, ks: Array, vs: Array, k_pr
     var q = try blocks.l2Clip(g, try g.reshape(try w.q.forward(g, qs), &.{ 1, l, w.heads, hd }), w.q_clip, w.qk_clip);
     const k = try blocks.l2Clip(g, try g.reshape(kc.out, &.{ 1, l, w.kv_heads, hd }), null, w.qk_clip);
     const v4 = try g.reshape(vc.out, &.{ 1, l, w.kv_heads, hd });
-    const v = try g.astype(try blocks.rms(g, try blocks.f32Of(g, v4), w.eps), ops.dtype(v4));
+    const v = (try blocks.rmsCast(g, v4, null, w.eps, ops.dtype(v4), false)).out;
     var rel = try blocks.l2Clip(g, try g.reshape(try w.rel.forward(g, qs), &.{ 1, l, w.heads, w.d_rel }), w.rel_clip, w.rel_clip_at);
     if (w.window == 0 and total > @as(c_int, @intCast(w.log_floor))) {
         const tau = try logScale(g, offset, l, w.log_floor, w.log_alpha);

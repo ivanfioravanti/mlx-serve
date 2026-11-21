@@ -55,16 +55,30 @@ fn route(w: *const Weights, g: *Graph, logits: Array) !Routing {
 /// Row-expert pairs from which the pairs are sorted by expert, so each expert's rows stream once (mlx-lm's bar).
 const SORT_PAIRS = 64;
 
+/// Each row's top-k expert outputs `[L, k, hidden]` in `x`'s dtype and their weights `[L, k]` f32 (`sum` is the MLP).
+pub const Parts = struct { out: Array, weights: Array };
+
 /// `x` `[1, L, hidden]` through its top-k experts, weighted and summed in f32, in `x`'s dtype.
 pub fn forward(w: *const Weights, g: *Graph, x: Array) !Array {
+    return sum(g, try parts(w, g, x, null), ops.shape(x));
+}
+
+/// The weighted sum of `p` in f32, in the outputs' dtype, as `sh` `[1, L, hidden]`.
+pub fn sum(g: *Graph, p: Parts, sh: []const c_int) !Array {
+    const s = try g.sum(try g.mul(try g.astype(p.out, .float32), try g.expandDims(p.weights, -1)), 1, false);
+    return g.reshape(try g.astype(s, ops.dtype(p.out)), sh);
+}
+
+/// `forward` before its weighted sum; `x32` is x widened to f32, where the caller has it.
+pub fn parts(w: *const Weights, g: *Graph, x: Array, x32: ?Array) !Parts {
     const sh = ops.shape(x);
     const t = sh[0] * sh[1];
     const d = sh[2];
     const k = w.top_k;
-    const dt = ops.dtype(x);
     const flat = try g.reshape(x, &.{ t, d });
 
-    const routing = try route(w, g, try g.matmul(try g.astype(flat, .float32), w.router));
+    const wide = if (x32) |a| try g.reshape(a, &.{ t, d }) else try g.astype(flat, .float32);
+    const routing = try route(w, g, try g.matmul(wide, w.router));
     const idx = routing.idx;
     var weights = routing.weights;
 
@@ -92,6 +106,5 @@ pub fn forward(w: *const Weights, g: *Graph, x: Array) !Array {
 
     const out = try g.reshape(if (sort) try g.take(try g.reshape(down, &.{ t * k, d }), inv, 0) else down, &.{ t, k, d });
     if (w.down_scale.ctx != null) weights = try g.mul(weights, try g.take(w.down_scale, idx, 0));
-    const sum = try g.sum(try g.mul(try g.astype(out, .float32), try g.expandDims(weights, -1)), 1, false);
-    return g.reshape(try g.astype(sum, dt), sh);
+    return .{ .out = out, .weights = weights };
 }

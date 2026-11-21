@@ -10,7 +10,7 @@ const Graph = ops.Graph;
 const Array = ops.Array;
 
 pub const SOURCE = kernelSource("plugins/inkling2/kernels/sconv.metal");
-pub const INPUTS = [_][*:0]const u8{ "x", "prev", "w", "dyn", "scale" };
+pub const INPUTS = [_][*:0]const u8{ "x", "prev", "w", "dyn", "wts", "scale" };
 pub const OUTPUTS = [_][*:0]const u8{ "out", "win" };
 pub const TG = 256;
 /// Rows it takes (a decode row, a verify window); a prefill chunk keeps MLX's conv.
@@ -34,13 +34,26 @@ fn getKernel() !mlx.mlx_fast_metal_kernel {
 /// The dynamic form: `dyn` `[1, L, heads * K]`, the taps' per-row part; `w` is then the static `[K, C]`.
 pub const Dynamic = struct { dyn: Array, heads: c_int };
 
+pub const Out = struct { out: Array, win: Array };
+
 /// The conv of `x` `[1, L, C]` with taps `w` (`[C, K, 1]`, or `[K, C]` with `dynamic`) after the window `prev`
 /// (`[1, K - 1, C]` f32, null = zeros), its residual added and scaled by `scale`: `out` in x's dtype and the window
 /// `[1, K - 1 + L, C]` f32. Null where it declines: off Metal, past `MAX_ROWS` rows, a shape or dtype it does not read.
-pub fn fused(g: *Graph, x: Array, w: Array, prev: ?Array, dynamic: ?Dynamic, scale: f32) !?struct { out: Array, win: Array } {
+pub fn fused(g: *Graph, x: Array, w: Array, prev: ?Array, dynamic: ?Dynamic, scale: f32) !?Out {
+    return fusedSum(g, x, null, w, prev, dynamic, scale);
+}
+
+/// `fused` on the weighted f32 sum of `x` `[L, KE, C]` with `weights` `[L, KE]` f32, rounded to x's dtype (null: `x`
+/// is the `[1, L, C]` chunk itself).
+pub fn fusedSum(g: *Graph, x: Array, weights: ?Array, w: Array, prev: ?Array, dynamic: ?Dynamic, scale: f32) !?Out {
     if (!mlx.streamIsGpu(g.s)) return null;
-    const sh = ops.shape(x);
-    if (sh.len != 3 or sh[0] != 1) return null;
+    const xs = ops.shape(x);
+    if (xs.len != 3) return null;
+    const ke: c_int = if (weights != null) xs[1] else 0;
+    if (weights) |wt| {
+        if (ops.dtype(wt) != .float32 or !std.mem.eql(c_int, ops.shape(wt), &.{ xs[0], xs[1] })) return null;
+    } else if (xs[0] != 1) return null;
+    const sh = [_]c_int{ 1, if (weights != null) xs[0] else xs[1], xs[2] };
     const l = sh[1];
     const c = sh[2];
     const ws = ops.shape(w);
@@ -58,7 +71,7 @@ pub fn fused(g: *Graph, x: Array, w: Array, prev: ?Array, dynamic: ?Dynamic, sca
 
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, sh.ptr, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &sh, 3, dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, k - 1 + l, c }, 3, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, l * c, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(TG, l * c), 1, 1));
@@ -66,12 +79,13 @@ pub fn fused(g: *Graph, x: Array, w: Array, prev: ?Array, dynamic: ?Dynamic, sca
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "TW", ops.dtype(w)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "C", c));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", k));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KE", ke));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HD", if (dynamic) |d| @divExact(c, d.heads) else 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "PREV", prev != null));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "DYN", dynamic != null));
 
     // Slots the kernel does not read bind x.
-    const inputs = [_]Array{ x, prev orelse x, w, if (dynamic) |d| d.dyn else x, try g.fromSlice(f32, &.{scale}, &.{1}) };
+    const inputs = [_]Array{ x, prev orelse x, w, if (dynamic) |d| d.dyn else x, weights orelse x, try g.fromSlice(f32, &.{scale}, &.{1}) };
     const in_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(in_vec);
     var out_vec = mlx.mlx_vector_array_new();
@@ -166,4 +180,44 @@ test "inkling2 sconv: the kernel gives the chain's window and output, static and
             try testing.expect(@abs(gout[t * C + c] - want) <= ulp);
         };
     };
+}
+
+// Bar: summing the experts in the kernel gives the bytes of the kernel run on the f32 sum rounded to bf16.
+test "inkling2 sconv: the experts' weighted sum in the kernel equals the kernel on the summed chunk" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    const K = 4;
+    const C = 64;
+    const KE = 8;
+    for ([_]c_int{ 1, 3 }) |l| {
+        const L: usize = @intCast(l);
+        var prng = std.Random.DefaultPrng.init(@intCast(l));
+        const r = prng.random();
+        var parts: [3 * KE * C]f32 = undefined;
+        var wts: [3 * KE]f32 = undefined;
+        var taps: [C * K]f32 = undefined;
+        for (&parts) |*v| v.* = bf(r.floatNorm(f32));
+        for (&wts) |*v| v.* = r.float(f32);
+        for (&taps) |*v| v.* = bf(r.floatNorm(f32));
+        var summed: [3 * C]f32 = undefined;
+        for (0..L) |t| for (0..C) |c| {
+            var acc: f32 = 0;
+            for (0..KE) |j| acc += parts[(t * KE + j) * C + c] * wts[t * KE + j];
+            summed[t * C + c] = bf(acc);
+        };
+        const p = try g.astype(try g.fromSlice(f32, parts[0 .. L * KE * C], &.{ l, KE, C }), .bfloat16);
+        const wt = try g.fromSlice(f32, wts[0 .. L * KE], &.{ l, KE });
+        const w = try g.astype(try g.fromSlice(f32, &taps, &.{ C, K, 1 }), .bfloat16);
+        const x = try g.astype(try g.fromSlice(f32, summed[0 .. L * C], &.{ 1, l, C }), .bfloat16);
+        const a = (try fusedSum(&g, p, wt, w, null, null, 0.5)) orelse return error.KernelDeclined;
+        const b = (try fused(&g, x, w, null, null, 0.5)) orelse return error.KernelDeclined;
+        inline for (.{ .{ a.out, b.out }, .{ a.win, b.win } }) |pair| {
+            const ha = try hostOf(&g, pair[0]);
+            defer testing.allocator.free(ha);
+            const hb = try hostOf(&g, pair[1]);
+            defer testing.allocator.free(hb);
+            try testing.expectEqualSlices(f32, hb, ha);
+        }
+    }
 }
