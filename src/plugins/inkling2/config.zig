@@ -211,7 +211,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         c.vision = v;
     };
 
-    var p: abi.Parsed = .{ .caps = .{ .images = c.vision != null } };
+    var p: abi.Parsed = .{ .caps = .{ .images = c.vision != null, .dflash_capture = true } };
     if (c.vision != null) p.placeholder_ids.image = if (field(root, "image_token_id")) |x| int(x) orelse return unsupported("image_token_id") else 200054;
     const s = &p.shell;
     s.* = .{
