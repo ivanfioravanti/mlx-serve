@@ -19,7 +19,7 @@ const capAcceptedForTokenBudget = @import("verify.zig").capAcceptedForTokenBudge
 const pldOneHotRow = @import("../sampling/spec_sampling.zig").pldOneHotRow;
 const probAt = @import("../sampling/spec_sampling.zig").probAt;
 const probsAtLastPos = @import("../sampling/spec_sampling.zig").probsAtLastPos;
-const runtimeGateShouldDisable = @import("gates.zig").runtimeGateShouldDisable;
+const runtimeGateSince = @import("gates.zig").runtimeGateSince;
 const sampleFromProbs = @import("../sampling/spec_sampling.zig").sampleFromProbs;
 const sampleResidual = @import("../sampling/spec_sampling.zig").sampleResidual;
 const specDecodeUnsupported = @import("verify.zig").specDecodeUnsupported;
@@ -131,6 +131,8 @@ pub fn nextPld(
                     self.disabled_steps = 0;
                     self.yield_steps = 0;
                     self.yield_accepted = 0;
+                    self.pld_gate_attempted0 = self.pld_attempted;
+                    self.pld_gate_accepted0 = self.pld_accepted_tokens;
                     // Invariant already holds — fall through to the
                     // enabled flow below in this same call.
                 },
@@ -140,6 +142,8 @@ pub fn nextPld(
                     self.disabled_steps = 0;
                     self.yield_steps = 0;
                     self.yield_accepted = 0;
+                    self.pld_gate_attempted0 = self.pld_attempted;
+                    self.pld_gate_accepted0 = self.pld_accepted_tokens;
                     const tokens = try allocator.alloc(u32, 1);
                     tokens[0] = drained_tok;
                     return PldStepResult{
@@ -522,16 +526,16 @@ pub fn nextPld(
     // upper-bound draft length (`max_draft`); matches with shorter accepts
     // still divide by this max so a workload with consistently-short
     // n-gram matches DOES get throttled.
-    if (runtimeGateShouldDisable(self.pld_attempted, self.pld_accepted_tokens, max_draft)) {
-        const drafts_proposed: u64 = self.pld_attempted * @as(u64, max_draft);
+    if (runtimeGateSince(self.pld_attempted, self.pld_accepted_tokens, self.pld_gate_attempted0, self.pld_gate_accepted0, max_draft)) {
+        const drafts_proposed: u64 = (self.pld_attempted - self.pld_gate_attempted0) * @as(u64, max_draft);
         const rate: f32 = if (drafts_proposed > 0)
-            @as(f32, @floatFromInt(self.pld_accepted_tokens)) /
+            @as(f32, @floatFromInt(self.pld_accepted_tokens - self.pld_gate_accepted0)) /
                 @as(f32, @floatFromInt(drafts_proposed))
         else
             0.0;
         log.info(
             "  pld=disabled (runtime per-draft rate {d:.2} < {d:.2} after {d} attempts)\n",
-            .{ rate, RUNTIME_GATE_MIN_PER_DRAFT_RATE, self.pld_attempted },
+            .{ rate, RUNTIME_GATE_MIN_PER_DRAFT_RATE, self.pld_attempted - self.pld_gate_attempted0 },
         );
         self.spec_disabled_runtime = true;
         self.disabled_steps = 0;

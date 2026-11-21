@@ -47,6 +47,13 @@ pub fn runtimeGateShouldDisable(attempted: u64, accepted: u64, drafts_per_round:
     return rate < RUNTIME_GATE_MIN_PER_DRAFT_RATE;
 }
 
+/// The per-draft gate over the rounds since PLD was last (re-)enabled: `attempted0` / `accepted0` are the
+/// request's totals at that moment. Judged on the request's totals, a re-enabled PLD inherited the stretch that
+/// dropped it and tripped again on its first round.
+pub fn runtimeGateSince(attempted: u64, accepted: u64, attempted0: u64, accepted0: u64, drafts_per_round: u32) bool {
+    return runtimeGateShouldDisable(attempted - attempted0, accepted - accepted0, drafts_per_round);
+}
+
 // DFlash has different economics from sequential-token drafters: one
 // assistant call proposes the whole block and the M5 NAX verify lane makes
 // wide blocks cheap. Per-draft percentage therefore penalizes block 16
@@ -625,4 +632,15 @@ test "PldMemory: a plain step's cost measured once spares later requests at that
     // Judged on its third round with no probe: 14 ms a token against 18.
     for (0..PLD_COST_PROBE_AFTER) |_| try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(42, 3, 5));
     try std.testing.expect(c.judged() and c.pays());
+}
+
+test "runtimeGateSince: a re-enabled PLD is judged on its own rounds, not the ones that dropped it" {
+    // Six rounds of five drafts, twelve accepted: 0.40 a draft, under the bar.
+    try std.testing.expect(runtimeGateShouldDisable(6, 12, 5));
+    // Re-enabled there: one more round, fully accepted, does not trip on the old totals, nor do the next four.
+    try std.testing.expect(runtimeGateShouldDisable(7, 17, 5));
+    try std.testing.expect(!runtimeGateSince(7, 17, 6, 12, 5));
+    try std.testing.expect(!runtimeGateSince(6 + RUNTIME_GATE_WARMUP, 12 + 5 * RUNTIME_GATE_WARMUP, 6, 12, 5));
+    // A fresh stretch that accepts too little is dropped once it is warm.
+    try std.testing.expect(runtimeGateSince(6 + RUNTIME_GATE_WARMUP, 12 + RUNTIME_GATE_WARMUP, 6, 12, 5));
 }
