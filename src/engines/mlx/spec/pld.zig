@@ -100,9 +100,9 @@ pub fn nextPld(
         const probe_over = self.pld_probe_over;
         self.pld_probe_over = false;
         if (probe_over or self.disabled_steps % SPEC_REENABLE_INTERVAL == 0) reenable: {
-            // A stretch that cost more per token than plain decode is not retried: no drain, no flapping.
-            if (!self.pld_cost.pays()) {
-                if (probe_over) {
+            // A stretch whose rounds cost more per token than plain decode is not retried: no drain, no flapping.
+            if (self.pld_cost.lost or (probe_over and !self.pld_cost.pays())) {
+                if (probe_over and !self.pld_cost.lost) {
                     self.pld_cost.lost = true;
                     self.xfm.pld_memory.record(contextTokens(self), self.pld_cost.ratio());
                     log.info("  pld=disabled (cost gate: {d:.1} ms/token in rounds vs {d:.1} plain)\n", .{ self.pld_cost.msPerToken(), self.pld_cost.plain_ms });
@@ -265,7 +265,7 @@ pub fn nextPld(
             self.spec_disabled_runtime = true;
             self.disabled_steps = 0;
         }
-        costStep(self, msSince(watch), 1);
+        costStep(self, msSince(watch), 1, 0);
 
         const tokens = try allocator.alloc(u32, 1);
         tokens[0] = t1;
@@ -534,7 +534,7 @@ pub fn nextPld(
         self.spec_disabled_runtime = true;
         self.disabled_steps = 0;
     }
-    costStep(self, msSince(watch), num_emit);
+    costStep(self, msSince(watch), num_emit, m);
 
     return PldStepResult{
         .tokens = tokens,
@@ -553,13 +553,13 @@ fn msSince(watch: io_util.Stopwatch) f32 {
 
 /// Folds an enabled step into the request's PLD cost and acts on the verdict: a probe of plain steps when no
 /// plain step was timed yet, or PLD off when its tokens cost more than plain ones.
-fn costStep(self: *Generator, ms: f32, tokens: u32) void {
-    const verdict = self.pld_cost.spec(ms, tokens);
+fn costStep(self: *Generator, ms: f32, tokens: u32, drafted: u32) void {
+    const verdict = self.pld_cost.spec(ms, tokens, drafted);
     if (self.spec_disabled_runtime) return self.pld_cost.handOff();
     switch (verdict) {
         .keep => {
             // Judged at the margin and kept: a later request in this context starts with PLD on.
-            if (self.pld_cost.spec_n == PLD_COST_WARMUP and self.pld_cost.plain_n > 0) self.xfm.pld_memory.record(contextTokens(self), self.pld_cost.ratio());
+            if (drafted > 0 and self.pld_cost.rounds == PLD_COST_WARMUP and self.pld_cost.plain_n > 0) self.xfm.pld_memory.record(contextTokens(self), self.pld_cost.ratio());
             return;
         },
         .probe => self.pld_cost.beginProbe(),

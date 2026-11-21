@@ -133,9 +133,12 @@ pub fn specShouldReenable(committed: []const u32, generated_len: usize) bool {
 // The gates above count drafts; none of them knows what a round costs. Past a few thousand keys a 16-row verify
 // (and the re-forward a partial accept owes) costs more wall time than the tokens it emits, at any acceptance.
 
-/// Enabled steps (verify rounds and cold steps) before the cost gate asks what a plain step costs, so a request of
-/// a few steps never probes, and before a loss within the margin's reach is believed.
+/// Verify rounds before the cost gate asks what a plain step costs, so a request of a few rounds never probes,
+/// and before a loss within the margin's reach is believed. Cold steps add to PLD's cost but are not counted: a
+/// stretch with no draft says nothing of what a round costs, and the yield gate already answers for it.
 pub const PLD_COST_PROBE_AFTER: u32 = 3;
+/// Draft tokens those rounds must have verified between them: one round whose draft missed is no sample.
+pub const PLD_COST_MIN_DRAFTED: u32 = 12;
 pub const PLD_COST_WARMUP: u32 = 8;
 /// A loss this large is believed as soon as both costs are known: at 65k keys a round's token costs 3.5 plain
 /// ones, and every further round is a quarter second.
@@ -154,6 +157,9 @@ pub const PldCost = struct {
     spec_ms: f32 = 0,
     spec_tok: f32 = 0,
     spec_n: u32 = 0,
+    /// Enabled steps that ran a verify round, and the draft tokens they verified.
+    rounds: u32 = 0,
+    drafted: u32 = 0,
     /// EMA of a plain step's ms; `plain_n` 0 = never timed.
     plain_ms: f32 = 0,
     plain_n: u32 = 0,
@@ -170,14 +176,17 @@ pub const PldCost = struct {
         ema.* = if (n == 0) x else ema.* + PLD_COST_BETA * (x - ema.*);
     }
 
-    /// An enabled step took `ms` and emitted `tokens`.
-    pub fn spec(c: *PldCost, ms: f32, tokens: u32) Verdict {
+    /// An enabled step took `ms` and emitted `tokens` after verifying `drafted` draft tokens (0: a cold step).
+    pub fn spec(c: *PldCost, ms: f32, tokens: u32, drafted: u32) Verdict {
         fold(&c.spec_ms, c.spec_n, ms);
         fold(&c.spec_tok, c.spec_n, @floatFromInt(tokens));
         c.spec_n += 1;
-        if (c.spec_n < PLD_COST_PROBE_AFTER) return .keep;
+        if (drafted == 0) return .keep;
+        c.rounds += 1;
+        c.drafted += drafted;
+        if (!c.judged()) return .keep;
         if (c.plain_n == 0) return if (c.probed) .keep else .probe;
-        if (c.ratio() <= (if (c.spec_n < PLD_COST_WARMUP) PLD_COST_DECISIVE else PLD_COST_MARGIN)) return .keep;
+        if (c.pays()) return .keep;
         c.lost = true;
         return .disable;
     }
@@ -213,14 +222,23 @@ pub const PldCost = struct {
         return c.spec_ms / c.spec_tok / c.plain_ms;
     }
 
-    /// Whether PLD may run: nothing measured yet says its tokens cost more than plain ones.
+    /// Whether the stretch so far pays: its rounds have not shown its tokens to cost more than plain ones.
     pub fn pays(c: *const PldCost) bool {
-        return !c.lost and c.ratio() <= (if (c.spec_n < PLD_COST_WARMUP) PLD_COST_DECISIVE else PLD_COST_MARGIN);
+        if (c.lost) return false;
+        if (!c.judged()) return true;
+        return c.ratio() <= (if (c.rounds < PLD_COST_WARMUP) PLD_COST_DECISIVE else PLD_COST_MARGIN);
+    }
+
+    /// Whether the stretch has run enough rounds over enough draft tokens to be judged at all.
+    pub fn judged(c: *const PldCost) bool {
+        return c.rounds >= PLD_COST_PROBE_AFTER and c.drafted >= PLD_COST_MIN_DRAFTED;
     }
 
     /// A fresh spec stretch (the generated tail turned repetitive): it is judged on its own steps.
     pub fn restart(c: *PldCost) void {
         c.spec_n = 0;
+        c.rounds = 0;
+        c.drafted = 0;
         c.lost = false;
     }
 
@@ -229,15 +247,18 @@ pub const PldCost = struct {
     }
 };
 
+/// Requests in a row that must lose decisively before a context size starts with PLD off: one request's verdict
+/// (an image prompt, a continuation whose first drafts had to miss) is not the context's.
+pub const PLD_MEMORY_LOSSES: u8 = 2;
 /// A lost context lets every this-many-th request speculate again, so a verdict cannot outlive what caused it.
 pub const PLD_MEMORY_RETRY: u32 = 8;
 
 /// What the cost gate last decided per context size on one loaded model, in memory only: a request in a context
-/// that lost by `PLD_COST_DECISIVE` starts with PLD off instead of paying three rounds and a probe to find out
+/// that keeps losing by `PLD_COST_DECISIVE` starts with PLD off instead of paying rounds and a probe to find out
 /// again.
 pub const PldMemory = struct {
-    /// One cell per power of two of the context's tokens.
-    lost: [32]bool = @splat(false),
+    /// One cell per power of two of the context's tokens: decisive losses in a row, and requests started off.
+    losses: [32]u8 = @splat(0),
     skipped: [32]u32 = @splat(0),
 
     fn bucket(tokens: usize) usize {
@@ -247,17 +268,20 @@ pub const PldMemory = struct {
     /// Asked once at a request's first PLD step: whether it starts with PLD off.
     pub fn startsOff(m: *PldMemory, tokens: usize) bool {
         const b = bucket(tokens);
-        if (!m.lost[b]) return false;
+        if (m.losses[b] < PLD_MEMORY_LOSSES) return false;
         m.skipped[b] += 1;
         return m.skipped[b] % PLD_MEMORY_RETRY != 0;
     }
 
-    /// A request's verdict at `tokens` of context: `ratio` is PLD's ms per token over plain's when it was dropped,
-    /// or anything under the margin when it was kept.
+    /// A judged request's verdict at `tokens` of context: `ratio` is PLD's ms per token over plain's.
     pub fn record(m: *PldMemory, tokens: usize, ratio: f32) void {
         const b = bucket(tokens);
-        m.lost[b] = ratio >= PLD_COST_DECISIVE;
-        if (!m.lost[b]) m.skipped[b] = 0;
+        if (ratio >= PLD_COST_DECISIVE) {
+            m.losses[b] = @min(m.losses[b] + 1, PLD_MEMORY_LOSSES);
+        } else {
+            m.losses[b] = 0;
+            m.skipped[b] = 0;
+        }
     }
 };
 
@@ -469,11 +493,11 @@ test "Generator.specShouldReenable gates mid-request PLD re-activation" {
     try testing.expect(!Generator.specShouldReenable(&committed, 8));
 }
 
-test "PldCost: a few steps never probe; then a probe, and a loss of twice the plain cost ends PLD at once" {
+test "PldCost: a few rounds never probe; then a probe, and a loss of twice the plain cost ends PLD at once" {
     var c: PldCost = .{};
-    for (0..PLD_COST_PROBE_AFTER - 1) |_| try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(270, 3));
+    for (0..PLD_COST_PROBE_AFTER - 1) |_| try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(270, 3, 6));
     // Nothing says yet what a plain token costs.
-    try std.testing.expectEqual(PldCost.Verdict.probe, c.spec(270, 3));
+    try std.testing.expectEqual(PldCost.Verdict.probe, c.spec(270, 3, 6));
     c.beginProbe();
     // The hand-off step is not a sample; the probe ends on its last counted step.
     try std.testing.expect(!c.plain(90));
@@ -481,68 +505,92 @@ test "PldCost: a few steps never probe; then a probe, and a loss of twice the pl
     try std.testing.expect(c.plain(27));
     // 90 ms a token in rounds against 27 plain.
     try std.testing.expect(!c.pays());
-    try std.testing.expectEqual(PldCost.Verdict.disable, c.spec(270, 3));
+    try std.testing.expectEqual(PldCost.Verdict.disable, c.spec(270, 3, 6));
     try std.testing.expect(c.lost);
 }
 
 test "PldCost: a loss inside twice the plain cost waits for the warmup, and the probe runs once" {
     var c: PldCost = .{};
-    for (0..PLD_COST_PROBE_AFTER) |_| _ = c.spec(36, 1);
+    for (0..PLD_COST_PROBE_AFTER) |_| _ = c.spec(36, 1, 6);
     c.beginProbe();
     for (0..PLD_COST_PROBE) |_| _ = c.plain(27);
     // 36 against 27: early rounds are the dearest, so not yet.
     try std.testing.expect(c.pays());
-    for (PLD_COST_PROBE_AFTER..PLD_COST_WARMUP - 1) |_| try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(36, 1));
-    try std.testing.expectEqual(PldCost.Verdict.disable, c.spec(36, 1));
+    for (PLD_COST_PROBE_AFTER..PLD_COST_WARMUP - 1) |_| try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(36, 1, 6));
+    try std.testing.expectEqual(PldCost.Verdict.disable, c.spec(36, 1, 6));
 
     // A probe that timed nothing (the request's plain steps were all hand-offs) is not repeated.
     var blind: PldCost = .{ .probed = true };
-    for (0..PLD_COST_WARMUP + 4) |_| try std.testing.expectEqual(PldCost.Verdict.keep, blind.spec(500, 1));
+    for (0..PLD_COST_WARMUP + 4) |_| try std.testing.expectEqual(PldCost.Verdict.keep, blind.spec(500, 1, 6));
 }
 
 test "PldCost: rounds cheaper per token than a plain step keep PLD on, within the margin too" {
     var c: PldCost = .{};
-    for (0..PLD_COST_WARMUP) |_| _ = c.spec(40, 4);
+    for (0..PLD_COST_WARMUP) |_| _ = c.spec(40, 4, 6);
     c.beginProbe();
     for (0..PLD_COST_PROBE) |_| _ = c.plain(22);
     try std.testing.expect(c.pays());
-    try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(40, 4));
+    try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(40, 4, 6));
     // 26 ms a token against 22 plain is inside the margin.
     var near: PldCost = .{};
-    for (0..PLD_COST_WARMUP) |_| _ = near.spec(26, 1);
+    for (0..PLD_COST_WARMUP) |_| _ = near.spec(26, 1, 6);
     near.beginProbe();
     for (0..PLD_COST_PROBE) |_| _ = near.plain(22);
-    try std.testing.expectEqual(PldCost.Verdict.keep, near.spec(26, 1));
+    try std.testing.expectEqual(PldCost.Verdict.keep, near.spec(26, 1, 6));
 }
 
-test "PldCost: cold steps count as PLD's cost, and a later stretch is judged on its own" {
+test "PldCost: cold steps alone never drop PLD or block its return; with rounds they are part of its cost" {
     var c: PldCost = .{};
     c.beginProbe();
     for (0..PLD_COST_PROBE) |_| _ = c.plain(20);
-    // One token a step at 30 ms (no match, an unpipelined forward): slower than plain.
-    var v = PldCost.Verdict.keep;
-    for (0..PLD_COST_WARMUP) |_| v = c.spec(30, 1);
-    try std.testing.expectEqual(PldCost.Verdict.disable, v);
-    try std.testing.expect(!c.pays());
-    // The tail turns repetitive and PLD is given a fresh stretch.
-    c.restart();
+    // No match yet: one token a step through an unpipelined forward, half again a plain step. The yield gate's call.
+    for (0..40) |_| try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(30, 1, 0));
     try std.testing.expect(c.pays());
-    for (0..PLD_COST_WARMUP) |_| v = c.spec(60, 6);
+    try std.testing.expect(!c.lost);
+    // The tail turns repetitive: rounds of 6 tokens in 60 ms are judged on a fresh stretch.
+    c.restart();
+    var v = PldCost.Verdict.keep;
+    for (0..PLD_COST_WARMUP) |_| v = c.spec(60, 6, 6);
     try std.testing.expectEqual(PldCost.Verdict.keep, v);
+    // Rounds that emit one token each, between cold steps, lose.
+    c.restart();
+    for (0..PLD_COST_WARMUP) |_| {
+        _ = c.spec(30, 1, 0);
+        v = c.spec(70, 1, 6);
+    }
+    try std.testing.expectEqual(PldCost.Verdict.disable, v);
 }
 
-test "PldMemory: a decisive loss turns PLD off for that context size, with a retry, until a request keeps it" {
+test "PldCost: one round whose draft missed is no verdict, however dear" {
+    var c: PldCost = .{ .plain_ms = 14.3, .plain_n = 4, .probed = true };
+    // 33.4 ms for one emitted token: 2.3 plain steps, on a continuation whose first draft had to miss.
+    try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(33.4, 1, 5));
+    try std.testing.expect(c.pays());
+    // Three such rounds verify 15 draft tokens between them: now it is a sample, and a loss.
+    try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(33.4, 1, 5));
+    try std.testing.expectEqual(PldCost.Verdict.disable, c.spec(33.4, 1, 5));
+    // Three rounds of two-token drafts are not twelve tokens yet.
+    var short: PldCost = .{ .plain_ms = 14.3, .plain_n = 4, .probed = true };
+    for (0..3) |_| try std.testing.expectEqual(PldCost.Verdict.keep, short.spec(33.4, 1, 2));
+}
+
+test "PldMemory: two decisive losses in a row turn PLD off for that context size, with a retry, until a request keeps it" {
     var m: PldMemory = .{};
     try std.testing.expect(!m.startsOff(60_000));
+    // One request's loss (an image prompt, say) does not speak for the next request.
     m.record(60_000, 3.4);
+    try std.testing.expect(!m.startsOff(36_000));
+    m.record(36_000, 2.2);
     // 36k and 65k share a power of two; 2k does not.
     for (1..PLD_MEMORY_RETRY) |_| try std.testing.expect(m.startsOff(36_000));
     try std.testing.expect(!m.startsOff(65_000));
     try std.testing.expect(m.startsOff(65_000));
     try std.testing.expect(!m.startsOff(2_200));
-    // A loss inside twice the plain cost is not remembered, and a kept request clears the cell.
-    m.record(2_200, 1.4);
-    try std.testing.expect(!m.startsOff(2_200));
+    // A kept request, or a loss inside twice the plain cost, clears the cell; one new loss does not close it again.
     m.record(60_000, 0.5);
+    try std.testing.expect(!m.startsOff(36_000));
+    m.record(60_000, 3.0);
+    m.record(60_000, 1.4);
+    m.record(60_000, 3.0);
     try std.testing.expect(!m.startsOff(36_000));
 }
