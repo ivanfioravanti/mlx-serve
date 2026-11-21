@@ -484,11 +484,18 @@ Used in mlx-serve:
     (token, expert) pairs, gather rows, run with sorted indices, then inverse
     permute) is theirs, used by our multi-position MoE paths in
     `src/engines/mlx/transformer.zig` and `src/plugins/deepseek_v4/deepseek_v4.zig`.
+  * `src/plugins/inkling2/rel_attn.zig` ports the Inkling 2 attention of mlx-lm
+    PR #2086 (`mlx_lm/models/inkling2/`): `reference` is `layers.py`'s
+    `_attention_reference`, and `kernels/rel_attn.metal` computes what
+    `kernels.py`'s `relative_attention` does (the relative-position bias and
+    the per-row sink logit inside a causal flash attention).
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c, and the GDN
 kernel is extended by a sequence variant (`GDN_KERNEL_SEQ_SOURCE`) that records
 the recurrence state after every intermediate timestep so speculative decoding
-can roll back without re-running the prefix.
+can roll back without re-running the prefix. The Inkling 2 attention kernel
+is rewritten on our steel-attention tiles (fp32 fragments, K and V staged as
+stored) and cuts the key axis into passes that carry the softmax state.
 
 --------------------------------------------------------------------------------
 mlx-c

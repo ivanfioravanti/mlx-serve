@@ -76,7 +76,7 @@ pub const INPUTS = [_][*:0]const u8{ "q", "k", "v", "rel", "sinks", "key_start",
 pub const OUTPUTS = [_][*:0]const u8{ "out", "m_out", "l_out", "o_out" };
 
 /// Query rows a threadgroup takes (8 per simdgroup) and its threads.
-pub const BQ = 32;
+pub const BQ = 64;
 pub const TG = BQ / 8 * 32;
 /// Keys a kernel block stages; a pass boundary is a multiple of it.
 pub const BK = 16;
@@ -86,9 +86,9 @@ pub const MIN_ROWS = 16;
 /// Threadgroup bytes Metal grants on every Apple GPU.
 const TG_MEMORY = 32768;
 
-/// The kernel's threadgroup arrays at head width `d`: K transposed and V, as half.
+/// The kernel's threadgroup arrays at head width `d`: a K and a V block of 2-byte elements.
 pub fn tgBytes(d: usize) usize {
-    return 2 * (d * (BK + 8) + BK * (d + 8));
+    return 2 * 2 * BK * (d + 8);
 }
 
 /// Row-key pairs one dispatch may score. Past it the key axis is cut into passes that carry each row's fp32
@@ -124,7 +124,8 @@ fn halfFloat(dt: ops.Dtype) bool {
 }
 
 /// The simdgroup-matrix kernel; null where it declines: off Metal, a chunk under `MIN_ROWS` rows, q/k/v not all
-/// bf16 or all f16, a head width that is not a multiple of 8 or whose tiles outgrow threadgroup memory.
+/// bf16 or all f16, a head width that is not a multiple of 8 or whose tiles outgrow threadgroup memory, a K or V
+/// view whose base its 16-byte loads cannot read.
 pub fn simd(g: *Graph, a: Args) !?Array {
     if (!mlx.streamIsGpu(g.s)) return null;
     if (mlx.mlx_array_ndim(a.q) != 4 or mlx.mlx_array_ndim(a.k) != 4 or mlx.mlx_array_ndim(a.v) != 4) return null;
@@ -148,6 +149,7 @@ pub fn simd(g: *Graph, a: Args) !?Array {
     if (!std.mem.eql(c_int, ks, vs) or ks[0] != b or ks[3] != d) return null;
     if (rs[0] != b or rs[1] != l or rs[2] != hq) return null;
     if (!std.mem.eql(c_int, ops.shape(a.sinks), rs[0..3]) or ops.shape(a.key_start)[0] != b) return null;
+    if (!attn256.attn256Base16Aligned(a.k) or !attn256.attn256Base16Aligned(a.v)) return null;
     const k = getKernel() catch return null;
 
     var c = g.scope();
@@ -411,6 +413,12 @@ test "inkling2 rel_attn: attend takes the kernel for a prefill chunk and the op 
         try testing.expectEqual(@as(?Array, null), try simd(&g, a));
         try ops.expectBitEqual(try attend(&g, a), try reference(&g, a));
     }
+    // A K view that starts 6 bytes into its buffer.
+    var odd = chunk;
+    var prng = std.Random.DefaultPrng.init(9);
+    odd.k = try g.sliceAxis(try uniform(&g, prng.random(), &.{ 1, 2, 60, 40 }, -1, 1, .bfloat16), 3, 3, 35);
+    try ops.eval(odd.k);
+    try testing.expectEqual(@as(?Array, null), try simd(&g, odd));
 }
 
 test "inkling2 rel_attn: a pass takes whole key blocks within the budget, one at least" {
