@@ -64,6 +64,12 @@ pub const MessageGate = struct {
     forget: Array,
     message: Array,
 
+    /// `forward` on row `j` of `messages` `[1, L, Q, H]`: two kernels for a few rows, the op chain past them.
+    pub fn onRow(w: *const MessageGate, g: *Graph, hidden: Array, messages: Array, j: c_int) !Array {
+        if (try @import("message_gate.zig").fused(g, hidden, messages, j, w.down, w.forget, w.message)) |out| return out;
+        return w.forward(g, hidden, try row(g, messages, j));
+    }
+
     /// `(1 - tanh(forget)) * hidden + tanh(gain) * message`, both gates read off the RMS-normed pair; f32.
     pub fn forward(w: *const MessageGate, g: *Graph, hidden: Array, message: Array) !Array {
         const h = try f32Of(g, hidden);

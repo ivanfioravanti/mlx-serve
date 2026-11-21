@@ -166,7 +166,7 @@ pub const Model = struct {
                 } else qkv = @splat(try blocks.depthOne(g, bank, normed_in, L.attn_query));
             }
             if (messages) |m| for (&qkv, 0..) |*s, j| {
-                s.* = try L.gates.?[j].forward(g, s.*, try blocks.row(g, m, @intCast(j)));
+                s.* = try L.gates.?[j].onRow(g, s.*, m, @intCast(j));
             };
             var normed: [3]Array = undefined;
             for (&normed, qkv, 0..) |*n, s, j| {
@@ -183,7 +183,7 @@ pub const Model = struct {
             } else res = try compiled.sum(g, t.h, ac.out);
 
             var x = try blocks.depthOne(g, t.bank[0..t.blocks], try blocks.rms(g, res, 1e-6), L.mlp_query);
-            if (messages) |m| x = try L.gates.?[3].forward(g, x, try blocks.row(g, m, 3));
+            if (messages) |m| x = try L.gates.?[3].onRow(g, x, m, 3);
             const y = try moe.forward(&L.mlp, g, try g.astype(try g.rmsNorm(x, L.post_norm, eps), dt));
             const mc = try blocks.sconv(g, y, L.mlp_conv, prev[3]);
             // The four windows side by side; the state is their last `K - 1` rows (copied off a chunk).
