@@ -25,6 +25,9 @@ const launch = metal.Launch{
 };
 
 const K = 4;
+const POST_HD = 128;
+const CLIP = 5.0;
+const EPS = 1e-6;
 /// The dynamic form's heads (the pack's 8 KV heads of 128).
 const HEADS = 8;
 
@@ -35,6 +38,8 @@ const Conv = struct {
     dynamic: bool,
     /// Experts summed into the chunk (0: the chunk is x itself).
     experts: usize,
+    /// The head norm after the conv: 0 none, 1 RMS (v), 2 L2 clip (k), over 128-wide heads.
+    post: u8 = 0,
     arena: std.heap.ArenaAllocator,
     shape: Shape = undefined,
     x: []f64 = &.{},
@@ -58,8 +63,9 @@ const Conv = struct {
 
     pub fn geometry(self: *const Conv, shape: Shape) ?metal.Geometry {
         if (shape.rows < 1 or shape.rows > sconv.MAX_ROWS or shape.k != K or (self.dynamic and shape.n % HEADS != 0)) return null;
+        if (self.post != 0 and shape.n % POST_HD != 0) return null;
         const threads = shape.rows * shape.n;
-        var g = metal.Geometry{ .grid = .{ ci(threads), 1, 1 }, .tg = .{ ci(@min(sconv.TG, threads)), 1, 1 } };
+        var g = metal.Geometry{ .grid = .{ ci(threads), 1, 1 }, .tg = .{ ci(if (self.post != 0) POST_HD else @min(sconv.TG, threads)), 1, 1 } };
         g.out(&.{ 1, ci(shape.rows), ci(shape.n) }, .bfloat16);
         g.out(&.{ 1, ci(K - 1 + shape.rows), ci(shape.n) }, .float32);
         g.dtype("T", .bfloat16);
@@ -67,7 +73,8 @@ const Conv = struct {
         g.int("C", shape.n);
         g.int("K", K);
         g.int("KE", self.experts);
-        g.int("HD", if (self.dynamic) shape.n / HEADS else 1);
+        g.int("HD", if (self.dynamic) shape.n / HEADS else if (self.post != 0) @as(usize, POST_HD) else 1);
+        g.int("POST", self.post);
         g.flag("PREV", true);
         g.flag("DYN", self.dynamic);
         return g;
@@ -121,6 +128,7 @@ const Conv = struct {
         self.args[3] = if (self.dynamic) try rig.input(.bfloat16, &.{ 1, ci(l), HEADS * K }, self.dyn) else self.args[0];
         self.args[4] = if (self.experts > 0) try rig.input(.float32, &.{ ci(l), ci(self.experts) }, self.wts) else self.args[0];
         self.args[5] = try rig.input(.float32, &.{1}, &.{self.scale});
+        self.args[6] = try rig.input(.float32, &.{1}, &.{host.rt(.float32, self.postValue())});
         return true;
     }
 
@@ -130,6 +138,10 @@ const Conv = struct {
 
     pub fn count(self: *const Conv) usize {
         return self.shape.rows * self.shape.n + (K - 1 + self.shape.rows) * self.shape.n;
+    }
+
+    fn postValue(self: *const Conv) f64 {
+        return if (self.post == 2) CLIP else EPS;
     }
 
     fn window(self: *const Conv, r: usize, ch: usize) f64 {
@@ -158,6 +170,24 @@ const Conv = struct {
             want[t * c + ch] = (y + xt) * self.scale;
             if (mag) |mm| mm[t * c + ch] = (if (self.dynamic) m else @abs(y)) * self.scale;
         };
+        // The head norm reads the output rounded to bf16, as the kernel and the op chain round it.
+        if (self.post != 0) for (0..l) |t| for (0..c / POST_HD) |h| {
+            const row = want[t * c + h * POST_HD ..][0..POST_HD];
+            var ss: f64 = 0;
+            for (row) |*o| {
+                o.* = spec.roundTo(.bf16, o.*);
+                ss += o.* * o.*;
+            }
+            const pv = host.rt(.float32, self.postValue());
+            const factor = if (self.post == 1) 1 / @sqrt(ss / POST_HD + pv) else blk: {
+                const r = pv / (@sqrt(ss) + 1e-6);
+                break :blk if (std.math.isNan(r)) r else @min(r, 1);
+            };
+            for (row, 0..) |*o, i| {
+                o.* *= factor;
+                if (mag) |mm| mm[t * c + h * POST_HD + i] *= @abs(factor);
+            }
+        };
         const at = l * c;
         for (0..K - 1 + l) |r| for (0..c) |ch| {
             want[at + r * c + ch] = self.window(r, ch);
@@ -176,7 +206,11 @@ const Conv = struct {
     fn wrapper(self: *Conv) ![]const u8 {
         var g = ops.Graph.init(self.rig.a, self.rig.stream());
         defer g.deinit();
-        const got = (try sconv.fusedSum(&g, self.args[0], if (self.experts > 0) self.args[4] else null, self.args[2], self.args[1], if (self.dynamic) .{ .dyn = self.args[3], .heads = HEADS } else null, @floatCast(self.scale))) orelse return error.Declined;
+        const got = (try sconv.fusedSum(&g, self.args[0], if (self.experts > 0) self.args[4] else null, self.args[2], self.args[1], if (self.dynamic) .{ .dyn = self.args[3], .heads = HEADS } else null, @floatCast(self.scale), switch (self.post) {
+            0 => .none,
+            1 => .{ .rms = .{ .hd = POST_HD, .eps = EPS } },
+            else => .{ .clip = .{ .hd = POST_HD, .threshold = CLIP } },
+        })) orelse return error.Declined;
         return self.rig.bytesOf(&.{ got.out, got.win });
     }
 };
@@ -193,14 +227,14 @@ fn depthK(_: Shape) usize {
     return K;
 }
 
-fn convSpec(comptime name: []const u8, comptime dynamic: bool, served: []const Shape) spec.Spec {
+fn convSpec(comptime name: []const u8, comptime dynamic: bool, comptime post: u8, served: []const Shape) spec.Spec {
     return .{
         .name = name,
         .accum = .f32,
         .depth = depthK,
         // The residual add and the scale; the static form's conv sum is rounded to bf16 before them.
-        .ops = 2,
-        .mids = if (dynamic) 0 else 1,
+        .ops = if (post != 0) 6 else 2,
+        .mids = (if (dynamic) @as(f64, 0) else 1) + (if (post != 0) @as(f64, 2) else 0),
         .out = .bf16,
         .outs = &.{ .{ .elem = .bf16, .count = outCount }, .{ .elem = .f32, .count = outCount } },
         .served = served,
@@ -216,8 +250,22 @@ const registrations = .{
     .{ "inkling2_sconv (static, 8 experts summed)", false, 8, &[_]Shape{ .{ .rows = 1, .n = 2304, .k = K }, .{ .rows = 9, .n = 2304, .k = K } } },
 };
 
+/// k's L2 clip and v's RMS norm after the conv, over the 8 KV heads of 128.
+const post_registrations = .{
+    .{ "inkling2_sconv (static, k clip)", false, 2 },
+    .{ "inkling2_sconv (static, v rms)", false, 1 },
+    .{ "inkling2_sconv (dynamic, k clip)", true, 2 },
+    .{ "inkling2_sconv (dynamic, v rms)", true, 1 },
+};
+const post_shapes = &[_]Shape{ .{ .rows = 1, .n = 1024, .k = K }, .{ .rows = 9, .n = 1024, .k = K } };
+
 pub fn register(set: *kc.Set) !void {
-    inline for (registrations) |r| try set.add(Conv, .init(set.a, &launch, r[1], r[2]), convSpec(r[0], r[1], r[3]), null);
+    inline for (registrations) |r| try set.add(Conv, .init(set.a, &launch, r[1], r[2]), convSpec(r[0], r[1], 0, r[3]), null);
+    inline for (post_registrations) |r| {
+        var t = Conv.init(set.a, &launch, r[1], 0);
+        t.post = r[2];
+        try set.add(Conv, t, convSpec(r[0], r[1], r[2], post_shapes), null);
+    }
 }
 
 // ── tests ──

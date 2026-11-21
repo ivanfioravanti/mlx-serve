@@ -115,18 +115,25 @@ fn tail(g: *Graph, win: Array, k: c_int) !Array {
 const sconv_kernel = @import("sconv.zig");
 
 /// The kernel's output and window; the state is a view of the window's last `k - 1` rows.
-fn fromKernel(g: *Graph, out: Array, win: Array, k: c_int) !Conv {
+fn fromKernel(g: *Graph, out: Array, win: Array, k: c_int, post: bool) !Conv {
     const n = ops.shape(win)[1];
-    return .{ .out = out, .state = try g.sliceAxis(win, 1, n - (k - 1), n), .input = win };
+    return .{ .out = out, .state = try g.sliceAxis(win, 1, n - (k - 1), n), .input = win, .post = post };
 }
 
-/// `input` is the whole conv input `[1, K-1+L, C]` (what a verify forward leaves for the rollback).
-pub const Conv = struct { out: Array, state: Array, input: Array };
+/// `input` is the whole conv input `[1, K-1+L, C]` (what a verify forward leaves for the rollback). `post`: the
+/// kernel applied the asked-for head norm to `out` (the caller applies it otherwise).
+pub const Conv = struct { out: Array, state: Array, input: Array, post: bool = false };
+pub const Post = sconv_kernel.Post;
 
 /// Depthwise causal conv `w` `[C, K, 1]` in the weight's dtype plus the input, over `sqrt(K + 1)`.
 pub fn sconv(g: *Graph, x: Array, w: Array, prev: ?Array) !Conv {
+    return sconvPost(g, x, w, prev, .none);
+}
+
+/// `sconv` with `post` folded into the kernel where it serves (`Conv.post`).
+pub fn sconvPost(g: *Graph, x: Array, w: Array, prev: ?Array, post: Post) !Conv {
     const k = ops.shape(w)[1];
-    if (try sconv_kernel.fused(g, x, w, prev, null, 1.0 / @sqrt(@as(f32, @floatFromInt(k + 1))))) |r| return fromKernel(g, r.out, r.win, k);
+    if (try sconv_kernel.fusedSum(g, x, null, w, prev, null, 1.0 / @sqrt(@as(f32, @floatFromInt(k + 1))), post)) |r| return fromKernel(g, r.out, r.win, k, post != .none);
     const x32 = try f32Of(g, x);
     const win = try window(g, x32, prev, k);
     const y = try g.conv1d(try g.astype(win, ops.dtype(w)), w, 1, 0, 1, ops.shape(x)[2]);
@@ -138,15 +145,15 @@ pub fn sconv(g: *Graph, x: Array, w: Array, prev: ?Array) !Conv {
 /// kernel; null where it declines.
 pub fn sconvSum(g: *Graph, parts: Array, weights: Array, w: Array, prev: ?Array) !?Conv {
     const k = ops.shape(w)[1];
-    const r = (try sconv_kernel.fusedSum(g, parts, weights, w, prev, null, 1.0 / @sqrt(@as(f32, @floatFromInt(k + 1))))) orelse return null;
-    return try fromKernel(g, r.out, r.win, k);
+    const r = (try sconv_kernel.fusedSum(g, parts, weights, w, prev, null, 1.0 / @sqrt(@as(f32, @floatFromInt(k + 1))), .none)) orelse return null;
+    return try fromKernel(g, r.out, r.win, k, false);
 }
 
 /// A global layer's conv on k or v: per-head taps `static` `[K, C]` plus `dynamic` `[1, L, heads * K]` (the layer
 /// input's projection), plus the input, over `sqrt(2K + 1)`.
-pub fn dynamicSconv(g: *Graph, x: Array, dynamic: Array, static: Array, heads: c_int, prev: ?Array) !Conv {
+pub fn dynamicSconv(g: *Graph, x: Array, dynamic: Array, static: Array, heads: c_int, prev: ?Array, post: Post) !Conv {
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(2 * ops.shape(static)[0] + 1)));
-    if (try sconv_kernel.fused(g, x, static, prev, .{ .dyn = dynamic, .heads = heads }, scale)) |r| return fromKernel(g, r.out, r.win, ops.shape(static)[0]);
+    if (try sconv_kernel.fusedSum(g, x, null, static, prev, .{ .dyn = dynamic, .heads = heads }, scale, post)) |r| return fromKernel(g, r.out, r.win, ops.shape(static)[0], post != .none);
     const sh = ops.shape(x);
     const l = sh[1];
     const c = sh[2];
@@ -195,13 +202,13 @@ test "inkling2 blocks: a short conv fed row by row with its state equals the who
     const static = try g.fromSlice(f32, &ws, &.{ 4, 4 });
     const dyn = try g.fromSlice(f32, &ds, &.{ 1, 6, 8 });
     const whole = try sconv(&g, x, w, null);
-    const whole_dyn = try dynamicSconv(&g, x, dyn, static, 2, null);
+    const whole_dyn = try dynamicSconv(&g, x, dyn, static, 2, null, .none);
     var st: ?Array = null;
     var st_dyn: ?Array = null;
     for (0..6) |t| {
         const i: c_int = @intCast(t);
         const step = try sconv(&g, try g.sliceAxis(x, 1, i, i + 1), w, st);
-        const step_dyn = try dynamicSconv(&g, try g.sliceAxis(x, 1, i, i + 1), try g.sliceAxis(dyn, 1, i, i + 1), static, 2, st_dyn);
+        const step_dyn = try dynamicSconv(&g, try g.sliceAxis(x, 1, i, i + 1), try g.sliceAxis(dyn, 1, i, i + 1), static, 2, st_dyn, .none);
         st = step.state;
         st_dyn = step_dyn.state;
         for (try host(step.out), (try host(whole.out))[t * 4 ..][0..4]) |a, b| try testing.expectApproxEqAbs(b, a, 1e-5);

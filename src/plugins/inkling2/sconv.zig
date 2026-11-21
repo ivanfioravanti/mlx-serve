@@ -10,7 +10,7 @@ const Graph = ops.Graph;
 const Array = ops.Array;
 
 pub const SOURCE = kernelSource("plugins/inkling2/kernels/sconv.metal");
-pub const INPUTS = [_][*:0]const u8{ "x", "prev", "w", "dyn", "wts", "scale" };
+pub const INPUTS = [_][*:0]const u8{ "x", "prev", "w", "dyn", "wts", "scale", "post" };
 pub const OUTPUTS = [_][*:0]const u8{ "out", "win" };
 pub const TG = 256;
 /// Rows it takes (a decode row, a verify window); a prefill chunk keeps MLX's conv.
@@ -36,16 +36,19 @@ pub const Dynamic = struct { dyn: Array, heads: c_int };
 
 pub const Out = struct { out: Array, win: Array };
 
+/// A norm over each `hd`-wide head of the rounded output, rounded again: v's gain-less RMS, k's L2 clip.
+pub const Post = union(enum) { none, rms: struct { hd: c_int, eps: f32 }, clip: struct { hd: c_int, threshold: f32 } };
+
 /// The conv of `x` `[1, L, C]` with taps `w` (`[C, K, 1]`, or `[K, C]` with `dynamic`) after the window `prev`
 /// (`[1, K - 1, C]` f32, null = zeros), its residual added and scaled by `scale`: `out` in x's dtype and the window
 /// `[1, K - 1 + L, C]` f32. Null where it declines: off Metal, past `MAX_ROWS` rows, a shape or dtype it does not read.
 pub fn fused(g: *Graph, x: Array, w: Array, prev: ?Array, dynamic: ?Dynamic, scale: f32) !?Out {
-    return fusedSum(g, x, null, w, prev, dynamic, scale);
+    return fusedSum(g, x, null, w, prev, dynamic, scale, .none);
 }
 
 /// `fused` on the weighted f32 sum of `x` `[L, KE, C]` with `weights` `[L, KE]` f32, rounded to x's dtype (null: `x`
 /// is the `[1, L, C]` chunk itself).
-pub fn fusedSum(g: *Graph, x: Array, weights: ?Array, w: Array, prev: ?Array, dynamic: ?Dynamic, scale: f32) !?Out {
+pub fn fusedSum(g: *Graph, x: Array, weights: ?Array, w: Array, prev: ?Array, dynamic: ?Dynamic, scale: f32, post: Post) !?Out {
     if (!mlx.streamIsGpu(g.s)) return null;
     const xs = ops.shape(x);
     if (xs.len != 3) return null;
@@ -64,6 +67,13 @@ pub fn fusedSum(g: *Graph, x: Array, weights: ?Array, w: Array, prev: ?Array, dy
         if (ds.len != 3 or ds[0] != 1 or ds[1] != l or ds[2] != d.heads * k) return null;
     } else if (ws.len != 3 or ws[0] != c or ws[2] != 1) return null;
     if (k < 1 or l < 1 or l > MAX_ROWS or c < 1) return null;
+    const post_hd: c_int = switch (post) {
+        .none => 0,
+        .rms => |p| p.hd,
+        .clip => |p| p.hd,
+    };
+    if (post_hd != 0 and (@rem(post_hd, 32) != 0 or post_hd > 1024 or @rem(c, post_hd) != 0)) return null;
+    if (post_hd != 0) if (dynamic) |d| if (@divExact(c, d.heads) != post_hd) return null;
     if (prev) |p| if (ops.dtype(p) != .float32 or !std.mem.eql(c_int, ops.shape(p), &.{ 1, k - 1, c })) return null;
     const dt = ops.dtype(x);
     if (dt != .bfloat16 and dt != .float16 and dt != .float32) return null;
@@ -74,18 +84,28 @@ pub fn fusedSum(g: *Graph, x: Array, weights: ?Array, w: Array, prev: ?Array, dy
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &sh, 3, dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, k - 1 + l, c }, 3, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, l * c, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(TG, l * c), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, if (post_hd != 0) post_hd else @min(TG, l * c), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "TW", ops.dtype(w)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "C", c));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", k));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KE", ke));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HD", if (dynamic) |d| @divExact(c, d.heads) else 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HD", if (dynamic) |d| @divExact(c, d.heads) else if (post_hd != 0) post_hd else 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "POST", switch (post) {
+        .none => 0,
+        .rms => 1,
+        .clip => 2,
+    }));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "PREV", prev != null));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "DYN", dynamic != null));
 
     // Slots the kernel does not read bind x.
-    const inputs = [_]Array{ x, prev orelse x, w, if (dynamic) |d| d.dyn else x, weights orelse x, try g.fromSlice(f32, &.{scale}, &.{1}) };
+    const post_v: f32 = switch (post) {
+        .none => 0,
+        .rms => |p| p.eps,
+        .clip => |p| p.threshold,
+    };
+    const inputs = [_]Array{ x, prev orelse x, w, if (dynamic) |d| d.dyn else x, weights orelse x, try g.fromSlice(f32, &.{scale}, &.{1}), try g.fromSlice(f32, &.{post_v}, &.{1}) };
     const in_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(in_vec);
     var out_vec = mlx.mlx_vector_array_new();
@@ -210,7 +230,7 @@ test "inkling2 sconv: the experts' weighted sum in the kernel equals the kernel 
         const wt = try g.fromSlice(f32, wts[0 .. L * KE], &.{ l, KE });
         const w = try g.astype(try g.fromSlice(f32, &taps, &.{ C, K, 1 }), .bfloat16);
         const x = try g.astype(try g.fromSlice(f32, summed[0 .. L * C], &.{ 1, l, C }), .bfloat16);
-        const a = (try fusedSum(&g, p, wt, w, null, null, 0.5)) orelse return error.KernelDeclined;
+        const a = (try fusedSum(&g, p, wt, w, null, null, 0.5, .none)) orelse return error.KernelDeclined;
         const b = (try fused(&g, x, w, null, null, 0.5)) orelse return error.KernelDeclined;
         inline for (.{ .{ a.out, b.out }, .{ a.win, b.win } }) |pair| {
             const ha = try hostOf(&g, pair[0]);
@@ -218,6 +238,35 @@ test "inkling2 sconv: the experts' weighted sum in the kernel equals the kernel 
             const hb = try hostOf(&g, pair[1]);
             defer testing.allocator.free(hb);
             try testing.expectEqualSlices(f32, hb, ha);
+        }
+    }
+}
+
+// Bar: the head norms folded into the kernel give the kernel's plain output normed by the chain, to a bf16 ulp.
+test "inkling2 sconv: k's clip and v's RMS norm in the kernel equal the chain on its plain output" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    const blocks = @import("blocks.zig");
+    const C = 1024;
+    const HD = 128;
+    for ([_]c_int{ 1, 5 }) |l| {
+        const key = try g.call(mlx.mlx_random_key, .{@as(u64, @intCast(l))});
+        const x = try g.astype(try g.call(mlx.mlx_random_normal, .{ &[_]c_int{ 1, l, C }, @as(usize, 3), ops.Dtype.float32, @as(f32, 0), @as(f32, 2), key }), .bfloat16);
+        const w = try g.astype(try g.call(mlx.mlx_random_normal, .{ &[_]c_int{ C, 4, 1 }, @as(usize, 3), ops.Dtype.float32, @as(f32, 0), @as(f32, 0.5), key }), .bfloat16);
+        const plain = (try fusedSum(&g, x, null, w, null, null, 0.5, .none)) orelse return error.KernelDeclined;
+        const p4 = try g.reshape(plain.out, &.{ 1, l, C / HD, HD });
+        const want = [_]Array{ try @import("compiled.zig").l2Clip(&g, p4, null, 5), (try blocks.rmsCast(&g, p4, null, 1e-6, .bfloat16, false)).out };
+        const posts = [_]Post{ .{ .clip = .{ .hd = HD, .threshold = 5 } }, .{ .rms = .{ .hd = HD, .eps = 1e-6 } } };
+        for (posts, want) |p, wv| {
+            const got = (try fusedSum(&g, x, null, w, null, null, 0.5, p)) orelse return error.KernelDeclined;
+            const a = try g.astype(try g.reshape(got.out, &.{ 1, l, C / HD, HD }), .float32);
+            const b = try g.astype(wv, .float32);
+            const rel = try g.call(mlx.mlx_max, .{ try g.div(try g.abs(try g.sub(a, b)), try g.addScalar(try g.abs(b), 1e-3)), false });
+            try ops.eval(rel);
+            var r: f32 = 0;
+            try mlx.check(mlx.mlx_array_item_float32(&r, rel));
+            try testing.expect(r <= 1.0 / 128.0);
         }
     }
 }

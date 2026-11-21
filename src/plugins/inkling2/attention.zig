@@ -77,20 +77,23 @@ pub fn forward(w: *const Weights, c: *Ctx, qs: Array, ks: Array, vs: Array, k_pr
     const hd = w.head_dim;
     const offset: c_int = @intCast(c.offset());
     const total = offset + l;
+    // k's L2 clip and v's RMS norm ride the conv kernels where they serve.
+    const kpost: blocks.Post = .{ .clip = .{ .hd = hd, .threshold = w.qk_clip } };
+    const vpost: blocks.Post = .{ .rms = .{ .hd = hd, .eps = w.eps } };
     const kc, const vc = switch (w.conv) {
         .static => |s| blk: {
             var kv_lin: [2]Array = undefined;
             if (w.join_kv.built() and ks.ctx == vs.ctx) {
                 kv_lin = try split(&w.join_kv, g, ks, 2);
             } else kv_lin = .{ try w.k.forward(g, ks), try w.v.forward(g, vs) };
-            break :blk .{ try blocks.sconv(g, kv_lin[0], s.k, k_prev), try blocks.sconv(g, kv_lin[1], s.v, v_prev) };
+            break :blk .{ try blocks.sconvPost(g, kv_lin[0], s.k, k_prev, kpost), try blocks.sconvPost(g, kv_lin[1], s.v, v_prev, vpost) };
         },
         .dynamic => |d| blk: {
             const kk = if (w.join_k.built()) try split(&w.join_k, g, ks, 2) else [2]Array{ try w.k.forward(g, ks), try d.k_proj.forward(g, ks) };
             const vv = if (w.join_v.built()) try split(&w.join_v, g, vs, 2) else [2]Array{ try w.v.forward(g, vs), try d.v_proj.forward(g, vs) };
             break :blk .{
-                try blocks.dynamicSconv(g, kk[0], kk[1], d.k, w.kv_heads, k_prev),
-                try blocks.dynamicSconv(g, vv[0], vv[1], d.v, w.kv_heads, v_prev),
+                try blocks.dynamicSconv(g, kk[0], kk[1], d.k, w.kv_heads, k_prev, kpost),
+                try blocks.dynamicSconv(g, vv[0], vv[1], d.v, w.kv_heads, v_prev, vpost),
             };
         },
     };
@@ -99,9 +102,10 @@ pub fn forward(w: *const Weights, c: *Ctx, qs: Array, ks: Array, vs: Array, k_pr
     const sinks = qo[3];
 
     var q = try blocks.l2Clip(g, try g.reshape(qo[0], &.{ 1, l, w.heads, hd }), w.q_clip, w.qk_clip);
-    const k = try blocks.l2Clip(g, try g.reshape(kc.out, &.{ 1, l, w.kv_heads, hd }), null, w.qk_clip);
+    const k4 = try g.reshape(kc.out, &.{ 1, l, w.kv_heads, hd });
+    const k = if (kc.post) k4 else try blocks.l2Clip(g, k4, null, w.qk_clip);
     const v4 = try g.reshape(vc.out, &.{ 1, l, w.kv_heads, hd });
-    const v = (try blocks.rmsCast(g, v4, null, w.eps, ops.dtype(v4), false)).out;
+    const v = if (vc.post) v4 else (try blocks.rmsCast(g, v4, null, w.eps, ops.dtype(v4), false)).out;
     var rel = try blocks.l2Clip(g, try g.reshape(qo[1], &.{ 1, l, w.heads, w.d_rel }), w.rel_clip, w.rel_clip_at);
     if (w.window == 0 and total > @as(c_int, @intCast(w.log_floor))) {
         const tau = try logScale(g, offset, l, w.log_floor, w.log_alpha);
