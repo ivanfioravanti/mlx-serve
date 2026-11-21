@@ -602,4 +602,5 @@ test {
     _ = @import("sconv.zig");
     _ = @import("rms_cast.zig");
     _ = @import("experts.zig");
+    _ = moe;
 }

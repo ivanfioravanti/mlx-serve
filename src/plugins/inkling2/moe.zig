@@ -93,7 +93,22 @@ pub fn parts(w: *const Weights, g: *Graph, x: Array, x32: ?Array) !Parts {
     var sorted = ids;
     var inv: Array = .{};
     var rows: Array = undefined;
-    if (sort) {
+    const experts_n = ops.shape(w.gate_up.w)[0];
+    // Under four pairs an expert MLX gathers one pair at a time, reading each expert's weights again for every row
+    // that picked it; padding to four takes its sorted row-block kernel, which reads each expert once.
+    const pad: c_int = if (sort and t * k < 4 * experts_n) 4 * experts_n - t * k else 0;
+    if (sort and pad > 0) {
+        // Padded pairs repeat the chunk's own experts on a zero row, so no other expert is read.
+        const fill = try g.take(ids, try g.astype(try g.call(mlx.mlx_remainder, .{ try g.arange(0, @floatFromInt(pad), 1, .int32), try g.adopt(mlx.mlx_array_new_int(t * k)) }), .uint32), 0);
+        const ids_p = try g.concat(&.{ ids, fill }, 0);
+        const flat_p = try g.concat(&.{ flat, try g.zeros(&.{ 1, d }, ops.dtype(flat)) }, 0);
+        const order = try g.argsort(ids_p, 0);
+        inv = try g.argsort(order, 0);
+        sorted = try g.take(ids_p, order, 0);
+        // A padded pair's row is the zero row (index t).
+        const pair_row = try g.minimum(try g.call(mlx.mlx_floor_divide, .{ order, try g.adopt(mlx.mlx_array_new_int(k)) }), try g.astype(try g.adopt(mlx.mlx_array_new_int(t)), .uint32));
+        rows = try g.reshape(try g.take(flat_p, pair_row, 0), &.{ t * k + pad, 1, d });
+    } else if (sort) {
         const order = try g.argsort(ids, 0);
         inv = try g.argsort(order, 0);
         sorted = try g.take(ids, order, 0);
@@ -103,13 +118,65 @@ pub fn parts(w: *const Weights, g: *Graph, x: Array, x32: ?Array) !Parts {
         rows = try g.reshape(try g.broadcast(try g.reshape(flat, &.{ t, 1, d }), &.{ t, k, d }), &.{ t * k, 1, d });
     }
 
+    const np = t * k + pad;
     const gu = try gather(g, rows, &w.gate_up, sorted, sort);
     const inner = @divExact(ops.shape(gu)[2], 2);
-    const pairs = try g.reshape(gu, &.{ t * k, inner, 2 });
-    const scale: ?Array = if (w.gate_up_scale.ctx != null) try g.reshape(try g.take(w.gate_up_scale, sorted, 0), &.{ t * k, 1, 1 }) else null;
+    const pairs = try g.reshape(gu, &.{ np, inner, 2 });
+    const scale: ?Array = if (w.gate_up_scale.ctx != null) try g.reshape(try g.take(w.gate_up_scale, sorted, 0), &.{ np, 1, 1 }) else null;
     const act = try compiled.softcappedSwiglu(g, try g.sliceAxis(pairs, 2, 0, 1), try g.sliceAxis(pairs, 2, 1, 2), scale, w.gate_softcap, w.up_softcap);
-    const down = try gather(g, try g.reshape(act, &.{ t * k, 1, inner }), &w.down, sorted, sort);
+    const down = try gather(g, try g.reshape(act, &.{ np, 1, inner }), &w.down, sorted, sort);
 
-    const out = try g.reshape(if (sort) try g.take(try g.reshape(down, &.{ t * k, d }), inv, 0) else down, &.{ t, k, d });
+    const unsorted = if (sort) try g.take(try g.reshape(down, &.{ np, d }), inv, 0) else down;
+    const out = try g.reshape(if (pad > 0) try g.sliceAxis(unsorted, 0, 0, t * k) else unsorted, &.{ t, k, d });
     return .{ .out = out, .weights = weights };
+}
+
+// ── tests ──
+
+const std = @import("std");
+const testing = std.testing;
+
+// Bar: a short chunk padded to four pairs an expert gives each real pair the output MLX's one-pair-at-a-time gather
+// gives it, to a bf16 ulp or two (the row-block kernel sums in another order).
+test "inkling2 moe: a short chunk's padded pairs leave every real pair's output as the per-pair gather's" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    const E = 128;
+    const H = 256;
+    const I = 128;
+    for ([_][:0]const u8{ "nvfp4", "mxfp8" }, 0..) |m, n| {
+        const key = try g.call(mlx.mlx_random_key, .{@as(u64, n)});
+        var w: Weights = .{
+            .router = try g.call(mlx.mlx_random_normal, .{ &[_]c_int{ H, E }, @as(usize, 2), ops.Dtype.float32, @as(f32, 0), @as(f32, 1), key }),
+            .bias = try g.zeros(&.{E}, .float32),
+            .gate_up = try experts.quantBank(&g, E, 2 * I, H, m, 10 * n + 1),
+            .down = try experts.quantBank(&g, E, H, I, m, 10 * n + 2),
+            .top_k = 8,
+            .route_scale = 2,
+            .gate_softcap = 4,
+            .up_softcap = 25,
+        };
+        w.gate_up_scale = try g.addScalar(try g.call(mlx.mlx_random_uniform, .{ try g.scalar(0, .float32), try g.scalar(1, .float32), &[_]c_int{E}, @as(usize, 1), ops.Dtype.float32, key }), 0.5);
+        for ([_]c_int{ 17, 31, 63 }) |t| {
+            const x = try g.astype(try g.call(mlx.mlx_random_normal, .{ &[_]c_int{ 1, t, H }, @as(usize, 3), ops.Dtype.float32, @as(f32, 0), @as(f32, 1), key }), .bfloat16);
+            const got = try parts(&w, &g, x, null);
+            // The same pairs one at a time: unsorted, each its own row.
+            const flat = try g.reshape(x, &.{ t, H });
+            const r = try route(&w, &g, try g.matmul(try g.astype(flat, .float32), w.router));
+            const ids = try g.reshape(r.idx, &.{t * 8});
+            const rows = try g.reshape(try g.broadcast(try g.reshape(flat, &.{ t, 1, H }), &.{ t, 8, H }), &.{ t * 8, 1, H });
+            const pairs = try g.reshape(try gather(&g, rows, &w.gate_up, ids, false), &.{ t * 8, I, 2 });
+            const sc = try g.reshape(try g.take(w.gate_up_scale, ids, 0), &.{ t * 8, 1, 1 });
+            const act = try compiled.softcappedSwiglu(&g, try g.sliceAxis(pairs, 2, 0, 1), try g.sliceAxis(pairs, 2, 1, 2), sc, 4, 25);
+            const want = try g.reshape(try gather(&g, try g.reshape(act, &.{ t * 8, 1, I }), &w.down, ids, false), &.{ t, 8, H });
+            const a = try g.astype(got.out, .float32);
+            const b = try g.astype(want, .float32);
+            const rel = try g.call(mlx.mlx_max, .{ try g.div(try g.abs(try g.sub(a, b)), try g.addScalar(try g.abs(b), 1e-2)), false });
+            try ops.eval(rel);
+            var v: f32 = 0;
+            try mlx.check(mlx.mlx_array_item_float32(&v, rel));
+            try testing.expect(v <= 2.0 / 128.0);
+        }
+    }
 }

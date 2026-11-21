@@ -108,7 +108,7 @@ const testing = std.testing;
 const gatherExpertMm = @import("../../sdk/blocks/moe/experts.zig").gatherExpertMm;
 const compiled = @import("compiled.zig");
 
-fn quantBank(g: *Graph, e: c_int, n: c_int, k: c_int, m: [:0]const u8, seed: u64) !Bank {
+pub fn quantBank(g: *Graph, e: c_int, n: c_int, k: c_int, m: [:0]const u8, seed: u64) !Bank {
     const key = try g.call(mlx.mlx_random_key, .{seed});
     const wf = try g.astype(try g.call(mlx.mlx_random_normal, .{ &[_]c_int{ e, n, k }, @as(usize, 3), ops.Dtype.float32, @as(f32, 0), @as(f32, 0.05), key }), .bfloat16);
     const nv = std.mem.eql(u8, m, "nvfp4");
