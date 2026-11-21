@@ -19,8 +19,8 @@ const launch = metal.Launch{
     .outputs = &depth_attn.OUTPUTS,
     .source = depth_attn.SOURCE,
     .tg_bytes = @intCast(depth_attn.tgBytes(depth_attn.MAX_BANK, depth_attn.MAX_QUERIES, 2304)),
-    .m1 = 1024,
-    .m2 = 1024,
+    .m1 = 576,
+    .m2 = 576,
 };
 
 /// A shape's rows are the token rows, n the bank's block states, k the hidden width.
@@ -186,7 +186,7 @@ fn shapes(comptime list: []const [3]usize) []const Shape {
 const registrations = .{
     .{ "inkling2_depth_attn (1 query)", 1, shapes(&.{ .{ 1, 4, 2304 }, .{ 1, 0, 2304 }, .{ 9, 8, 2304 } }) },
     .{ "inkling2_depth_attn (3 queries)", 3, shapes(&.{ .{ 1, 3, 2304 }, .{ 9, 5, 2304 } }) },
-    .{ "inkling2_depth_attn (4 queries)", 4, shapes(&.{ .{ 1, 5, 2304 }, .{ 1, 2, 2304 }, .{ 9, 2, 2304 } }) },
+    .{ "inkling2_depth_attn (4 queries)", 4, shapes(&.{ .{ 1, 8, 2304 }, .{ 1, 2, 2304 }, .{ 9, 2, 2304 } }) },
 };
 
 pub fn register(set: *kc.Set) !void {
