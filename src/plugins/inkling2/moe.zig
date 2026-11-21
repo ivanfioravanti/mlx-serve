@@ -7,6 +7,7 @@ const ops = @import("../../mlx/ops.zig");
 const Bank = @import("../../sdk/bases/blocks/moe.zig").Bank;
 const gatherExpertMm = @import("../../sdk/blocks/moe/experts.zig").gatherExpertMm;
 const compiled = @import("compiled.zig");
+const experts = @import("experts.zig");
 const router_kernel = @import("../../sdk/blocks/moe/router_kernel.zig");
 
 const Graph = ops.Graph;
@@ -83,6 +84,11 @@ pub fn parts(w: *const Weights, g: *Graph, x: Array, x32: ?Array) !Parts {
     var weights = routing.weights;
 
     const ids = try g.reshape(idx, &.{t * k});
+    if (w.down_scale.ctx != null) weights = try g.mul(weights, try g.take(w.down_scale, idx, 0));
+    // A decode row: the bank read in place, the activation inside the gate_up kernel.
+    if (t == 1) if (try experts.gateUp(g, flat, &w.gate_up, ids, if (w.gate_up_scale.ctx != null) w.gate_up_scale else null, .{ w.gate_softcap, w.up_softcap })) |act| {
+        if (try experts.down(g, act, &w.down, ids)) |out| return .{ .out = try g.reshape(out, &.{ t, k, d }), .weights = weights };
+    };
     const sort = t * k >= SORT_PAIRS;
     var sorted = ids;
     var inv: Array = .{};
@@ -105,6 +111,5 @@ pub fn parts(w: *const Weights, g: *Graph, x: Array, x32: ?Array) !Parts {
     const down = try gather(g, try g.reshape(act, &.{ t * k, 1, inner }), &w.down, sorted, sort);
 
     const out = try g.reshape(if (sort) try g.take(try g.reshape(down, &.{ t * k, d }), inv, 0) else down, &.{ t, k, d });
-    if (w.down_scale.ctx != null) weights = try g.mul(weights, try g.take(w.down_scale, idx, 0));
     return .{ .out = out, .weights = weights };
 }

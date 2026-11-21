@@ -15,6 +15,7 @@ const gates = @import("contract_gate.zig");
 const l2clip = @import("contract_l2clip.zig");
 const conv = @import("contract_sconv.zig");
 const rms = @import("contract_rms_cast.zig");
+const moe_kernels = @import("contract_experts.zig");
 const rel_attn_nax = @import("rel_attn_nax.zig");
 
 const spec = kc.spec;
@@ -618,6 +619,7 @@ pub fn register(set: *kc.Set) !void {
     try l2clip.register(set);
     try conv.register(set);
     try rms.register(set);
+    try moe_kernels.register(set);
 }
 
 // ── tests ──

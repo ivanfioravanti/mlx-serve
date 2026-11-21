@@ -601,4 +601,5 @@ test {
     _ = @import("l2_clip.zig");
     _ = @import("sconv.zig");
     _ = @import("rms_cast.zig");
+    _ = @import("experts.zig");
 }
