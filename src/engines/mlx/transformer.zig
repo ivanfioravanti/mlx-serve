@@ -414,6 +414,8 @@ pub const Transformer = struct {
     /// two measured widths. Lives on the model, not the request — a request
     /// spans only its own max_tokens. Inference thread only.
     round_cost: round_cost_mod.Table = .{},
+    /// What PLD's cost gate last decided per context size (`gates.PldMemory`). Inference thread only.
+    pld_memory: @import("spec/gates.zig").PldMemory = .{},
     mtp_group_cost: group_cost_mod.Table = .{},
     /// What a DSpark group round's verify costs on this model (`spec/dspark_group.zig`). Inference thread only.
     dspark_group_cost: @import("spec/dflash/policy.zig").GroupCost = .{},

@@ -3,6 +3,9 @@ const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const log = @import("../../../sdk/util/log.zig");
+const io_util = @import("../../../sdk/util/io_util.zig");
+const PLD_COST_MARGIN = @import("gates.zig").PLD_COST_MARGIN;
+const PLD_COST_WARMUP = @import("gates.zig").PLD_COST_WARMUP;
 const pld_index = @import("../../../sdk/spec/pld_index.zig");
 const SSMCacheEntrySnapshot = transformer_mod.SSMCacheEntrySnapshot;
 const ssmSnapshot = transformer_mod.ssmSnapshot;
@@ -56,6 +59,7 @@ pub fn nextPld(
     key_len: u32,
 ) !?PldStepResult {
     if (self.done) return null;
+    const watch = io_util.Stopwatch.init(self.timer.io);
     // Init never armed PLD for this generator (the deepseek_v4 chokepoint
     // guard, or a caller that simply didn't ask). The dispatching caller's
     // flag alone must never put a verify forward through the trunk — on
@@ -93,7 +97,18 @@ pub fn nextPld(
         // again. Drain the `next()` pipeline back to the spec entry
         // invariant; the drained token (if any) is this step's emit and
         // speculation resumes on the following call.
-        if (self.disabled_steps % SPEC_REENABLE_INTERVAL == 0) reenable: {
+        const probe_over = self.pld_probe_over;
+        self.pld_probe_over = false;
+        if (probe_over or self.disabled_steps % SPEC_REENABLE_INTERVAL == 0) reenable: {
+            // A stretch that cost more per token than plain decode is not retried: no drain, no flapping.
+            if (!self.pld_cost.pays()) {
+                if (probe_over) {
+                    self.pld_cost.lost = true;
+                    self.xfm.pld_memory.record(contextTokens(self), self.pld_cost.ratio());
+                    log.info("  pld=disabled (cost gate: {d:.1} ms/token in rounds vs {d:.1} plain)\n", .{ self.pld_cost.msPerToken(), self.pld_cost.plain_ms });
+                }
+                break :reenable;
+            }
             const gen = self.generated_ids.items;
             const prompt_toks = self.prompt_ids_owned;
             const committed_check = try allocator.alloc(u32, prompt_toks.len + gen.len);
@@ -104,7 +119,9 @@ pub fn nextPld(
             //    const dbg_frac = pld_index.tailMatchFraction(committed_check, @min(SPEC_REENABLE_WINDOW, gen.len), 3);
             //    log.debug("  pld re-enable check: disabled_steps={d} gen={d} tail_match={d:.2}\n", .{ self.disabled_steps, gen.len, dbg_frac });
             //}
-            if (!specShouldReenable(committed_check, gen.len)) break :reenable;
+            if (!probe_over and !specShouldReenable(committed_check, gen.len)) break :reenable;
+            // A probe hands back to the stretch it interrupted; a re-enable starts one of its own.
+            if (!probe_over) self.pld_cost.restart();
             switch (try self.drainPipelineForSpec(allocator)) {
                 .stay_disabled => break :reenable,
                 .stopped => return null,
@@ -136,6 +153,7 @@ pub fn nextPld(
         if (self.spec_disabled_runtime) {
             const tok_opt = try self.next(allocator);
             if (tok_opt == null) return null;
+            if (self.pld_cost.plain(msSince(watch))) self.pld_probe_over = true;
             const tokens = try allocator.alloc(u32, 1);
             tokens[0] = tok_opt.?;
             return PldStepResult{
@@ -143,6 +161,17 @@ pub fn nextPld(
                 .accepted_tokens = 0,
                 .used_lookup = false,
             };
+        }
+    }
+
+    if (!self.pld_memory_asked) {
+        self.pld_memory_asked = true;
+        if (self.xfm.pld_memory.startsOff(contextTokens(self))) {
+            log.info("  pld=disabled (cost gate: this context size lost to plain decode on an earlier request)\n", .{});
+            self.spec_disabled_runtime = true;
+            self.disabled_steps = 0;
+            self.pld_cost.lost = true;
+            return nextPld(self, allocator, draft_len, key_len);
         }
     }
 
@@ -236,6 +265,7 @@ pub fn nextPld(
             self.spec_disabled_runtime = true;
             self.disabled_steps = 0;
         }
+        costStep(self, msSince(watch), 1);
 
         const tokens = try allocator.alloc(u32, 1);
         tokens[0] = t1;
@@ -504,10 +534,41 @@ pub fn nextPld(
         self.spec_disabled_runtime = true;
         self.disabled_steps = 0;
     }
+    costStep(self, msSince(watch), num_emit);
 
     return PldStepResult{
         .tokens = tokens,
         .accepted_tokens = accepted,
         .used_lookup = true,
     };
+}
+
+fn contextTokens(self: *const Generator) usize {
+    return self.prompt_ids_owned.len + self.generated_ids.items.len;
+}
+
+fn msSince(watch: io_util.Stopwatch) f32 {
+    return @as(f32, @floatFromInt(watch.read())) / 1.0e6;
+}
+
+/// Folds an enabled step into the request's PLD cost and acts on the verdict: a probe of plain steps when no
+/// plain step was timed yet, or PLD off when its tokens cost more than plain ones.
+fn costStep(self: *Generator, ms: f32, tokens: u32) void {
+    const verdict = self.pld_cost.spec(ms, tokens);
+    if (self.spec_disabled_runtime) return self.pld_cost.handOff();
+    switch (verdict) {
+        .keep => {
+            // Judged at the margin and kept: a later request in this context starts with PLD on.
+            if (self.pld_cost.spec_n == PLD_COST_WARMUP and self.pld_cost.plain_n > 0) self.xfm.pld_memory.record(contextTokens(self), self.pld_cost.ratio());
+            return;
+        },
+        .probe => self.pld_cost.beginProbe(),
+        .disable => {
+            self.pld_cost.handOff();
+            self.xfm.pld_memory.record(contextTokens(self), self.pld_cost.ratio());
+            log.info("  pld=disabled (cost gate: {d:.1} ms/token in rounds vs {d:.1} plain, margin {d:.2})\n", .{ self.pld_cost.msPerToken(), self.pld_cost.plain_ms, PLD_COST_MARGIN });
+        },
+    }
+    self.spec_disabled_runtime = true;
+    self.disabled_steps = 0;
 }

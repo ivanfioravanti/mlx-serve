@@ -110,10 +110,37 @@ fn logScale(g: *Graph, offset: c_int, l: c_int, floor: u32, alpha: f32) !Array {
     return g.reshape(try g.addScalar(try g.mulScalar(try g.log(ratio), alpha), 1), &.{ 1, l, 1, 1 });
 }
 
+/// Keys from which a window is read over key chunks; under it, row by row is as quick. A single row stays on
+/// the fused attention at every length (over 65k keys it is half again as fast as the chunked kernel).
+const SPLIT_KEYS = 4096;
+
 /// `[1, L, Hq, D]`: one decode row through MLX's fused attention (its sinks are one row's), a chunk through the kernels.
 pub fn attend(g: *Graph, a: rel_attn.Args) !Array {
     const qs = ops.shape(a.q);
-    if (qs[2] != 1) return rel_attn.attend(g, a);
+    if (qs[2] != 1) {
+        if (qs[2] > rel_attn.MIN_ROWS) return rel_attn.attend(g, a);
+        // A window under the kernel's floor (a speculative round's verify rows): each row as a decode row reads
+        // it, over its own keys. The op chain scores every key for every row and rounds differently from decode.
+        const total = ops.shape(a.k)[2];
+        if (total >= SPLIT_KEYS) if (try rel_attn.split(g, a)) |out| return out;
+        var outs: [rel_attn.MIN_ROWS]Array = undefined;
+        for (0..@intCast(qs[2])) |i| {
+            const at: c_int = @intCast(i);
+            const end = total - qs[2] + at + 1;
+            const from: c_int = if (a.window > 0) @max(0, end - @as(c_int, @intCast(a.window))) else 0;
+            outs[i] = try attend(g, .{
+                .q = try g.sliceAxis(a.q, 2, at, at + 1),
+                .k = try g.sliceAxis(a.k, 2, from, end),
+                .v = try g.sliceAxis(a.v, 2, from, end),
+                .rel = try g.sliceAxis(a.rel, 1, at, at + 1),
+                .sinks = try g.sliceAxis(a.sinks, 1, at, at + 1),
+                .key_start = a.key_start,
+                .scale = a.scale,
+                .window = a.window,
+            });
+        }
+        return g.concat(outs[0..@intCast(qs[2])], 1);
+    }
     const hq = qs[1];
     const s = ops.shape(a.k)[2];
     const r = ops.shape(a.rel)[3];
@@ -150,7 +177,7 @@ fn rowBias(g: *Graph, rel: Array, s: c_int, window: u32) !Array {
 const testing = std.testing;
 
 // Bar: the fused one-row arm equals the reference chain's last row.
-test "inkling2 attention: the decode row equals the last row of the chunk" {
+test "inkling2 attention: a decode row and a short window equal the chunk's rows" {
     var g = Graph.init(testing.allocator, mlx.mlx_default_cpu_stream_new());
     defer g.deinit();
     const hq = 4;
@@ -190,6 +217,11 @@ test "inkling2 attention: the decode row equals the last row of the chunk" {
         const diff = try g.max(try g.reshape(try g.abs(try g.sub(last, one)), &.{hq * d}), 0, false);
         try ops.eval(diff);
         try testing.expect(mlx.mlx_array_data_float32(diff).?[0] < 1e-5);
+        // A short window is its rows, each read alone.
+        const rows = try attend(&g, .{ .q = q, .k = k, .v = v, .rel = rel, .sinks = sinks, .key_start = start, .scale = 0.35, .window = window });
+        const off = try g.max(try g.reshape(try g.abs(try g.sub(whole, rows)), &.{l * hq * d}), 0, false);
+        try ops.eval(off);
+        try testing.expect(mlx.mlx_array_data_float32(off).?[0] < 1e-5);
     }
 }
 
