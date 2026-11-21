@@ -27,6 +27,14 @@ pub fn l2Clip(g: *Graph, x: Array, scale: ?Array, threshold: f32) !Array {
     return compiled.l2Clip(g, x, scale, threshold);
 }
 
+/// `x` RMS-normed in f32 times `w` (null = none) and cast to `to`, as `cast(rmsNorm(f32(x), w))`; with `twin`, also
+/// that output widened to f32. One kernel, or the chain where it declines.
+pub fn rmsCast(g: *Graph, x: Array, w: ?Array, eps: f32, to: ops.Dtype, twin: bool) !@import("rms_cast.zig").Out {
+    if (try @import("rms_cast.zig").fused(g, x, w, eps, to, twin)) |r| return r;
+    const out = try g.astype(try g.rmsNorm(try f32Of(g, x), w orelse .{}, eps), to);
+    return .{ .out = out, .twin = if (twin) try g.astype(out, .float32) else null };
+}
+
 /// Learned queries `[Q, H]` attend over the depth sources of each token (the `bank`'s block states, then `partial`,
 /// all `[1, L, H]` f32, which are also the values): `[1, L, Q, H]`.
 pub fn depth(g: *Graph, bank: []const Array, partial: Array, query: Array) !Array {
@@ -124,6 +132,14 @@ pub fn sconv(g: *Graph, x: Array, w: Array, prev: ?Array) !Conv {
     const y = try g.conv1d(try g.astype(win, ops.dtype(w)), w, 1, 0, 1, ops.shape(x)[2]);
     const out = try compiled.residualScale(g, y, x, 1.0 / @sqrt(@as(f32, @floatFromInt(k + 1))));
     return .{ .out = out, .state = try tail(g, win, k), .input = win };
+}
+
+/// `sconv` on the weighted f32 sum of `parts` `[L, KE, C]` with `weights` `[L, KE]` f32 (rounded to parts' dtype) in the
+/// kernel; null where it declines.
+pub fn sconvSum(g: *Graph, parts: Array, weights: Array, w: Array, prev: ?Array) !?Conv {
+    const k = ops.shape(w)[1];
+    const r = (try sconv_kernel.fusedSum(g, parts, weights, w, prev, null, 1.0 / @sqrt(@as(f32, @floatFromInt(k + 1))))) orelse return null;
+    return try fromKernel(g, r.out, r.win, k);
 }
 
 /// A global layer's conv on k or v: per-head taps `static` `[K, C]` plus `dynamic` `[1, L, heads * K]` (the layer

@@ -2,14 +2,27 @@
 // dispatch: the window (the K - 1 rows before the chunk, then the chunk in f32), the conv, the residual and its
 // scale. One thread an output (row t, channel c); it also writes its window rows.
 //
-// x [1, L, C] T; prev [1, K - 1, C] f32 (read when PREV, else zeros); w: static [C, K, 1] in TW (the conv runs on the
-// window rounded to TW, its sum rounded to TW), dynamic (DYN) [K, C] plus dyn [1, L, C / HD * K]: f32 taps
+// x [1, L, C] T, or with KE > 0 the chunk's top-KE expert outputs [L, KE, C] T and their weights wts [L, KE] f32,
+// whose weighted f32 sum rounded to T is the chunk (the MoE's last step); prev [1, K - 1, C] f32 (read when PREV,
+// else zeros); w: static [C, K, 1] in TW (the conv runs on the window rounded to TW, its sum rounded to TW), dynamic (DYN) [K, C] plus dyn [1, L, C / HD * K]: f32 taps
 // w[k][c] + dyn[t][c / HD][k] over the f32 window; scale [1] f32. out [1, L, C] T = T((y + x) * scale); win
 // [1, K - 1 + L, C] f32.
+// Products round before they are summed, as the op chain's multiply and sum do.
+#pragma clang fp contract(off)
+#define XAT(r, v)                                                                                 \
+  if (KE == 0) {                                                                                  \
+    v = float(x[(r) * x_strides[1] + c * x_strides[2]]);                                          \
+  } else {                                                                                        \
+    float s_ = 0.0f;                                                                              \
+    for (int j = 0; j < KE; j++)                                                                  \
+      s_ += float(x[(r) * x_strides[0] + j * x_strides[1] + c * x_strides[2]]) * wts[(r) * wts_strides[0] + j * wts_strides[1]]; \
+    v = float(T(s_));                                                                             \
+  }
 const uint gid = thread_position_in_grid.x;
 const uint t = gid / C;
 const uint c = gid % C;
-const float xt = float(x[t * x_strides[1] + c * x_strides[2]]);
+float xt;
+XAT(t, xt);
 win[size_t(t + K - 1) * C + c] = xt;
 
 float acc = 0.0f;
@@ -19,7 +32,7 @@ for (int i = 0; i < K; i++) {
   const int r = int(t) + k - (K - 1);
   float v = 0.0f;
   if (r >= 0) {
-    v = float(x[r * x_strides[1] + c * x_strides[2]]);
+    XAT(r, v);
   } else if (PREV) {
     v = prev[(r + K - 1) * prev_strides[1] + c * prev_strides[2]];
   }

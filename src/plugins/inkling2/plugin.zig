@@ -170,7 +170,7 @@ pub const Model = struct {
             };
             var normed: [3]Array = undefined;
             for (&normed, qkv, 0..) |*n, s, j| {
-                n.* = if (j > 0 and s.ctx == qkv[0].ctx and L.in_norm[j].ctx == L.in_norm[0].ctx) normed[0] else try g.astype(try g.rmsNorm(s, L.in_norm[j], eps), dt);
+                n.* = if (j > 0 and s.ctx == qkv[0].ctx and L.in_norm[j].ctx == L.in_norm[0].ctx) normed[0] else if (ops.dtype(s) == .float32 and ops.dtype(L.in_norm[j]) == .float32) (try blocks.rmsCast(g, s, L.in_norm[j], eps, dt, false)).out else try g.astype(try g.rmsNorm(s, L.in_norm[j], eps), dt);
             }
             const a = try attention.forward(&L.attn, c, normed[0], normed[1], normed[2], prev[0], prev[1]);
             const ac = try blocks.sconv(g, a.out, L.attn_conv, prev[2]);
@@ -184,15 +184,15 @@ pub const Model = struct {
 
             var x = try blocks.depthOne(g, t.bank[0..t.blocks], try blocks.rms(g, res, 1e-6), L.mlp_query);
             if (messages) |m| x = try L.gates.?[3].onRow(g, x, m, 3);
-            const y = try moe.forward(&L.mlp, g, try g.astype(try g.rmsNorm(x, L.post_norm, eps), dt));
-            const mc = try blocks.sconv(g, y, L.mlp_conv, prev[3]);
-            // The four windows side by side; the state is their last `K - 1` rows (copied off a chunk).
-            const wins = try g.concat(&.{ a.k.input, a.v.input, ac.input, mc.input }, 2);
-            const n = ops.shape(wins)[1];
-            const st_rows = try g.sliceAxis(wins, 1, n - (ops.shape(L.mlp_conv)[1] - 1), n);
-            try kv.setState(c, .conv, try g.contiguous(st_rows));
+            const mlp_in = try blocks.rmsCast(g, x, L.post_norm, eps, dt, true);
+            const parts = try moe.parts(&L.mlp, g, mlp_in.out, mlp_in.twin);
+            // The experts' weighted sum rides the conv kernel where it serves.
+            const mc = (try blocks.sconvSum(g, parts.out, parts.weights, L.mlp_conv, prev[3])) orelse
+                try blocks.sconv(g, try moe.sum(g, parts, ops.shape(mlp_in.out)), L.mlp_conv, prev[3]);
+            // One copy joins the four windows' last `K - 1` rows (views of the conv kernels' windows).
+            try kv.setState(c, .conv, try g.concat(&.{ a.k.state, a.v.state, ac.state, mc.state }, 2));
             // A verify forward's rejected rows are rolled back from the conv inputs.
-            if (c.capture_spec) try kv.setState(c, .conv_input, wins);
+            if (c.capture_spec) try kv.setState(c, .conv_input, try g.concat(&.{ a.k.input, a.v.input, ac.input, mc.input }, 2));
 
             const next = try compiled.sumBoth(g, res, mc.out);
             try t.move(next[0], next[1]);
@@ -574,4 +574,5 @@ test {
     _ = vision;
     _ = @import("l2_clip.zig");
     _ = @import("sconv.zig");
+    _ = @import("rms_cast.zig");
 }
