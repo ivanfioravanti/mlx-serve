@@ -234,6 +234,13 @@ pub const PldCost = struct {
         return c.rounds >= PLD_COST_PROBE_AFTER and c.drafted >= PLD_COST_MIN_DRAFTED;
     }
 
+    /// Starts the request from a plain step's cost an earlier one measured, so it runs no probe of its own.
+    pub fn seedPlain(c: *PldCost, ms: f32) void {
+        c.plain_ms = ms;
+        c.plain_n = 1;
+        c.probed = true;
+    }
+
     /// A fresh spec stretch (the generated tail turned repetitive): it is judged on its own steps.
     pub fn restart(c: *PldCost) void {
         c.spec_n = 0;
@@ -260,6 +267,8 @@ pub const PldMemory = struct {
     /// One cell per power of two of the context's tokens: decisive losses in a row, and requests started off.
     losses: [32]u8 = @splat(0),
     skipped: [32]u32 = @splat(0),
+    /// What a plain step last cost there, ms (0: never timed): a later request starts from it and runs no probe.
+    plain_ms: [32]f32 = @splat(0),
 
     fn bucket(tokens: usize) usize {
         return std.math.log2_int(usize, @max(tokens, 1));
@@ -271,6 +280,16 @@ pub const PldMemory = struct {
         if (m.losses[b] < PLD_MEMORY_LOSSES) return false;
         m.skipped[b] += 1;
         return m.skipped[b] % PLD_MEMORY_RETRY != 0;
+    }
+
+    /// What a plain step cost in an earlier request at this context size.
+    pub fn plainMs(m: *const PldMemory, tokens: usize) ?f32 {
+        const ms = m.plain_ms[bucket(tokens)];
+        return if (ms > 0) ms else null;
+    }
+
+    pub fn notePlain(m: *PldMemory, tokens: usize, ms: f32) void {
+        if (ms > 0) m.plain_ms[bucket(tokens)] = ms;
     }
 
     /// A judged request's verdict at `tokens` of context: `ratio` is PLD's ms per token over plain's.
@@ -593,4 +612,17 @@ test "PldMemory: two decisive losses in a row turn PLD off for that context size
     m.record(60_000, 1.4);
     m.record(60_000, 3.0);
     try std.testing.expect(!m.startsOff(36_000));
+}
+
+test "PldMemory: a plain step's cost measured once spares later requests at that context size the probe" {
+    var m: PldMemory = .{};
+    try std.testing.expectEqual(@as(?f32, null), m.plainMs(2_200));
+    m.notePlain(2_200, 18);
+    try std.testing.expectEqual(@as(?f32, 18), m.plainMs(3_000));
+    try std.testing.expectEqual(@as(?f32, null), m.plainMs(60_000));
+    var c: PldCost = .{};
+    c.seedPlain(m.plainMs(2_200).?);
+    // Judged on its third round with no probe: 14 ms a token against 18.
+    for (0..PLD_COST_PROBE_AFTER) |_| try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(42, 3, 5));
+    try std.testing.expect(c.judged() and c.pays());
 }

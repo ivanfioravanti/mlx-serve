@@ -154,6 +154,7 @@ pub fn nextPld(
             const tok_opt = try self.next(allocator);
             if (tok_opt == null) return null;
             if (self.pld_cost.plain(msSince(watch))) self.pld_probe_over = true;
+            self.xfm.pld_memory.notePlain(contextTokens(self), self.pld_cost.plain_ms);
             const tokens = try allocator.alloc(u32, 1);
             tokens[0] = tok_opt.?;
             return PldStepResult{
@@ -166,6 +167,7 @@ pub fn nextPld(
 
     if (!self.pld_memory_asked) {
         self.pld_memory_asked = true;
+        if (self.xfm.pld_memory.plainMs(contextTokens(self))) |ms| self.pld_cost.seedPlain(ms);
         if (self.xfm.pld_memory.startsOff(contextTokens(self))) {
             log.info("  pld=disabled (cost gate: this context size lost to plain decode on an earlier request)\n", .{});
             self.spec_disabled_runtime = true;
