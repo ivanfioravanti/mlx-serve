@@ -53,7 +53,7 @@ const resolveMtpDepthCapForProfile = @import("../spec/mtp/ev_plan.zig").resolveM
 const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
 const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpointSsmPrefill;
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
-const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
+const endSnapshotBackoff = @import("prefill_chunk.zig").endSnapshotBackoff;
 const WholePromptPlan = @import("prefill_chunk.zig").WholePromptPlan;
 const wholePromptPlan = @import("prefill_chunk.zig").wholePromptPlan;
 const PromptCheckpoints = @import("../ssm/checkpoint.zig").PromptCheckpoints;
@@ -339,13 +339,8 @@ pub fn initWithOptions(
         dfl_cl = .{ .ids = options.dflash.?.config.captureIds(), .out = dfl_out_buf };
     }
 
-    // Start of the final (logits) forward's token span. Without SSM
-    // checkpointing this is the last prompt token (the classic 1-token
-    // logits forward); with checkpointing the chunk loop stops
-    // SSM_SNAPSHOT_BACKOFF tokens early so the always-on snapshot lands
-    // where the next turn's prefix match can actually reach it (see
-    // ssmSnapshotBackoff), and the final forward covers the held-back
-    // tail + the last token in the same weight sweep.
+    // Start of the final (logits) forward's token span: the last prompt token. With SSM checkpointing the chunk loop
+    // also ends a chunk SSM_SNAPSHOT_BACKOFF tokens early, where the next turn's prefix match reaches its snapshot.
     var final_start: usize = if (xfm.prefillsWholePrompt()) 0 else prompt_ids.len - 1;
     // Chunked vision prefill (issue #197): placeholder rows consumed by
     // completed chunks, fed to ctx.vision_splice_offset per forward
@@ -358,8 +353,10 @@ pub fn initWithOptions(
 
     if (final_start > 0) {
         const prefix_len = prompt_ids.len - 1;
-        const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
-        const loop_end = prefix_len - snapshot_backoff;
+        // A hybrid prompt also snapshots one token before its end (`endSnapshotBackoff`): the chunk loop runs to
+        // `prefix_len`, ending a chunk at the backoff snapshot on the way, so an exact repeat forwards one row.
+        const backoff_end = prefix_len - if (want_state_cp) endSnapshotBackoff(prefix_len) else 0;
+        const loop_end = prefix_len;
         final_start = loop_end;
         // Per-chunk adaptive width: the first chunk runs the admitted width; every boundary
         // after it re-asks the same estimator. `cap_adapt` is the widest this arch forwards
@@ -449,7 +446,7 @@ pub fn initWithOptions(
             // chunk-locally. Boundary alignment is in ABSOLUTE position
             // (pos + offset), so the saved snapshot list is correct for
             // the full prompt, not the truncated tail.
-            const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid);
+            const end = nextChunkEnd(pos, if (pos < backoff_end) backoff_end else loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid);
             if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
             const chunk_len: c_int = @intCast(end - pos);
             const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -568,7 +565,9 @@ pub fn initWithOptions(
             // are realized; the snapshot is just a refcount-share of the
             // already-resident state.
             const abs_end_for_cp2 = end + ssm_cp_offset;
-            if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid)) {
+            // The backoff snapshot, when the loop runs past it to the end snapshot.
+            const at_backoff = end == backoff_end and backoff_end < loop_end;
+            if (want_ssm_cp and (at_backoff or ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid))) {
                 const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
                 fileCheckpoint(allocator, &ssm_checkpoints, cp, options.ssm_checkpoint_max, cp_thin, options.ssm_low_anchors) catch |e| {
                     var doomed = cp;
@@ -661,11 +660,8 @@ pub fn initWithOptions(
         // prompt) and only the last token + new tail re-forwards.
         // Skipped on `prompt_ids.len == 1` (no prefill chunks ran).
         if (want_ssm_cp and loop_end > 0) {
-            // The snapshot sits at the chunk loop's end — snapshot_backoff
-            // tokens BEFORE the prompt end, where the next turn's prefix
-            // match can actually reach it (the template's generation
-            // suffix renders differently in history, so a match always
-            // falls a few tokens short of the full prompt).
+            // The snapshot sits at the chunk loop's end, one token before the prompt end: an exact repeat restores here
+            // and forwards one row (the backoff snapshot, filed in the loop, serves the next turn).
             const final_abs = loop_end + ssm_cp_offset;
             // Skip if we already captured at this exact position (the
             // chunked loop would have done so when loop_end happens

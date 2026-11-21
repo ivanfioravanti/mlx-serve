@@ -295,6 +295,14 @@ pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize, restored: bool) 
     return SSM_SNAPSHOT_BACKOFF;
 }
 
+/// The backoff when the prompt also snapshots one token before its end (a hybrid's chunk loop runs on to
+/// `prefix_len`): the backoff snapshot stays where the next turn's match reaches it, and an exact repeat restores at
+/// the end snapshot and forwards one row. A tail inside the window has no backoff point of its own; restored there it
+/// forwards `[0, prefix_len)` as one chunk, which is cold's own span from the backoff snapshot, then the last row.
+pub fn endSnapshotBackoff(prefix_len: usize) usize {
+    return if (prefix_len <= SSM_SNAPSHOT_BACKOFF) 0 else SSM_SNAPSHOT_BACKOFF;
+}
+
 /// Under `longCtxGated` the chunk loop lays dense checkpoint anchors every 8192
 /// through the first 65536, whatever stride the request coarsened to (#794): a
 /// deep entry's grid then always answers `highestSsmPosAtOrBelow` for a fork
@@ -1298,4 +1306,29 @@ test "reservedPrefillTokens: a reserving model reserves its whole request to the
     var toy = ling;
     toy.model_type = "toy_hybrid";
     try t.expectEqual(@as(u64, 33_591 + 512), reservedPrefillTokens(&toy, 33_591, 11_198, 512));
+}
+
+test "a hybrid prompt's chunk loop ends a chunk at the backoff snapshot and runs on to one token before the end" {
+    // The ends `init`'s loop reaches for a `prefix_len`-token prefix (the last token is the logits forward).
+    const Ends = struct {
+        fn of(prefix_len: usize, buf: []usize) []usize {
+            const backoff_end = prefix_len - endSnapshotBackoff(prefix_len);
+            var n: usize = 0;
+            var pos: usize = 0;
+            while (pos < prefix_len) {
+                pos = nextChunkEnd(pos, if (pos < backoff_end) backoff_end else prefix_len, 8192, true, 8192, 0, false, false);
+                buf[n] = pos;
+                n += 1;
+            }
+            return buf[0..n];
+        }
+    };
+    var buf: [8]usize = undefined;
+    // A 1776-token prompt: the backoff snapshot at 1745 (the next turn's match reaches it), the end one at 1775.
+    try testing.expectEqualSlices(usize, &.{ 1745, 1775 }, Ends.of(1775, &buf));
+    // A tail inside the window (a restore at the backoff snapshot): one chunk to its end, cold's own span.
+    try testing.expectEqualSlices(usize, &.{30}, Ends.of(30, &buf));
+    try testing.expectEqualSlices(usize, &.{10}, Ends.of(10, &buf));
+    // Past a chunk: the chunk boundary, the backoff point, the end.
+    try testing.expectEqualSlices(usize, &.{ 8192, 9850, 9880 }, Ends.of(9880, &buf));
 }

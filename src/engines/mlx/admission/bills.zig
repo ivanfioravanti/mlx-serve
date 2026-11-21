@@ -362,11 +362,12 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
         @max(@as(usize, @intCast(chunk)), generate_mod.prefillCli().override),
     );
     if (stride == 0) return 0;
-    // Stride-aligned capture positions in `(matched, seq]` plus the always-on end-of-prompt
-    // snapshot, the only capture a warm append shorter than one stride makes.
+    // Stride-aligned capture positions in `(matched, seq]` plus the prompt's two end snapshots (the backoff one past
+    // the window, and the one a token before the end), the only captures a warm append shorter than one stride makes.
     const span: u64 = seq -| @min(matched, seq);
     var n: u64 = seq / stride -| @min(matched, seq) / stride;
     if (span > generate_mod.SSM_SNAPSHOT_BACKOFF) n += 1;
+    if (span > 1) n += 1;
     if (http_server.launch().ssm_checkpoint_max > 0) n = @min(n, http_server.launch().ssm_checkpoint_max);
     return n * per_cp;
 }

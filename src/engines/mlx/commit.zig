@@ -26,7 +26,7 @@ fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
 }
 
 /// Snapshot the live SSM state at the committed length so the next turn resumes after this
-/// one's generated tail; prefill snapshots end SSM_SNAPSHOT_BACKOFF tokens before the prompt end.
+/// one's generated tail; prefill snapshots end one token before the prompt end (and SSM_SNAPSHOT_BACKOFF before it).
 /// Exact there because every speculative round rolls the GDN state back before it returns.
 fn appendDecodeEndCheckpoint(
     slot: *Slot,

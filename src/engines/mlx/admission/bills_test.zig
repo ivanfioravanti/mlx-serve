@@ -1647,13 +1647,14 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
 
     // Cold: `seq / stride` saturates at --ssm-checkpoint-max as before.
     try t.expectEqual(@as(u64, http_server.launch().ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, chunk));
-    // Warm: a 3,730-token append at stride 8192 crosses no boundary, so the end snapshot is the whole of it.
-    try t.expectEqual(@as(u64, 1) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, matched, chunk));
+    // Warm: a 3,730-token append at stride 8192 crosses no boundary, so the two end snapshots are the whole of it.
+    try t.expectEqual(@as(u64, 2) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, matched, chunk));
     // A chain extension long enough to fill the ring still bills the cap: the
     // credit is proportional to the SPAN, not a blanket warm discount.
     try t.expectEqual(@as(u64, http_server.launch().ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 60_000, chunk));
-    // A span shorter than the backoff window snapshots nothing.
-    try t.expectEqual(@as(u64, 0), retainedSsmCheckpointBytes(&cfg, seq, seq - 4, chunk));
+    // A span inside the backoff window snapshots one token before its end only; a one-token span nothing.
+    try t.expectEqual(@as(u64, 1) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, seq - 4, chunk));
+    try t.expectEqual(@as(u64, 0), retainedSsmCheckpointBytes(&cfg, seq, seq - 1, chunk));
 
     // The bill term by term, from the same inputs `prefillMemoryNeeded` reads.
     const kv_bits: u64 = 8;

@@ -1,8 +1,8 @@
 #!/bin/bash
 # test_hybrid_reuse_equivalence.sh — prefix reuse on hybrid SSM models (qwen3_5, qwen3_5_moe, qwen3_next, lfm2,
 # nemotron_h) through per-position SSM/conv checkpoints: [1] warm output is byte-identical to cold (temp 0, and seeded
-# temp 1, whose draws key on absolute positions); [2] cached_n > 0 on the second identical request (the cache
-# engaged); [3] warm prompt_ms <= 0.7x cold.
+# temp 1, whose draws key on absolute positions); [2] the second identical request reuses all but its last token (the
+# snapshot one token before the prompt end); [3] warm prompt_ms <= 0.7x cold.
 #
 #   MLX_HYBRID_MODEL=<dir> ./tests/test_hybrid_reuse_equivalence.sh   # default Qwen3.5-4B-MLX-4bit; PORT (19077)
 
@@ -62,6 +62,7 @@ WARM_RESP=$(req_one)
 WARM_TEXT=$(echo "$WARM_RESP" | jq -r '.choices[0].message.content')
 WARM_MS=$(echo "$WARM_RESP" | jq -r '.timings.prompt_ms')
 WARM_CACHED=$(echo "$WARM_RESP" | jq -r '.timings.cached_n')
+WARM_PROMPT=$(echo "$WARM_RESP" | jq -r '.usage.prompt_tokens')
 echo "  prompt_ms=$WARM_MS cached_n=$WARM_CACHED"
 echo "  text=$(echo "$WARM_TEXT" | head -c 100)..."
 
@@ -86,11 +87,11 @@ else
     echo "✅ seeded byte-identical output"
 fi
 
-if ! python3 -c "import sys; sys.exit(0 if $WARM_CACHED > 0 else 1)"; then
-    echo "❌ FAIL: warm cached_n=$WARM_CACHED (expected > 0). SSM checkpoint cache didn't engage."
+if [ "$WARM_CACHED" != "$((WARM_PROMPT - 1))" ]; then
+    echo "❌ FAIL: warm cached_n=$WARM_CACHED of $WARM_PROMPT (expected all but the last token)."
     EC=1
 else
-    echo "✅ warm reuse engaged (cached_n=$WARM_CACHED)"
+    echo "✅ warm reuse of all but the last token (cached_n=$WARM_CACHED of $WARM_PROMPT)"
 fi
 
 # 0.7× is loose to avoid flakiness on different hardware. The real win is
