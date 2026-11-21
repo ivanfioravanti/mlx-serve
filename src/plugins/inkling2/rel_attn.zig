@@ -126,33 +126,135 @@ fn halfFloat(dt: ops.Dtype) bool {
     return dt == .bfloat16 or dt == .float16;
 }
 
-/// The simdgroup-matrix kernel; null where it declines: off Metal, a chunk under `MIN_ROWS` rows, q/k/v not all
-/// bf16 or all f16, a head width that is not a multiple of 8 or whose tiles outgrow threadgroup memory, a K or V
-/// view whose base its 16-byte loads cannot read.
-pub fn simd(g: *Graph, a: Args) !?Array {
-    if (!mlx.streamIsGpu(g.s)) return null;
-    if (mlx.mlx_array_ndim(a.q) != 4 or mlx.mlx_array_ndim(a.k) != 4 or mlx.mlx_array_ndim(a.v) != 4) return null;
-    if (mlx.mlx_array_ndim(a.rel) != 4 or mlx.mlx_array_ndim(a.sinks) != 3 or mlx.mlx_array_ndim(a.key_start) != 1) return null;
+/// What every launch of the kernel needs of its inputs, whatever the rows: on Metal, q/k/v all bf16 or all f16, a
+/// head width that is a multiple of 8 and whose tiles fit threadgroup memory, a K and V base its 16-byte loads read.
+fn accepts(g: *const Graph, a: Args) bool {
+    if (!mlx.streamIsGpu(g.s)) return false;
+    if (mlx.mlx_array_ndim(a.q) != 4 or mlx.mlx_array_ndim(a.k) != 4 or mlx.mlx_array_ndim(a.v) != 4) return false;
+    if (mlx.mlx_array_ndim(a.rel) != 4 or mlx.mlx_array_ndim(a.sinks) != 3 or mlx.mlx_array_ndim(a.key_start) != 1) return false;
     const qs = ops.shape(a.q);
     const ks = ops.shape(a.k);
-    const vs = ops.shape(a.v);
     const rs = ops.shape(a.rel);
+    const dt = ops.dtype(a.q);
+    if (!halfFloat(dt) or ops.dtype(a.k) != dt or ops.dtype(a.v) != dt) return false;
+    if (!halfFloat(ops.dtype(a.rel)) and ops.dtype(a.rel) != .float32) return false;
+    if (qs[2] < 1 or ks[2] < qs[2] or qs[3] < 8 or @rem(qs[3], 8) != 0 or tgBytes(@intCast(qs[3])) > TG_MEMORY) return false;
+    if (ks[1] <= 0 or @rem(qs[1], ks[1]) != 0 or rs[3] < 1) return false;
+    if (!std.mem.eql(c_int, ks, ops.shape(a.v)) or ks[0] != qs[0] or ks[3] != qs[3]) return false;
+    if (rs[0] != qs[0] or rs[1] != qs[2] or rs[2] != qs[1]) return false;
+    if (!std.mem.eql(c_int, ops.shape(a.sinks), rs[0..3]) or ops.shape(a.key_start)[0] != qs[0]) return false;
+    return attn256.attn256Base16Aligned(a.k) and attn256.attn256Base16Aligned(a.v);
+}
+
+fn templates(cfg: mlx.mlx_fast_metal_kernel_config, a: Args) !void {
+    const qs = ops.shape(a.q);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", ops.dtype(a.q)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", qs[3]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HQ", qs[1]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HKV", ops.shape(a.k)[1]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "R", ops.shape(a.rel)[3]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WINDOW", @intCast(a.window)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BQ", BQ));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", TG));
+}
+
+fn apply(c: *Graph, k: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config, inputs: []const Array, comptime n: usize) ![n]Array {
+    const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(in_vec);
+    var out_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(out_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&out_vec, k, in_vec, cfg, c.s));
+    if (mlx.mlx_vector_array_size(out_vec) != n) return error.MetalKernelBadOutputCount;
+    var got: [n]Array = undefined;
+    for (&got, 0..) |*x, i| {
+        var h = mlx.mlx_array_new();
+        const rc = mlx.mlx_vector_array_get(&h, out_vec, i);
+        x.* = try c.adopt(h);
+        try mlx.check(rc);
+    }
+    return got;
+}
+
+pub const MERGE_SOURCE = kernelSource("plugins/inkling2/kernels/rel_attn_merge.metal");
+pub const MERGE_INPUTS = [_][*:0]const u8{ "ms", "ls", "os" };
+/// Key chunks a split launch makes at most, and the fewest keys in one.
+pub const MAX_CHUNKS = 64;
+pub const MIN_CHUNK = 1024;
+
+var merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// A chunk's keys for `s` keys: `MIN_CHUNK` doubled until `MAX_CHUNKS` chunks hold them. A row's chunks are cut at
+/// the same keys whether it is read alone or in a window, so its bits are the same.
+pub fn chunkKeys(s: i64) i64 {
+    var n: i64 = MIN_CHUNK;
+    while (n * MAX_CHUNKS < s) n *= 2;
+    return n;
+}
+
+/// A few rows over many keys: every key chunk is read by its own threadgroups and a second kernel joins them, so
+/// the dispatch is as long as one chunk, not the key range. Null where the kernel declines (`accepts`).
+pub fn split(g: *Graph, a: Args) !?Array {
+    if (!accepts(g, a)) return null;
+    const k = getKernel() catch return null;
+    if (merge_kernel == null) {
+        const in_vec = mlx.mlx_vector_string_new_data(&MERGE_INPUTS, MERGE_INPUTS.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{"out"}, 1);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const m = mlx.mlx_fast_metal_kernel_new("inkling2_rel_attn_merge", in_vec, out_vec, MERGE_SOURCE, "", true, false);
+        if (m.ctx == null) return null;
+        merge_kernel = m;
+    }
+    const qs = ops.shape(a.q);
     const b = qs[0];
     const hq = qs[1];
     const l = qs[2];
     const d = qs[3];
-    const hkv = ks[1];
-    const s = ks[2];
+    const s = ops.shape(a.k)[2];
+    const chunk: c_int = @intCast(chunkKeys(s));
+    const chunks = @divTrunc(s + chunk - 1, chunk);
+
+    var c = g.scope();
+    defer c.deinit();
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{1}, 1, ops.dtype(a.q)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ chunks, b * l * hq }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ chunks, b * l * hq }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ chunks, b * l * hq, d }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(l + BQ - 1, BQ) * chunks * TG, hq, b));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, TG, 1, 1));
+    try templates(cfg, a);
+    const dummy = try c.fromSlice(f32, &.{0}, &.{1});
+    const state = try apply(&c, k, cfg, &.{
+        a.q,                                                  a.k,                                               a.v,
+        try c.contiguous(a.rel),                              try c.contiguous(try c.astype(a.sinks, .float32)), try c.contiguous(try c.astype(a.key_start, .int32)),
+        try c.fromSlice(i32, &.{ l, s, chunk, 0, 4 }, &.{5}), try c.fromSlice(f32, &.{a.scale}, &.{1}),          dummy,
+        dummy,                                                dummy,
+    }, OUTPUTS.len);
+
+    const mc = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(mc);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(mc, &[_]c_int{ b, l, hq, d }, 4, ops.dtype(a.q)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(mc, b * l * hq * 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(mc, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(mc, "T", ops.dtype(a.q)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(mc, "D", d));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(mc, "CH", chunks));
+    const out = try apply(&c, merge_kernel.?, mc, state[1..], 1);
+    return try g.keep(out[0]);
+}
+
+/// The simdgroup-matrix kernel over a prefill chunk; null where it declines: under `MIN_ROWS` rows, or `accepts`.
+pub fn simd(g: *Graph, a: Args) !?Array {
+    if (ops.shape(a.q).len != 4 or ops.shape(a.q)[2] < MIN_ROWS or !accepts(g, a)) return null;
+    const qs = ops.shape(a.q);
+    const b = qs[0];
+    const hq = qs[1];
+    const l = qs[2];
+    const d = qs[3];
+    const s = ops.shape(a.k)[2];
     const dt = ops.dtype(a.q);
-    if (!halfFloat(dt) or ops.dtype(a.k) != dt or ops.dtype(a.v) != dt) return null;
-    const rel_dt = ops.dtype(a.rel);
-    if (!halfFloat(rel_dt) and rel_dt != .float32) return null;
-    if (l < MIN_ROWS or s < l or d < 8 or @rem(d, 8) != 0 or tgBytes(@intCast(d)) > TG_MEMORY) return null;
-    if (hkv <= 0 or @rem(hq, hkv) != 0 or rs[3] < 1) return null;
-    if (!std.mem.eql(c_int, ks, vs) or ks[0] != b or ks[3] != d) return null;
-    if (rs[0] != b or rs[1] != l or rs[2] != hq) return null;
-    if (!std.mem.eql(c_int, ops.shape(a.sinks), rs[0..3]) or ops.shape(a.key_start)[0] != b) return null;
-    if (!attn256.attn256Base16Aligned(a.k) or !attn256.attn256Base16Aligned(a.v)) return null;
     const k = getKernel() catch return null;
 
     var c = g.scope();
@@ -186,30 +288,10 @@ pub fn simd(g: *Graph, a: Args) !?Array {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, if (last) &one else &state, if (last) 1 else 4, .float32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(l + BQ - 1, BQ) * TG, hq, b));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, TG, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", d));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HQ", hq));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HKV", hkv));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "R", rs[3]));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WINDOW", @intCast(a.window)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BQ", BQ));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", TG));
+        try templates(cfg, a);
 
         const st = carry orelse .{ dummy, dummy, dummy };
-        const inputs = [_]Array{ a.q, a.k, a.v, rel, sinks, key_start, sizes, scale, st[0], st[1], st[2] };
-        const in_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
-        defer _ = mlx.mlx_vector_array_free(in_vec);
-        var out_vec = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(out_vec);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&out_vec, k, in_vec, cfg, g.s));
-        if (mlx.mlx_vector_array_size(out_vec) != OUTPUTS.len) return error.MetalKernelBadOutputCount;
-        var got: [OUTPUTS.len]Array = undefined;
-        for (&got, 0..) |*x, i| {
-            var h = mlx.mlx_array_new();
-            const rc = mlx.mlx_vector_array_get(&h, out_vec, i);
-            x.* = try c.adopt(h);
-            try mlx.check(rc);
-        }
+        const got = try apply(&c, k, cfg, &.{ a.q, a.k, a.v, rel, sinks, key_start, sizes, scale, st[0], st[1], st[2] }, OUTPUTS.len);
         // The state a pass took is dead once the next pass is built.
         if (carry) |old| for (old) |x| c.drop(x);
         carry = .{ got[1], got[2], got[3] };
@@ -385,6 +467,38 @@ test "inkling2 rel_attn: the kernel is no worse than the op chain against fp32, 
         .{ .l = 40, .s = 90, .r = 64, .dt = .float16 },
     };
     for (cases, 0..) |cs, n| try expectKernel(cs, 100 + n);
+}
+
+test "inkling2 rel_attn: a few rows over key chunks are no worse than the op chain, and a row alone has its window's bits" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    const cases = [_]Case{
+        // Three chunks, the last one ragged; one chunk; a window; a first key inside the second chunk.
+        .{ .l = 6, .s = 2 * MIN_CHUNK + 300, .r = 64 },
+        .{ .l = 1, .s = 200, .r = 64 },
+        .{ .l = 16, .s = 3 * MIN_CHUNK, .r = 512, .window = 700 },
+        .{ .hq = 6, .hkv = 2, .l = 9, .s = 2 * MIN_CHUNK + 40, .d = 128, .r = 1024, .key_start = &.{MIN_CHUNK + 17} },
+    };
+    for (cases, 0..) |cs, n| {
+        const a = try draw(&g, cs, 300 + n);
+        const got = (try split(&g, a)) orelse return error.KernelDeclined;
+        const want = try truth(&g, a);
+        try testing.expectEqualSlices(c_int, ops.shape(want), ops.shape(got));
+        const err = try attn256.attn256MaxDiff(got, want, g.s);
+        const bar = @max(try attn256.attn256UlpBar(want, g.s), try attn256.attn256MaxDiff(try reference(&g, a), want, g.s));
+        try testing.expect(err <= bar);
+        try testing.expect(try attn256.attn256Cosine(got, want, g.s) > 0.9999);
+
+        // The last row read alone over the same keys.
+        var one = a;
+        one.q = try g.sliceAxis(a.q, 2, cs.l - 1, cs.l);
+        one.rel = try g.sliceAxis(a.rel, 1, cs.l - 1, cs.l);
+        one.sinks = try g.sliceAxis(a.sinks, 1, cs.l - 1, cs.l);
+        try ops.expectBitEqual((try split(&g, one)).?, try g.sliceAxis(got, 1, cs.l - 1, cs.l));
+    }
+    try testing.expectEqual(@as(i64, MIN_CHUNK), chunkKeys(MIN_CHUNK * MAX_CHUNKS));
+    try testing.expectEqual(@as(i64, 2 * MIN_CHUNK), chunkKeys(MIN_CHUNK * MAX_CHUNKS + 1));
 }
 
 test "inkling2 rel_attn: key passes carry the state to the same bits as one dispatch" {

@@ -110,6 +110,10 @@ fn logScale(g: *Graph, offset: c_int, l: c_int, floor: u32, alpha: f32) !Array {
     return g.reshape(try g.addScalar(try g.mulScalar(try g.log(ratio), alpha), 1), &.{ 1, l, 1, 1 });
 }
 
+/// Keys from which a window is read over key chunks; under it, row by row is as quick. A single row stays on
+/// the fused attention at every length (over 65k keys it is half again as fast as the chunked kernel).
+const SPLIT_KEYS = 4096;
+
 /// `[1, L, Hq, D]`: one decode row through MLX's fused attention (its sinks are one row's), a chunk through the kernels.
 pub fn attend(g: *Graph, a: rel_attn.Args) !Array {
     const qs = ops.shape(a.q);
@@ -118,6 +122,7 @@ pub fn attend(g: *Graph, a: rel_attn.Args) !Array {
         // A window under the kernel's floor (a speculative round's verify rows): each row as a decode row reads
         // it, over its own keys. The op chain scores every key for every row and rounds differently from decode.
         const total = ops.shape(a.k)[2];
+        if (total >= SPLIT_KEYS) if (try rel_attn.split(g, a)) |out| return out;
         var outs: [rel_attn.MIN_ROWS]Array = undefined;
         for (0..@intCast(qs[2])) |i| {
             const at: c_int = @intCast(i);

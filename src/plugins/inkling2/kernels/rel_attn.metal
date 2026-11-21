@@ -5,7 +5,8 @@
 // row's max, sum and unnormalized output in fp32.
 //
 // q [B,HQ,L,D]; k, v [B,HKV,S,D] (strided views whose last L rows are the queries' own); rel [B,L,HQ,R];
-// sinks [B,L,HQ] f32; key_start [B]; sizes {L, S, first key, end key, 1 = takes a carry | 2 = last pass}.
+// sinks [B,L,HQ] f32; key_start [B]; sizes {L, S, first key, end key, 1 = takes a carry | 2 = last pass | 4 = key
+// split, where the third is a chunk's keys}.
 // Row i sits at key S - L + i and sees key j at d = that - j when 0 <= d, j >= key_start and (WINDOW == 0 or
 // d < WINDOW); the logit is q.k * scale + (d < R ? rel[d] : 0). The sink is one more softmax column whose value
 // is zero: it seeds the row's max and sum.
@@ -15,16 +16,22 @@ constexpr int BK = 16;
 constexpr int LDV = D + 8;
 const int L = sizes[0];
 const int S = sizes[1];
-const int k_begin = sizes[2];
-const int k_end = sizes[3];
 const bool has_carry = (sizes[4] & 1) != 0;
 const bool is_final = (sizes[4] & 2) != 0;
+// Key-split launch (sizes[4] & 4): the grid's x also counts key chunks of sizes[2] keys, each read from a fresh
+// state by its own threadgroup and stored as chunk `chunk` of the state outputs for the merge kernel.
+const bool split = (sizes[4] & 4) != 0;
+const int tiles = (L + BQ - 1) / BQ;
+const int gx = int(threadgroup_position_in_grid.x);
+const int chunk = split ? gx / tiles : 0;
+const int k_begin = split ? chunk * sizes[2] : sizes[2];
+const int k_end = split ? k_begin + sizes[2] : sizes[3];
 const int tix = int(thread_index_in_threadgroup);
 const int warp = int(simdgroup_index_in_threadgroup);
 const ushort lane = ushort(thread_index_in_simdgroup);
 const int batch = int(threadgroup_position_in_grid.z);
 const int head = int(threadgroup_position_in_grid.y);
-const int q0 = int(threadgroup_position_in_grid.x) * BQ;
+const int q0 = (split ? gx % tiles : gx) * BQ;
 const int start = key_start[batch];
 const float qscale = scale[0] * LOG2E;
 
@@ -63,7 +70,13 @@ if (has_carry && row_ok) {
   sum_score = l_in[crow];
   for (int dd = 0; dd < D / 8; ++dd) Ofrag[dd] = float2(o_in[crow * D + dd * 8 + sn], o_in[crow * D + dd * 8 + sn + 1]);
 } else {
-  if (row_ok) max_score = float(sinks[crow]) * LOG2E;
+  if (chunk > 0) {
+    // Only the first chunk holds the sink; an empty state merges as nothing.
+    max_score = -3.0e38f;
+    sum_score = 0.0f;
+  } else if (row_ok) {
+    max_score = float(sinks[crow]) * LOG2E;
+  }
   for (int dd = 0; dd < D / 8; ++dd) Ofrag[dd] = float2(0.0f);
 }
 
@@ -153,11 +166,12 @@ if (row_ok) {
       out[crow * D + id * 8 + sn + 1] = T(Ofrag[id].y * inv);
     }
   } else {
-    m_out[crow] = max_score;
-    l_out[crow] = sum_score;
+    const size_t srow = crow + size_t(chunk) * threadgroups_per_grid.z * L * HQ;
+    m_out[srow] = max_score;
+    l_out[srow] = sum_score;
     for (int id = 0; id < D / 8; ++id) {
-      o_out[crow * D + id * 8 + sn] = Ofrag[id].x;
-      o_out[crow * D + id * 8 + sn + 1] = Ofrag[id].y;
+      o_out[srow * D + id * 8 + sn] = Ofrag[id].x;
+      o_out[srow * D + id * 8 + sn + 1] = Ofrag[id].y;
     }
   }
 }
