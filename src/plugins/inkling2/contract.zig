@@ -468,7 +468,7 @@ test "kernel contract inkling2: the NAX launch is the shipped wrapper's, byte fo
     var set = kc.Set.init(a);
     defer set.deinit();
     try register(&set);
-    for (set.kernels.items[registrations.len..]) |k| {
+    for (set.kernels.items[registrations.len..][0..nax_registrations.len]) |k| {
         const t: *attn.NaxAttn = @ptrCast(@alignCast(k.ctx));
         // The chain's first two passes ride its last one's registration.
         if (t.cfg.phase == .out or t.cfg.phase == .through) continue;

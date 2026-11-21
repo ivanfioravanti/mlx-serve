@@ -91,6 +91,8 @@ test "inkling2 depth_attn: the kernel gives the op chain's rows at every bank si
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var g = Graph.init(testing.allocator, mlx.gpuStream());
     defer g.deinit();
+    var cpu = Graph.init(testing.allocator, mlx.mlx_default_cpu_stream_new());
+    defer cpu.deinit();
     const cases = [_]struct { bank: usize, rows: c_int, d: c_int, q: c_int }{
         .{ .bank = 0, .rows = 1, .d = 2304, .q = 1 },
         .{ .bank = 4, .rows = 1, .d = 2304, .q = 3 },
@@ -106,13 +108,14 @@ test "inkling2 depth_attn: the kernel gives the op chain's rows at every bank si
         // Queries far from zero, so the weights are far from uniform.
         const query = try normal(&g, &.{ cs.q, cs.d }, 100 * n + 51, 4);
         const got = (try fused(&g, bank[0..cs.bank], partial, query)) orelse return error.KernelDeclined;
-        const want = try blocks.depthChain(&g, bank[0..cs.bank], partial, query);
+        // The op chain on the CPU: a tensor-unit GPU's f32 matmul is good to about 1e-3 of its largest product.
+        const want = try blocks.depthChain(&cpu, bank[0..cs.bank], partial, query);
         try testing.expectEqualSlices(c_int, ops.shape(want), ops.shape(got));
         const diff = try g.call(mlx.mlx_max, .{ try g.abs(try g.sub(got, want)), false });
         try ops.eval(diff);
         var worst: f32 = 0;
         try mlx.check(mlx.mlx_array_item_float32(&worst, diff));
-        try testing.expect(worst <= 2e-5);
+        try testing.expect(worst <= 1e-4);
     }
     var nine: [MAX_BANK + 1]Array = @splat(try normal(&g, &.{ 1, 2, 64 }, 1, 1));
     try testing.expectEqual(@as(?Array, null), try fused(&g, &nine, nine[0], try normal(&g, &.{ 1, 64 }, 2, 1)));
