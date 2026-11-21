@@ -314,6 +314,15 @@ const Load = struct {
         return p;
     }
 
+    /// Projections of one input, read unowned and joined row-wise (each `Linear` a view of its rows); kept apart where
+    /// their quant geometry differs (an empty `Joined`).
+    fn join(l: *Load, in_dim: u32, parts: []const *Linear, names: []const []const u8) !b.linear.Joined {
+        for (parts, names) |p, n| p.* = try l.r.proj(n, in_dim);
+        const j = if (parts[0].s.ctx != null) try loader.join(l.o, parts, l.r.s) else b.linear.Joined{};
+        for (parts) |p| try l.o.linear(p.*);
+        return j;
+    }
+
     /// An evaluated f32 copy of a tensor, reshaped (`sh` empty = as stored), transposed (`[out, in]` to `[in, out]`)
     /// or scaled.
     fn made(l: *Load, comptime fmt: []const u8, args: anytype, how: struct { sh: []const c_int = &.{}, t: bool = false, dt: ?mlx.mlx_dtype = .float32, mul: f32 = 1 }) !Array {
@@ -411,13 +420,13 @@ fn loadLayer(l: *Load, c: *const config.Config, i: usize) !Layer {
     const q_dim = hs.heads * hs.head_dim;
 
     var attn: attention.Weights = .{
-        .q = try l.proj(hidden, "layers.{d}.self_attn.q_proj", .{i}),
-        .k = try l.proj(hidden, "layers.{d}.self_attn.k_proj", .{i}),
-        .v = try l.proj(hidden, "layers.{d}.self_attn.v_proj", .{i}),
-        .rel = try l.proj(hidden, "layers.{d}.self_attn.r_proj", .{i}),
+        .q = .{},
+        .k = .{},
+        .v = .{},
+        .rel = .{},
         .o = try l.proj(q_dim, "layers.{d}.self_attn.o_proj", .{i}),
-        .gate = try l.proj(hidden, "layers.{d}.self_attn.gate_proj", .{i}),
-        .sink = try l.proj(hidden, "layers.{d}.self_attn.sink_proj", .{i}),
+        .gate = .{},
+        .sink = .{},
         .q_clip = try l.need("layers.{d}.self_attn.q_l2_clip.scale", .{i}),
         .rel_clip = try l.need("layers.{d}.self_attn.rel_l2_clip.scale", .{i}),
         .rel_proj = try l.need("layers.{d}.self_attn.rel_logits_proj.proj", .{i}),
@@ -433,15 +442,32 @@ fn loadLayer(l: *Load, c: *const config.Config, i: usize) !Layer {
         .rel_clip_at = c.rel_clip,
         .eps = c.rms_norm_eps,
     };
-    attn.conv = if (global) .{ .dynamic = .{
-        .k = try l.need("layers.{d}.self_attn.k_sconv.static_weight", .{i}),
-        .v = try l.need("layers.{d}.self_attn.v_sconv.static_weight", .{i}),
-        .k_proj = try l.proj(hidden, "layers.{d}.self_attn.k_sconv.weight_proj", .{i}),
-        .v_proj = try l.proj(hidden, "layers.{d}.self_attn.v_sconv.weight_proj", .{i}),
-    } } else .{ .static = .{
-        .k = try l.need("layers.{d}.self_attn.k_sconv.conv1d.weight", .{i}),
-        .v = try l.need("layers.{d}.self_attn.v_sconv.conv1d.weight", .{i}),
-    } };
+    var nb: [4][256]u8 = undefined;
+    const r = l.r;
+    attn.join_q = try l.join(hidden, &.{ &attn.q, &attn.rel, &attn.gate, &attn.sink }, &.{
+        try r.name(&nb[0], "layers.{d}.self_attn.q_proj", .{i}),
+        try r.name(&nb[1], "layers.{d}.self_attn.r_proj", .{i}),
+        try r.name(&nb[2], "layers.{d}.self_attn.gate_proj", .{i}),
+        try r.name(&nb[3], "layers.{d}.self_attn.sink_proj", .{i}),
+    });
+    if (global) {
+        var kp: Linear = .{};
+        var vp: Linear = .{};
+        attn.join_k = try l.join(hidden, &.{ &attn.k, &kp }, &.{ try r.name(&nb[0], "layers.{d}.self_attn.k_proj", .{i}), try r.name(&nb[1], "layers.{d}.self_attn.k_sconv.weight_proj", .{i}) });
+        attn.join_v = try l.join(hidden, &.{ &attn.v, &vp }, &.{ try r.name(&nb[0], "layers.{d}.self_attn.v_proj", .{i}), try r.name(&nb[1], "layers.{d}.self_attn.v_sconv.weight_proj", .{i}) });
+        attn.conv = .{ .dynamic = .{
+            .k = try l.need("layers.{d}.self_attn.k_sconv.static_weight", .{i}),
+            .v = try l.need("layers.{d}.self_attn.v_sconv.static_weight", .{i}),
+            .k_proj = kp,
+            .v_proj = vp,
+        } };
+    } else {
+        attn.join_kv = try l.join(hidden, &.{ &attn.k, &attn.v }, &.{ try r.name(&nb[0], "layers.{d}.self_attn.k_proj", .{i}), try r.name(&nb[1], "layers.{d}.self_attn.v_proj", .{i}) });
+        attn.conv = .{ .static = .{
+            .k = try l.need("layers.{d}.self_attn.k_sconv.conv1d.weight", .{i}),
+            .v = try l.need("layers.{d}.self_attn.v_sconv.conv1d.weight", .{i}),
+        } };
+    }
 
     var mlp: moe.Weights = .{
         .router = try l.made("layers.{d}.mlp.gate.weight", .{i}, .{ .t = true }),

@@ -38,6 +38,13 @@ pub const Weights = struct {
         /// Per-head taps `[K, C]` plus the layer input's projection to `heads * K`.
         dynamic: struct { k: Array, v: Array, k_proj: Linear, v_proj: Linear },
     },
+    /// q, rel, gate and sink (one input).
+    join_q: Joined = .{},
+    /// A sliding layer's k and v (one input unless a loop message tells them apart); a global layer's k with its conv
+    /// projection, and v with its.
+    join_kv: Joined = .{},
+    join_k: Joined = .{},
+    join_v: Joined = .{},
     heads: c_int,
     kv_heads: c_int,
     head_dim: c_int,
@@ -53,6 +60,16 @@ pub const Weights = struct {
 
 pub const Out = struct { out: Array, k: blocks.Conv, v: blocks.Conv };
 
+const Joined = @import("../../sdk/bases/blocks/linear.zig").Joined;
+
+/// The first `n` parts of `j`'s one matmul over `x`.
+fn split(j: *const Joined, g: *Graph, x: Array, comptime n: usize) ![n]Array {
+    const y = try j.lin.forward(g, x);
+    var out: [n]Array = undefined;
+    for (&out, 0..) |*o, i| o.* = try j.part(g, y, i);
+    return out;
+}
+
 /// The layer's attention over its normed q, k and v inputs `[1, L, hidden]`; `k_prev`/`v_prev` are the conv windows.
 pub fn forward(w: *const Weights, c: *Ctx, qs: Array, ks: Array, vs: Array, k_prev: ?Array, v_prev: ?Array) !Out {
     const g = c.g;
@@ -60,23 +77,32 @@ pub fn forward(w: *const Weights, c: *Ctx, qs: Array, ks: Array, vs: Array, k_pr
     const hd = w.head_dim;
     const offset: c_int = @intCast(c.offset());
     const total = offset + l;
-    const k_lin = try w.k.forward(g, ks);
-    const v_lin = try w.v.forward(g, vs);
     const kc, const vc = switch (w.conv) {
-        .static => |s| .{ try blocks.sconv(g, k_lin, s.k, k_prev), try blocks.sconv(g, v_lin, s.v, v_prev) },
-        .dynamic => |d| .{
-            try blocks.dynamicSconv(g, k_lin, try d.k_proj.forward(g, ks), d.k, w.kv_heads, k_prev),
-            try blocks.dynamicSconv(g, v_lin, try d.v_proj.forward(g, vs), d.v, w.kv_heads, v_prev),
+        .static => |s| blk: {
+            var kv_lin: [2]Array = undefined;
+            if (w.join_kv.built() and ks.ctx == vs.ctx) {
+                kv_lin = try split(&w.join_kv, g, ks, 2);
+            } else kv_lin = .{ try w.k.forward(g, ks), try w.v.forward(g, vs) };
+            break :blk .{ try blocks.sconv(g, kv_lin[0], s.k, k_prev), try blocks.sconv(g, kv_lin[1], s.v, v_prev) };
+        },
+        .dynamic => |d| blk: {
+            const kk = if (w.join_k.built()) try split(&w.join_k, g, ks, 2) else [2]Array{ try w.k.forward(g, ks), try d.k_proj.forward(g, ks) };
+            const vv = if (w.join_v.built()) try split(&w.join_v, g, vs, 2) else [2]Array{ try w.v.forward(g, vs), try d.v_proj.forward(g, vs) };
+            break :blk .{
+                try blocks.dynamicSconv(g, kk[0], kk[1], d.k, w.kv_heads, k_prev),
+                try blocks.dynamicSconv(g, vv[0], vv[1], d.v, w.kv_heads, v_prev),
+            };
         },
     };
-    const gate = try w.gate.forward(g, qs);
-    const sinks = try w.sink.forward(g, qs);
+    const qo = if (w.join_q.built()) try split(&w.join_q, g, qs, 4) else [4]Array{ try w.q.forward(g, qs), try w.rel.forward(g, qs), try w.gate.forward(g, qs), try w.sink.forward(g, qs) };
+    const gate = qo[2];
+    const sinks = qo[3];
 
-    var q = try blocks.l2Clip(g, try g.reshape(try w.q.forward(g, qs), &.{ 1, l, w.heads, hd }), w.q_clip, w.qk_clip);
+    var q = try blocks.l2Clip(g, try g.reshape(qo[0], &.{ 1, l, w.heads, hd }), w.q_clip, w.qk_clip);
     const k = try blocks.l2Clip(g, try g.reshape(kc.out, &.{ 1, l, w.kv_heads, hd }), null, w.qk_clip);
     const v4 = try g.reshape(vc.out, &.{ 1, l, w.kv_heads, hd });
     const v = (try blocks.rmsCast(g, v4, null, w.eps, ops.dtype(v4), false)).out;
-    var rel = try blocks.l2Clip(g, try g.reshape(try w.rel.forward(g, qs), &.{ 1, l, w.heads, w.d_rel }), w.rel_clip, w.rel_clip_at);
+    var rel = try blocks.l2Clip(g, try g.reshape(qo[1], &.{ 1, l, w.heads, w.d_rel }), w.rel_clip, w.rel_clip_at);
     if (w.window == 0 and total > @as(c_int, @intCast(w.log_floor))) {
         const tau = try logScale(g, offset, l, w.log_floor, w.log_alpha);
         q = try g.astype(try g.mul(try blocks.f32Of(g, q), tau), ops.dtype(q));
