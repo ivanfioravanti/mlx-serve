@@ -97,11 +97,14 @@ template <
     bool LAST,
     typename AccumType,
     typename QT,
+    int REL = 0,
+    bool ROW_SINKS = false,
     typename StridePtr,
     typename SinkPtr,
     typename StatePtr,
     typename QScalePtr,
-    typename KScalePtr>
+    typename KScalePtr,
+    typename KeyStartPtr = const device int*>
 METAL_FUNC void attention_nax_bdv_qt(
     const device T* Q,
     const device T* K,
@@ -121,7 +124,9 @@ METAL_FUNC void attention_nax_bdv_qt(
     const device QT* Qq,
     const device QT* Kq,
     QScalePtr q_scale,
-    KScalePtr k_scale) {
+    KScalePtr k_scale,
+    const device T* rel = nullptr,
+    KeyStartPtr key_start = nullptr) {
   ulong3 tidl{tid.x, tid.y, tid.z};
   // int8 Q / K (SageAttention): row-contiguous [B, H, qL, BD] / [B, Hkv, kL,
   // BD] copies; scores accumulate in int32 and are scaled by the Q tile's and
@@ -213,7 +218,15 @@ METAL_FUNC void attention_nax_bdv_qt(
     if (has_sinks) {
       OMLX_NAX_UNROLL
       for (short i = 0; i < kRowsPT; ++i) {
-        max_score[i] = M_LOG2E_F * static_cast<AccumType>(sinks[tidl.y]);
+        if constexpr (ROW_SINKS) {
+          // sinks [B, qL, H]: one logit per query row.
+          const int row = int(tid.x) * BQ + tm + sm + i * otile_t::kFragRowsJump;
+          max_score[i] = row < params->qL
+              ? M_LOG2E_F * static_cast<AccumType>(sinks[(int64_t(tid.z) * params->qL + row) * params->H + tid.y])
+              : AccumType(0);
+        } else {
+          max_score[i] = M_LOG2E_F * static_cast<AccumType>(sinks[tidl.y]);
+        }
         sum_score[i] = 1;
       }
     }
@@ -379,6 +392,40 @@ METAL_FUNC void attention_nax_bdv_qt(
     OMLX_NAX_UNROLL
     for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
       Stile.elems()[ii] *= float(scale2);
+    }
+
+    // Relative-position bias: rel [B, qL, H, REL] holds each query row's logit
+    // at key distances under REL; keys before key_start[B] are masked.
+    if constexpr (REL > 0) {
+      constexpr auto neg_inf = Limits<AccumType>::finite_min;
+
+      const int row0 = tid.x * BQ + tm;
+      const int base_col = kb * BK;
+      const int first_key = key_start[tid.z];
+
+      OMLX_NAX_UNROLL
+      for (short iq = 0; iq < TQ; iq++) {
+        OMLX_NAX_UNROLL
+        for (short ik = 0; ik < TK; ik++) {
+          thread auto& fg = Stile.frag_at(iq, ik);
+
+          OMLX_NAX_UNROLL
+          for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
+            OMLX_NAX_UNROLL
+            for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
+              const int row = row0 + iq * kU + ii * stile_t::kFragRowsJump + sm;
+              const int c = base_col + ik * kU + jj + sn;
+              const int d = row + params->qL_off - c;
+              const auto loc = ii * stile_t::kFragThrCols + jj;
+              if (d >= 0 && d < REL && row < params->qL) {
+                fg[loc] += M_LOG2E_F *
+                    static_cast<AccumType>(rel[((int64_t(tid.z) * params->qL + row) * params->H + tid.y) * REL + d]);
+              }
+              fg[loc] = (c < first_key) ? neg_inf : fg[loc];
+            }
+          }
+        }
+      }
     }
 
     // Mask out length sequence

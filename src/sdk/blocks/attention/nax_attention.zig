@@ -15,7 +15,7 @@ const THREADS: c_int = 128;
 /// Keys per pass, and the grid size from which passes pay (oMLX's measured defaults).
 const PASS_KEYS: c_int = 8192;
 const PASS_MIN_GROUPS: c_int = 512;
-const MAX_PASSES = 64;
+pub const MAX_PASSES = 64;
 
 pub const SOURCE = kernelSource("kernels/attention/nax_attention_entry.metal");
 
@@ -40,7 +40,7 @@ fn getKernel() !mlx.mlx_fast_metal_kernel {
 
 /// Key-block boundaries of the passes over `nk` key blocks: one dispatch for a
 /// sliding window (a tile reads only its band) or a grid too small to drift apart.
-fn passEdges(out: *[MAX_PASSES + 1]c_int, groups: c_int, nk: c_int, window: c_int) []const c_int {
+pub fn passEdges(out: *[MAX_PASSES + 1]c_int, groups: c_int, nk: c_int, window: c_int) []const c_int {
     const n_pass: c_int = if (window > 0 or groups < PASS_MIN_GROUPS)
         1
     else
