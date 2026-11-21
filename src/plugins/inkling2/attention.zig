@@ -269,3 +269,51 @@ test "inkling2 attention: a row's mask is its bias read backwards, zero past the
         try testing.expectEqualSlices(f32, cs.want, mlx.mlx_array_data_float32(got).?[0..cs.want.len]);
     }
 }
+
+// Bar: each part of the joined matmul is the separate projection's output, element for element, at a decode row and
+// a 2048-row chunk, on 4-bit g64 affine weights of the pack's q, rel, gate and sink shapes.
+test "inkling2 attention: the joined projections give each projection's own rows" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const loader = @import("../llama/load.zig");
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    var o: loader.Owned = .{};
+    defer o.release();
+    const widths = [_]c_int{ 3072, 384, 3072, 24 };
+    var lins: [4]Linear = undefined;
+    for (&lins, widths, 0..) |*l, n, i| {
+        const key = try g.call(mlx.mlx_random_key, .{@as(u64, i)});
+        const wf = try g.astype(try g.call(mlx.mlx_random_normal, .{ &[_]c_int{ n, 2304 }, @as(usize, 2), ops.Dtype.float32, @as(f32, 0), @as(f32, 0.05), key }), .bfloat16);
+        var qv = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(qv);
+        try mlx.check(mlx.mlx_quantize(&qv, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, g.s));
+        var parts: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+        for (&parts, 0..) |*p, j| try mlx.check(mlx.mlx_vector_array_get(p, qv, j));
+        try ops.evalMany(&parts);
+        l.* = .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = 4, .group_size = 64, .mode = .affine };
+    }
+    const j = try loader.join(&o, &.{ &lins[0], &lins[1], &lins[2], &lins[3] }, g.s);
+    try testing.expect(j.built());
+    for (lins) |l| try o.linear(l);
+    for ([_]c_int{ 1, 2048 }) |rows| {
+        const key = try g.call(mlx.mlx_random_key, .{@as(u64, @intCast(rows))});
+        const x = try g.astype(try g.call(mlx.mlx_random_normal, .{ &[_]c_int{ 1, rows, 2304 }, @as(usize, 3), ops.Dtype.float32, @as(f32, 0), @as(f32, 1), key }), .bfloat16);
+        const y = try j.lin.forward(&g, x);
+        for (lins, 0..) |l, i| {
+            const a = try g.astype(try j.part(&g, y, i), .float32);
+            const b = try g.astype(try l.forward(&g, x), .float32);
+            const off = try g.abs(try g.sub(a, b));
+            const differ = try g.call(mlx.mlx_sum, .{ try g.astype(try g.call(mlx.mlx_greater, .{ off, try g.scalar(0, .float32) }), .float32), false });
+            // In bf16 ulps of the separate projection's value.
+            const ulps = try g.call(mlx.mlx_max, .{ try g.div(off, try g.addScalar(try g.mulScalar(try g.abs(b), 1.0 / 128.0), 1e-30)), false });
+            try ops.evalMany(&.{ differ, ulps });
+            var d: f32 = 0;
+            var u: f32 = 0;
+            try mlx.check(mlx.mlx_array_item_float32(&d, differ));
+            try mlx.check(mlx.mlx_array_item_float32(&u, ulps));
+            if ((rows == 1 and d != 0) or u > 1.0) std.debug.print("joined part {d} at {d} rows: {d:.0} elements differ, worst {d:.2} ulp\n", .{ i, rows, d, u });
+            // A decode row is the same kernel either way; at chunk width MLX may tile a narrow projection differently.
+            if (rows == 1) try testing.expectEqual(@as(f32, 0), d) else try testing.expect(u <= 1.0);
+        }
+    }
+}
