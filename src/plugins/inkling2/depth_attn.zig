@@ -41,7 +41,7 @@ fn getKernel() !mlx.mlx_fast_metal_kernel {
     return k;
 }
 
-/// `bank` and `partial` `[1, L, H]` f32, `query` `[Q, H]` f32: `[1, L, Q, H]`. Null where it declines: off Metal,
+/// `bank` and `partial` `[1, L, H]` f32, `query` `[Q, H]` f32: `[1, L, Q, H]` (`[1, L, H]` for one query). Null where it declines: off Metal,
 /// more block states or queries than it binds, an input that is not f32.
 pub fn fused(g: *Graph, bank: []const Array, partial: Array, query: Array) !?Array {
     if (!mlx.streamIsGpu(g.s) or bank.len > MAX_BANK) return null;
@@ -57,7 +57,10 @@ pub fn fused(g: *Graph, bank: []const Array, partial: Array, query: Array) !?Arr
 
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ sh[0], sh[1], qs[0], d }, 4, .float32));
+    try mlx.check(if (qs[0] == 1)
+        mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ sh[0], sh[1], d }, 3, .float32)
+    else
+        mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ sh[0], sh[1], qs[0], d }, 4, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, rows * tg, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tg, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", @intCast(bank.len)));
@@ -109,7 +112,8 @@ test "inkling2 depth_attn: the kernel gives the op chain's rows at every bank si
         const query = try normal(&g, &.{ cs.q, cs.d }, 100 * n + 51, 4);
         const got = (try fused(&g, bank[0..cs.bank], partial, query)) orelse return error.KernelDeclined;
         // The op chain on the CPU: a tensor-unit GPU's f32 matmul is good to about 1e-3 of its largest product.
-        const want = try blocks.depthChain(&cpu, bank[0..cs.bank], partial, query);
+        const chain = try blocks.depthChain(&cpu, bank[0..cs.bank], partial, query);
+        const want = if (cs.q == 1) try blocks.row(&cpu, chain, 0) else chain;
         try testing.expectEqualSlices(c_int, ops.shape(want), ops.shape(got));
         const diff = try g.call(mlx.mlx_max, .{ try g.abs(try g.sub(got, want)), false });
         try ops.eval(diff);

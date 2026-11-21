@@ -68,6 +68,8 @@ pub const Layer = struct {
     mlp_conv: Array,
     /// q, k, v, mlp; a looped layer's.
     gates: ?[4]blocks.MessageGate = null,
+    /// `[4, hidden]` f32: a looped layer's q, k, v and mlp message queries.
+    message_query: Array = .{},
 };
 
 pub const Head = struct {
@@ -78,9 +80,7 @@ pub const Head = struct {
     /// The padded vocab's real rows, softcapped in f32.
     pub fn forward(w: *const Weights, c: *block.Ctx, x: Array) !Array {
         const g = c.g;
-        const logits = try g.astype(try head_block.project(g, &w.lin, x), .float32);
-        const capped = try g.mulScalar(try g.tanh(try g.mulScalar(logits, 1.0 / w.softcap)), w.softcap);
-        return g.sliceAxis(capped, 2, 0, w.vocab);
+        return g.sliceAxis(try compiled.softcap(g, try head_block.project(g, &w.lin, x), w.softcap), 2, 0, w.vocab);
     }
 };
 
@@ -91,8 +91,6 @@ pub const Model = struct {
         embed: b.embed.TableEmbed.Weights,
         embed_norm: Array,
         layers: []const Layer,
-        /// `[core, 4, hidden]` f32: each looped layer's q, k, v and mlp message queries.
-        message_query: Array = .{},
         final_query: Array,
         final_norm: Array,
         head: Head.Weights,
@@ -108,17 +106,28 @@ pub const Model = struct {
         g: *Graph,
         run: *const run_mod.Run,
         h: Array,
+        /// `h` widened to f32 where a visit made it (empty = cast on use).
+        h32: Array = .{},
         /// A residual a later pass restarts from: not dropped when the stream moves on.
         pinned: Array = .{},
+        pinned32: Array = .{},
         bank: [64]Array = undefined,
         blocks: usize = 0,
         visit: u32 = 0,
         visits: u32,
 
-        fn move(t: *Trunk, to: Array) !void {
+        fn move(t: *Trunk, to: Array, to32: Array) !void {
             const old = t.h;
+            const old32 = t.h32;
             t.h = try t.g.keep(to);
+            t.h32 = try t.g.keep(to32);
             if (old.ctx != t.pinned.ctx) t.g.drop(old);
+            if (old32.ctx != null and old32.ctx != t.pinned32.ctx) t.g.drop(old32);
+        }
+
+        /// The residual in f32, in `g`.
+        fn wide(t: *const Trunk, g: *Graph) !Array {
+            return if (t.h32.ctx != null) t.h32 else blocks.f32Of(g, t.h);
         }
 
         /// Layer `li` on the residual; `messages` `[1, L, 4, hidden]` in a pass after the first.
@@ -135,7 +144,7 @@ pub const Model = struct {
             const dt = ops.dtype(t.h);
             const hidden = ops.shape(t.h)[2];
             const kvd = L.attn.kv_heads * L.attn.head_dim;
-            const normed_in = try blocks.rms(g, try blocks.f32Of(g, t.h), 1e-6);
+            const normed_in = try blocks.rms(g, try t.wide(g), 1e-6);
 
             // The visit's conv windows: k | v | attention output | MLP output.
             const st = try kv.state(c, .conv);
@@ -148,12 +157,13 @@ pub const Model = struct {
                 }
             }
 
-            const attn_in: ?Array = if (L.attn_query.ctx != null) try blocks.depth(g, t.bank[0..t.blocks], normed_in, L.attn_query) else null;
             var qkv: [3]Array = @splat(t.h);
-            if (attn_in) |x| {
+            if (L.attn_query.ctx != null) {
+                const bank = t.bank[0..t.blocks];
                 if (L.global) {
+                    const x = try blocks.depth(g, bank, normed_in, L.attn_query);
                     for (&qkv, 0..) |*s, j| s.* = try blocks.row(g, x, @intCast(j));
-                } else qkv = @splat(try blocks.row(g, x, 0));
+                } else qkv = @splat(try blocks.depthOne(g, bank, normed_in, L.attn_query));
             }
             if (messages) |m| for (&qkv, 0..) |*s, j| {
                 s.* = try L.gates.?[j].forward(g, s.*, try blocks.row(g, m, @intCast(j)));
@@ -172,15 +182,20 @@ pub const Model = struct {
                 t.blocks += 1;
             } else res = try compiled.sum(g, t.h, ac.out);
 
-            var x = try blocks.row(g, try blocks.depth(g, t.bank[0..t.blocks], try blocks.rms(g, res, 1e-6), L.mlp_query), 0);
+            var x = try blocks.depthOne(g, t.bank[0..t.blocks], try blocks.rms(g, res, 1e-6), L.mlp_query);
             if (messages) |m| x = try L.gates.?[3].forward(g, x, try blocks.row(g, m, 3));
             const y = try moe.forward(&L.mlp, g, try g.astype(try g.rmsNorm(x, L.post_norm, eps), dt));
             const mc = try blocks.sconv(g, y, L.mlp_conv, prev[3]);
-            try kv.setState(c, .conv, try g.concat(&.{ a.k.state, a.v.state, ac.state, mc.state }, 2));
+            // The four windows side by side; the state is their last `K - 1` rows (copied off a chunk).
+            const wins = try g.concat(&.{ a.k.input, a.v.input, ac.input, mc.input }, 2);
+            const n = ops.shape(wins)[1];
+            const st_rows = try g.sliceAxis(wins, 1, n - (ops.shape(L.mlp_conv)[1] - 1), n);
+            try kv.setState(c, .conv, try g.contiguous(st_rows));
             // A verify forward's rejected rows are rolled back from the conv inputs.
-            if (c.capture_spec) try kv.setState(c, .conv_input, try g.concat(&.{ a.k.input, a.v.input, ac.input, mc.input }, 2));
+            if (c.capture_spec) try kv.setState(c, .conv_input, wins);
 
-            try t.move(try compiled.sumAs(g, res, mc.out));
+            const next = try compiled.sumBoth(g, res, mc.out);
+            try t.move(next[0], next[1]);
             try t.run.capture(t.g, t.visit, t.h);
             try t.run.cadence(t.visit, t.visits, t.h);
             t.visit += 1;
@@ -198,6 +213,7 @@ pub const Model = struct {
 
         for (0..w.core_start) |i| try t.apply(i, null);
         t.pinned = t.h;
+        t.pinned32 = t.h32;
         const base = t.blocks;
         var heard: [64]Array = undefined;
         for (0..w.passes) |pass| {
@@ -208,21 +224,22 @@ pub const Model = struct {
             // The previous pass as the next one hears it: its block states after the first, and its output.
             const said = t.blocks - (base + 1);
             @memcpy(heard[0..said], t.bank[base + 1 .. t.blocks]);
-            const last = try g.keep(try blocks.rms(g, try blocks.f32Of(g, t.h), 1e-6));
+            const last = try g.keep(try blocks.rms(g, try t.wide(g), 1e-6));
             if (t.h.ctx != t.pinned.ctx) g.drop(t.h);
+            if (t.h32.ctx != null and t.h32.ctx != t.pinned32.ctx) g.drop(t.h32);
             t.h = t.pinned;
+            t.h32 = t.pinned32;
             t.blocks = base;
             for (w.core_start..w.core_end) |i| {
-                const j: c_int = @intCast(i - w.core_start);
-                const query = try g.reshape(try g.sliceAxis(w.message_query, 0, j, j + 1), ops.shape(w.message_query)[1..]);
-                try t.apply(i, try blocks.depth(g, heard[0..said], last, query));
+                try t.apply(i, try blocks.depth(g, heard[0..said], last, w.layers[i].message_query));
             }
         }
         t.pinned = .{};
+        t.pinned32 = .{};
         for (w.core_end..n) |i| try t.apply(i, null);
 
-        const normed = try blocks.rms(g, try blocks.f32Of(g, t.h), 1e-6);
-        const mixed = try blocks.row(g, try blocks.depth(g, t.bank[0..t.blocks], normed, w.final_query), 0);
+        const normed = try blocks.rms(g, try t.wide(g), 1e-6);
+        const mixed = try blocks.depthOne(g, t.bank[0..t.blocks], normed, w.final_query);
         const final = try g.astype(try g.rmsNorm(mixed, w.final_norm, w.eps), ops.dtype(t.h));
         // A drafter's last tap: the final-normed output, published one past the last visit.
         try run.capture(g, t.visits, final);
@@ -316,6 +333,17 @@ const Load = struct {
         return kept;
     }
 
+    /// Row `j` of an evaluated `[n, ...]` tensor, as its own evaluated copy.
+    fn row(l: *Load, x: Array, j: c_int) !Array {
+        var g = Graph.init(gpa, l.r.s);
+        defer g.deinit();
+        const y = try g.contiguous(try g.reshape(try g.sliceAxis(x, 0, j, j + 1), ops.shape(x)[1..]));
+        try ops.eval(y);
+        const kept = g.escape(y);
+        try l.o.own(kept);
+        return kept;
+    }
+
     fn gate(l: *Load, i: usize, comptime which: []const u8) !blocks.MessageGate {
         return .{
             .down = try l.made("layers.{d}." ++ which ++ "_message_gate.down_proj.weight", .{i}, .{ .t = true, .dt = null }),
@@ -349,6 +377,10 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     m.layers = try gpa.alloc(Layer, c.num_hidden_layers);
     for (m.layers, 0..) |*L, i| L.* = try loadLayer(&l, c, i);
 
+    if (c.passes > 1) {
+        const all = try l.made("message_input.query", .{}, .{});
+        for (m.layers[c.core_start..c.core_end], 0..) |*L, j| L.message_query = try l.row(all, @intCast(j));
+    }
     if (c.vision) |v| m.tower = try vision.Tower.load(&r, &m.owned, v);
 
     const embed = try r.tableAt(try l.name("embed_tokens", .{}), hidden);
@@ -359,9 +391,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         .embed = .{ .table = embed, .hidden = h, .act = .bfloat16 },
         .embed_norm = try l.need("embed_norm.weight", .{}),
         .layers = m.layers,
-        .message_query = if (c.passes > 1) try l.made("message_input.query", .{}, .{}) else .{},
         .final_query = try l.made("final_input.query", .{}, .{ .sh = &.{ 1, h } }),
-        .final_norm = try l.need("norm.weight", .{}),
+        .final_norm = try l.made("norm.weight", .{}, .{}),
         .head = .{ .lin = unembed, .vocab = @intCast(c.unpadded_vocab_size), .softcap = c.logit_softcap },
         .core_start = c.core_start,
         .core_end = c.core_end,
@@ -425,10 +456,12 @@ fn loadLayer(l: *Load, c: *const config.Config, i: usize) !Layer {
     mlp.gate_up = try l.bank(i, "gate_up_proj", hidden, &mlp.gate_up_scale);
     mlp.down = try l.bank(i, "down_proj", c.intermediate_size, &mlp.down_scale);
 
+    // f32 where the input is (every layer but 0, whose input is the bf16 embedding), so no forward casts them.
+    const norm_dt: ?mlx.mlx_dtype = if (i > 0) .float32 else null;
     var in_norm: [3]Array = undefined;
     if (global) {
-        inline for (&in_norm, .{ "q", "k", "v" }) |*n, which| n.* = try l.need("layers.{d}." ++ which ++ "_input_layernorm.weight", .{i});
-    } else in_norm = @splat(try l.need("layers.{d}.input_layernorm.weight", .{i}));
+        inline for (&in_norm, .{ "q", "k", "v" }) |*n, which| n.* = try l.made("layers.{d}." ++ which ++ "_input_layernorm.weight", .{i}, .{ .dt = norm_dt });
+    } else in_norm = @splat(try l.made("layers.{d}.input_layernorm.weight", .{i}, .{ .dt = norm_dt }));
 
     return .{
         .global = global,
@@ -437,7 +470,7 @@ fn loadLayer(l: *Load, c: *const config.Config, i: usize) !Layer {
         .in_norm = in_norm,
         .attn_query = if (i > 0) try l.made("layers.{d}.attention_input.query", .{i}, .{ .sh = &.{ if (global) 3 else 1, h } }) else .{},
         .mlp_query = try l.made("layers.{d}.mlp_input.query", .{i}, .{ .sh = &.{ 1, h } }),
-        .post_norm = try l.need("layers.{d}.post_attention_layernorm.weight", .{i}),
+        .post_norm = try l.made("layers.{d}.post_attention_layernorm.weight", .{i}, .{}),
         .mlp = mlp,
         .attn_conv = try l.need("layers.{d}.post_attention_convolution.conv1d.weight", .{i}),
         .mlp_conv = try l.need("layers.{d}.post_mlp_convolution.conv1d.weight", .{i}),

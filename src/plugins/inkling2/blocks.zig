@@ -23,8 +23,18 @@ pub const l2Clip = compiled.l2Clip;
 /// Learned queries `[Q, H]` attend over the depth sources of each token (the `bank`'s block states, then `partial`,
 /// all `[1, L, H]` f32, which are also the values): `[1, L, Q, H]`.
 pub fn depth(g: *Graph, bank: []const Array, partial: Array, query: Array) !Array {
+    if (ops.shape(query)[0] == 1) {
+        const sh = ops.shape(partial);
+        return g.reshape(try depthOne(g, bank, partial, query), &.{ sh[0], sh[1], 1, sh[2] });
+    }
     if (try @import("depth_attn.zig").fused(g, bank, partial, query)) |out| return out;
     return depthChain(g, bank, partial, query);
+}
+
+/// `depth` for one query `[1, H]`: `[1, L, H]`.
+pub fn depthOne(g: *Graph, bank: []const Array, partial: Array, query: Array) !Array {
+    if (try @import("depth_attn.zig").fused(g, bank, partial, query)) |out| return out;
+    return row(g, try depthChain(g, bank, partial, query), 0);
 }
 
 /// `depth` as ops: the sources stacked, scored, softmaxed and mixed.
