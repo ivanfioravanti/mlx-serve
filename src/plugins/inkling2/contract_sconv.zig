@@ -242,12 +242,13 @@ fn convSpec(comptime name: []const u8, comptime dynamic: bool, comptime post: u8
     };
 }
 
-/// A decode row and a verify window at the widths the pack convolves: k and v (1024), the hidden width (2304).
+/// A decode row, a verify window and short prefill chunks at the widths the pack convolves: k and v (1024), the hidden
+/// width (2304).
 /// The post-MLP conv also takes the 8 experts' outputs and sums them itself.
 const registrations = .{
-    .{ "inkling2_sconv (static)", false, 0, &[_]Shape{ .{ .rows = 1, .n = 2304, .k = K }, .{ .rows = 9, .n = 1024, .k = K } } },
-    .{ "inkling2_sconv (dynamic, 8 heads)", true, 0, &[_]Shape{ .{ .rows = 1, .n = 1024, .k = K }, .{ .rows = 9, .n = 1024, .k = K } } },
-    .{ "inkling2_sconv (static, 8 experts summed)", false, 8, &[_]Shape{ .{ .rows = 1, .n = 2304, .k = K }, .{ .rows = 9, .n = 2304, .k = K } } },
+    .{ "inkling2_sconv (static)", false, 0, &[_]Shape{ .{ .rows = 1, .n = 2304, .k = K }, .{ .rows = 9, .n = 1024, .k = K }, .{ .rows = 33, .n = 2304, .k = K }, .{ .rows = 64, .n = 1024, .k = K } } },
+    .{ "inkling2_sconv (dynamic, 8 heads)", true, 0, &[_]Shape{ .{ .rows = 1, .n = 1024, .k = K }, .{ .rows = 9, .n = 1024, .k = K }, .{ .rows = 64, .n = 1024, .k = K } } },
+    .{ "inkling2_sconv (static, 8 experts summed)", false, 8, &[_]Shape{ .{ .rows = 1, .n = 2304, .k = K }, .{ .rows = 9, .n = 2304, .k = K }, .{ .rows = 64, .n = 2304, .k = K } } },
 };
 
 /// k's L2 clip and v's RMS norm after the conv, over the 8 KV heads of 128.
@@ -257,7 +258,7 @@ const post_registrations = .{
     .{ "inkling2_sconv (dynamic, k clip)", true, 2 },
     .{ "inkling2_sconv (dynamic, v rms)", true, 1 },
 };
-const post_shapes = &[_]Shape{ .{ .rows = 1, .n = 1024, .k = K }, .{ .rows = 9, .n = 1024, .k = K } };
+const post_shapes = &[_]Shape{ .{ .rows = 1, .n = 1024, .k = K }, .{ .rows = 9, .n = 1024, .k = K }, .{ .rows = 64, .n = 1024, .k = K } };
 
 pub fn register(set: *kc.Set) !void {
     inline for (registrations) |r| try set.add(Conv, .init(set.a, &launch, r[1], r[2]), convSpec(r[0], r[1], 0, r[3]), null);

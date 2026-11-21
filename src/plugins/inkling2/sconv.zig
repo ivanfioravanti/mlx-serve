@@ -13,8 +13,8 @@ pub const SOURCE = kernelSource("plugins/inkling2/kernels/sconv.metal");
 pub const INPUTS = [_][*:0]const u8{ "x", "prev", "w", "dyn", "wts", "scale", "post" };
 pub const OUTPUTS = [_][*:0]const u8{ "out", "win" };
 pub const TG = 256;
-/// Rows it takes (a decode row, a verify window); a prefill chunk keeps MLX's conv.
-pub const MAX_ROWS = 16;
+/// Rows it takes (a decode row, a verify window, a short prefill chunk); a wider chunk keeps MLX's conv.
+pub const MAX_ROWS = 64;
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 
