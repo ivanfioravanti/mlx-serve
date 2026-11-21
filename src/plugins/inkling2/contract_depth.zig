@@ -49,7 +49,7 @@ const Depth = struct {
         if (shape.n > depth_attn.MAX_BANK or shape.k < 32) return null;
         const tg: c_int = @intCast(depth_attn.threads(shape.k));
         var g = metal.Geometry{ .grid = .{ ci(shape.rows) * tg, 1, 1 }, .tg = .{ tg, 1, 1 } };
-        g.out(&.{ 1, ci(shape.rows), ci(self.queries), ci(shape.k) }, .float32);
+        if (self.queries == 1) g.out(&.{ 1, ci(shape.rows), ci(shape.k) }, .float32) else g.out(&.{ 1, ci(shape.rows), ci(self.queries), ci(shape.k) }, .float32);
         g.int("K", shape.n);
         g.int("D", shape.k);
         g.int("Q", self.queries);

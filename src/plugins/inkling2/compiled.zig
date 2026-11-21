@@ -12,6 +12,18 @@ const Array = ops.Array;
 /// `body` over `n` arrays: `call` runs it through its compiled closure, or as plain ops where there is none.
 fn Compiled(comptime n: usize, comptime body: fn (*Graph, [n]Array) anyerror!Array) type {
     return struct {
+        fn one(g: *Graph, a: [n]Array) anyerror![1]Array {
+            return .{try body(g, a)};
+        }
+        pub fn call(g: *Graph, args: [n]Array) !Array {
+            return (try Multi(n, 1, one).call(g, args))[0];
+        }
+    };
+}
+
+/// `Compiled` with `m` outputs, all made by one closure.
+fn Multi(comptime n: usize, comptime m: usize, comptime body: fn (*Graph, [n]Array) anyerror![m]Array) type {
+    return struct {
         var closure: mlx.mlx_closure = .{ .ctx = null };
         var stream: ops.Stream = undefined;
         var tried = false;
@@ -27,11 +39,11 @@ fn Compiled(comptime n: usize, comptime body: fn (*Graph, [n]Array) anyerror!Arr
                 if (rc != 0) return -1;
             }
             const out = body(&g, args) catch return -1;
-            res.* = mlx.mlx_vector_array_new_data(&[_]Array{out}, 1);
+            res.* = mlx.mlx_vector_array_new_data(&out, m);
             return 0;
         }
 
-        pub fn call(g: *Graph, args: [n]Array) !Array {
+        pub fn call(g: *Graph, args: [n]Array) ![m]Array {
             if (!mlx.streamOnGpuDevice(g.s)) return body(g, args);
             if (!tried) {
                 tried = true;
@@ -46,11 +58,14 @@ fn Compiled(comptime n: usize, comptime body: fn (*Graph, [n]Array) anyerror!Arr
             var out = mlx.mlx_vector_array{ .ctx = null };
             defer _ = mlx.mlx_vector_array_free(out);
             try mlx.check(mlx.mlx_closure_apply(&out, closure, in));
-            var r = mlx.mlx_array_new();
-            const rc = mlx.mlx_vector_array_get(&r, out, 0);
-            const kept = try g.adopt(r);
-            try mlx.check(rc);
-            return kept;
+            var res: [m]Array = undefined;
+            for (&res, 0..) |*r, i| {
+                var x = mlx.mlx_array_new();
+                const rc = mlx.mlx_vector_array_get(&x, out, i);
+                r.* = try g.adopt(x);
+                try mlx.check(rc);
+            }
+            return res;
         }
     };
 }
@@ -113,6 +128,16 @@ pub fn residualScale(g: *Graph, y: Array, x: Array, by: f32) !Array {
     return Compiled(3, residualScaleBody).call(g, .{ y, x, try g.scalar(by, .float32) });
 }
 
+fn softcapBody(g: *Graph, a: [3]Array) !Array {
+    const x, const inv, const cap = a;
+    return g.mul(try g.tanh(try g.mul(try g.astype(x, .float32), inv)), cap);
+}
+
+/// `cap * tanh(x * (1 / cap))` in f32.
+pub fn softcap(g: *Graph, x: Array, cap: f32) !Array {
+    return Compiled(3, softcapBody).call(g, .{ x, try g.scalar(1 / cap, .float32), try g.scalar(cap, .float32) });
+}
+
 fn sumBody(g: *Graph, a: [2]Array) !Array {
     return g.add(try g.astype(a[0], .float32), try g.astype(a[1], .float32));
 }
@@ -129,6 +154,16 @@ fn sumAsBody(g: *Graph, a: [2]Array) !Array {
 /// `a + b` in f32, in `b`'s dtype.
 pub fn sumAs(g: *Graph, a: Array, b: Array) !Array {
     return Compiled(2, sumAsBody).call(g, .{ a, b });
+}
+
+fn sumBothBody(g: *Graph, a: [2]Array) ![2]Array {
+    const rounded = try sumAsBody(g, a);
+    return .{ rounded, try g.astype(rounded, .float32) };
+}
+
+/// `sumAs` and its value in f32 (the rounded sum, widened), from one kernel.
+pub fn sumBoth(g: *Graph, a: Array, b: Array) ![2]Array {
+    return Multi(2, 2, sumBothBody).call(g, .{ a, b });
 }
 
 // ── tests ──
@@ -173,8 +208,13 @@ test "inkling2 compiled: the closures give the op chains' values, in the input's
         const m = try randn(&g, &.{ 1, 5, 16 }, 7, .float32);
         try testing.expect(try maxDiff(&g, try gateMix(&g, m, h, h, m), try gateMixBody(&g, .{ m, h, h, m })) <= 1e-5);
         try testing.expect(try maxDiff(&g, try sigmoidGate(&g, gate, up), try sigmoidGateBody(&g, .{ gate, up })) <= 1e-5);
+        try testing.expect(try maxDiff(&g, try softcap(&g, gate, 30), try softcapBody(&g, .{ gate, try g.scalar(1.0 / 30.0, .float32), try g.scalar(30, .float32) })) <= 1e-5 * 30);
         try testing.expect(try maxDiff(&g, try sum(&g, gate, up), try sumBody(&g, .{ gate, up })) <= 1e-5);
         try testing.expect(try maxDiff(&g, try sumAs(&g, h, try g.astype(m, dt)), try sumAsBody(&g, .{ h, try g.astype(m, dt) })) <= 1e-5);
+        const both = try sumBoth(&g, h, try g.astype(m, dt));
+        const both_want = try sumBothBody(&g, .{ h, try g.astype(m, dt) });
+        try testing.expect(try maxDiff(&g, both[0], both_want[0]) <= 1e-5);
+        try testing.expect(try maxDiff(&g, both[1], both_want[1]) <= 1e-5);
         try testing.expect(try maxDiff(&g, try residualScale(&g, gate, up, 0.5), try residualScaleBody(&g, .{ gate, up, try g.scalar(0.5, .float32) })) <= 1e-5);
     }
 }
