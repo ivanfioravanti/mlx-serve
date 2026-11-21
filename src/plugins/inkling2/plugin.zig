@@ -2,7 +2,8 @@
 //! run once, the core `num_passes` times (each pass restarts from the prelude's output and hears the previous pass
 //! only through message gates), then the tail. Every layer reads its attention and MLP inputs by depth attention
 //! over a bank of block states; a layer opening a block replaces the residual with its attention output. Each layer
-//! VISIT has its own KV and conv windows (`c.layer` is the visit). Serial, spec off.
+//! VISIT has its own KV and conv windows (`c.layer` is the visit). Images splice after the embedding norm
+//! (`vision.zig`). Serial, spec off.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -18,6 +19,7 @@ const loader = @import("../llama/load.zig");
 const attention = @import("attention.zig");
 const blocks = @import("blocks.zig");
 const moe = @import("moe.zig");
+const vision = @import("vision.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -38,6 +40,7 @@ pub const table = abi.ModelTable{
     .unload = &unload,
     .forward = &forward,
     .cache = &.{ .layout = config.layout },
+    .media = &.{ .tower = &vision.tower, .prepare = &vision.prepare },
     .weights = &.{},
 };
 
@@ -226,8 +229,11 @@ pub const Loaded = struct {
     base: bases.Model(Model),
     layers: []Layer = &.{},
     owned: loader.Owned = .{},
+    /// Null on a pack shipped without its tower.
+    tower: ?vision.Tower = null,
 
     fn release(m: *Loaded) void {
+        if (m.tower) |*t| t.deinit();
         m.owned.release();
         gpa.free(m.layers);
         m.base.shared.deinit();
@@ -320,13 +326,15 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     defer r.close();
     const m = try gpa.create(Loaded);
     errdefer gpa.destroy(m);
-    m.* = .{ .base = .{ .weights = undefined, .shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps), .a = gpa, .s = r.s } };
+    m.* = .{ .base = .{ .weights = undefined, .shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps), .a = gpa, .s = r.s, .placeholders = ctx.parsed.placeholder_ids } };
     errdefer m.release();
     var l: Load = .{ .r = &r, .o = &m.owned };
     const hidden = c.hidden_size;
     const h: c_int = @intCast(hidden);
     m.layers = try gpa.alloc(Layer, c.num_hidden_layers);
     for (m.layers, 0..) |*L, i| L.* = try loadLayer(&l, c, i);
+
+    if (c.vision) |v| m.tower = try vision.Tower.load(&r, &m.owned, v);
 
     const embed = try r.tableAt(try l.name("embed_tokens", .{}), hidden);
     try m.owned.linear(embed);
@@ -515,4 +523,5 @@ test {
     _ = config;
     _ = blocks;
     _ = attention;
+    _ = vision;
 }

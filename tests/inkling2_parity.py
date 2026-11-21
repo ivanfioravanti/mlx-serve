@@ -10,6 +10,21 @@ def post(path, body):
 TOL = 0.75
 ok = True
 for name, e in ref.items():
+    if "image_png_b64" in e:
+        # A chat with the image first, at the reference's default effort. A chat returns no logprobs for its thinking
+        # rows, so the bar is the prompt's length and a continuation that names what the picture holds.
+        content = [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + e["image_png_b64"]}}, {"type": "text", "text": e["question"]}]
+        r = post("/v1/chat/completions", {"messages": [{"role": "user", "content": content}], "max_tokens": 120, "temperature": 0, "reasoning_effort": "high", "stream": False})
+        m = r["choices"][0]["message"]
+        said = (m.get("reasoning_content") or "") + " | " + (m.get("content") or "")
+        n = r["usage"]["prompt_tokens"]
+        seen = [w for w in ("red", "green", "blue", "square", "circle") if w in said.lower()]
+        good = n == len(e["ids"]) and len(seen) == 5
+        ok &= good
+        print(f"{'ok  ' if good else 'FAIL'} {name}: {n} prompt tokens (reference {len(e['ids'])}), names {seen}")
+        print("     ours:", repr(said[:160]))
+        print("     ref :", repr(e["greedy_text"][:160]))
+        continue
     ids = post("/tokenize", {"content": e["text"], "add_special": False})["tokens"]
     r = post("/v1/completions", {"prompt": e["text"], "max_tokens": 25, "temperature": 0, "logprobs": 10, "stream": False})
     c = r["choices"][0]

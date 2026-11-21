@@ -26,6 +26,23 @@ pub const claims = sdk.claimsByType(&model_types);
 pub const max_layers = 128;
 pub const max_visits = 512;
 
+/// The image tower (`vision_config`): a ViT over `patch`-pixel patches whose `merge x merge` blocks become one row each.
+pub const Vision = struct {
+    hidden: u32 = 1024,
+    layers: u32 = 23,
+    heads: u32 = 16,
+    patch: u32 = 20,
+    merge: u32 = 2,
+    /// Side of the learned position grid the patch positions interpolate.
+    posemb_grid: u32 = 32,
+    proj_hidden: u32 = 4096,
+    eps: f32 = 1e-5,
+
+    pub fn block(v: Vision) u32 {
+        return v.patch * v.merge;
+    }
+};
+
 /// One attention geometry (the global layers', or the sliding layers').
 pub const Heads = struct { heads: u32, kv_heads: u32, head_dim: u32 };
 
@@ -60,6 +77,7 @@ pub const Config = struct {
     core_start: u32 = 0,
     core_end: u32 = 0,
     passes: u32 = 1,
+    vision: ?Vision = null,
     quant: abi.Quant = .{},
     block_json: []const u8 = "{}",
 
@@ -179,7 +197,22 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         if (i < c.num_hidden_layers) c.global[i] = false;
     }
 
-    var p: abi.Parsed = .{};
+    if (field(root, "vision_config")) |vv| if (vv == .object) {
+        var v: Vision = .{};
+        inline for (.{ .{ "hidden_size", &v.hidden }, .{ "num_hidden_layers", &v.layers }, .{ "num_attention_heads", &v.heads }, .{ "native_patch_size", &v.patch }, .{ "adapter_merge_size", &v.merge }, .{ "posemb_grid_size", &v.posemb_grid }, .{ "projection_hidden_dim", &v.proj_hidden } }) |f| {
+            if (field(vv.object, f[0])) |x| f[1].* = int(x) orelse return unsupported("vision_config." ++ f[0]);
+        }
+        if (field(vv.object, "layer_norm_eps")) |x| v.eps = @floatCast(float(x) orelse return unsupported("vision_config.layer_norm_eps"));
+        if (field(vv.object, "projector_bias")) |x| if (x != .bool or x.bool) return unsupported("a projector bias");
+        if (v.hidden == 0 or v.hidden > 1 << 14 or v.layers == 0 or v.layers > 128 or v.heads == 0 or v.hidden % v.heads != 0 or
+            (v.hidden / v.heads) % 4 != 0 or v.patch == 0 or v.patch > 64 or v.merge == 0 or v.merge > 8 or
+            v.posemb_grid == 0 or v.posemb_grid > 1024 or v.proj_hidden == 0)
+            return unsupported("vision dimensions out of range");
+        c.vision = v;
+    };
+
+    var p: abi.Parsed = .{ .caps = .{ .images = c.vision != null } };
+    if (c.vision != null) p.placeholder_ids.image = if (field(root, "image_token_id")) |x| int(x) orelse return unsupported("image_token_id") else 200054;
     const s = &p.shell;
     s.* = .{
         .vocab_size = c.unpadded_vocab_size,
@@ -273,6 +306,9 @@ pub const mini_4bit =
     \\"intermediate_size":1152,"mlp_gate_softcap":4.0,"mlp_up_softcap":25.0,"route_scale":8.0,"use_gate_bias":true,
     \\"local_layer_ids":[0,1,2,3,4,6,7,8,9,10,12,13,14,15,16,18,19,20,21,22],
     \\"loop_config":{"core_start":6,"core_end":18,"num_passes":3,"gate_rank":64,"is_varloop":false}},
+    \\"vision_config":{"temporal_patch_size":2,"native_patch_size":20,"adapter_merge_size":2,
+    \\"projection_hidden_dim":4096,"projector_bias":false,"hidden_size":1024,"num_hidden_layers":23,
+    \\"num_attention_heads":16,"mlp_ratio":4.0,"posemb_grid_size":32,"layer_norm_eps":1e-05},
     \\"quantization":{"group_size":64,"bits":4,"mode":"affine"}}
 ;
 
@@ -285,6 +321,7 @@ test "inkling2 config: the Mini pack's loop gives 48 visits, each with its own c
     try testing.expectEqual(@as(u32, 48), p.shell.num_hidden_layers);
     try testing.expectEqual(@as(u32, 48), p.cache.ssm_state.entries);
     try testing.expectEqual(@as(u32, 200058), p.shell.vocab_size);
+    try testing.expect(p.caps.images and p.placeholder_ids.image == 200054 and c.vision.?.block() == 40);
     // Prelude, three passes over 6..17, coda.
     const want = [_]u32{ 0, 5, 6, 17, 6, 17, 6, 17, 18, 23 };
     for ([_]u32{ 0, 5, 6, 17, 18, 29, 30, 41, 42, 47 }, want) |v, layer| try testing.expectEqual(layer, c.layerOf(v));
