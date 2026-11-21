@@ -573,4 +573,5 @@ test {
     _ = attention;
     _ = vision;
     _ = @import("l2_clip.zig");
+    _ = @import("sconv.zig");
 }

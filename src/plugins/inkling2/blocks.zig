@@ -103,12 +103,21 @@ fn tail(g: *Graph, win: Array, k: c_int) !Array {
     return g.contiguous(try g.sliceAxis(win, 1, n - (k - 1), n));
 }
 
+const sconv_kernel = @import("sconv.zig");
+
+/// The kernel's output and window; the state is a view of the window's last `k - 1` rows.
+fn fromKernel(g: *Graph, out: Array, win: Array, k: c_int) !Conv {
+    const n = ops.shape(win)[1];
+    return .{ .out = out, .state = try g.sliceAxis(win, 1, n - (k - 1), n), .input = win };
+}
+
 /// `input` is the whole conv input `[1, K-1+L, C]` (what a verify forward leaves for the rollback).
 pub const Conv = struct { out: Array, state: Array, input: Array };
 
 /// Depthwise causal conv `w` `[C, K, 1]` in the weight's dtype plus the input, over `sqrt(K + 1)`.
 pub fn sconv(g: *Graph, x: Array, w: Array, prev: ?Array) !Conv {
     const k = ops.shape(w)[1];
+    if (try sconv_kernel.fused(g, x, w, prev, null, 1.0 / @sqrt(@as(f32, @floatFromInt(k + 1))))) |r| return fromKernel(g, r.out, r.win, k);
     const x32 = try f32Of(g, x);
     const win = try window(g, x32, prev, k);
     const y = try g.conv1d(try g.astype(win, ops.dtype(w)), w, 1, 0, 1, ops.shape(x)[2]);
@@ -119,6 +128,8 @@ pub fn sconv(g: *Graph, x: Array, w: Array, prev: ?Array) !Conv {
 /// A global layer's conv on k or v: per-head taps `static` `[K, C]` plus `dynamic` `[1, L, heads * K]` (the layer
 /// input's projection), plus the input, over `sqrt(2K + 1)`.
 pub fn dynamicSconv(g: *Graph, x: Array, dynamic: Array, static: Array, heads: c_int, prev: ?Array) !Conv {
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(2 * ops.shape(static)[0] + 1)));
+    if (try sconv_kernel.fused(g, x, static, prev, .{ .dyn = dynamic, .heads = heads }, scale)) |r| return fromKernel(g, r.out, r.win, ops.shape(static)[0]);
     const sh = ops.shape(x);
     const l = sh[1];
     const c = sh[2];
