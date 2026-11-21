@@ -28,6 +28,7 @@ pub const Args = struct {
 };
 
 pub fn attend(g: *Graph, a: Args) !Array {
+    if (try @import("rel_attn_nax.zig").nax(g, a)) |out| return out;
     if (try simd(g, a)) |out| return out;
     return reference(g, a);
 }

@@ -175,6 +175,11 @@ pub fn computeQuantParams(model: QuantParams, w: mlx.mlx_array, sc: mlx.mlx_arra
             }
             return model;
         }
+        // An fp override inside an affine pack: the geometry names the mode where the caller knows the input width.
+        if (in_dim) |in| if (in > 0 and s_cols > 0 and (w_cols * 32) % in == 0 and in % s_cols == 0) {
+            const bits = (w_cols * 32) / in;
+            if (fpQuantModeFor(bits, in / s_cols)) |mode| return .{ .bits = bits, .group_size = in / s_cols, .mode = mode };
+        };
         const gs: u32 = if (w_cols > 0 and s_cols > 0) (w_cols * 32) / (s_cols * 8) else 32;
         return .{ .bits = 8, .group_size = gs, .mode = .mxfp8 };
     }
@@ -459,6 +464,25 @@ test "computeQuantParams resolves mixed nvfp4 + affine-override weights" {
     try testing.expectEqual(QuantMode.affine, qp_plain.mode);
     try testing.expectEqual(@as(u32, 8), qp_plain.bits);
     try testing.expectEqual(@as(u32, 64), qp_plain.group_size);
+}
+
+// Bar: Inkling 2 Mini's 4-bit affine pack keeps its experts in the checkpoint's NVFP4 (g16) and MXFP8 banks.
+test "computeQuantParams resolves an NVFP4 or MXFP8 expert bank inside an affine pack" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const model: QuantParams = .{ .bits = 4, .group_size = 64, .mode = .affine };
+    inline for (.{ .{ 288, 144, QuantMode.nvfp4, 4, 16 }, .{ 576, 72, QuantMode.mxfp8, 8, 32 } }) |c| {
+        var w = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w);
+        try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ 2, 8, c[0] }, 3, .uint32, s));
+        var sc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc);
+        try mlx.check(mlx.mlx_zeros(&sc, &[_]c_int{ 2, 8, c[1] }, 3, .uint8, s));
+        const qp = computeQuantParams(model, w, sc, 2304);
+        try std.testing.expectEqual(c[2], qp.mode);
+        try std.testing.expectEqual(@as(u32, c[3]), qp.bits);
+        try std.testing.expectEqual(@as(u32, c[4]), qp.group_size);
+    }
 }
 
 test "QuantParamsCache put/lookup round-trip" {

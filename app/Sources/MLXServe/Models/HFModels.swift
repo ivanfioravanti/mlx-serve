@@ -26,7 +26,7 @@ private let supportedArchitectureTagPrefixes: [String] = [
     "hunyuan",    // Tencent Hunyuan 3 (model_type hy_v3) — repos tag "hunyuan"
     "hy_v3",      // …and/or the model_type verbatim (some tag only that)
     "laguna",     // poolside Laguna S 2.1 — repos tag "laguna" and/or "laguna-s-2.1"
-    "inkling",    // Thinking Machines Inkling Small — repos tag "inkling" and/or "inkling_mm_model"
+    "inkling",    // Thinking Machines Inkling Small and Inkling 2 — repos tag "inkling", "inkling_mm_model", "inkling2_loop"
     "muse",       // meta-models Muse-Glimmer-30B — repos tag "muse_glimmer" (and *_text)
     "bailing",    // inclusionAI Ling 3.0 — repos tag "bailing_moe_v3" and/or "bailing_hybrid"
     "ling",       // …and/or the family name
@@ -58,6 +58,7 @@ let supportedModelTypes: Set<String> = [
     "mimo_v2", "mimo_v2_flash", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout packs)
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA hybrid MoE, text + vision)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
+    "inkling2_loop", // Thinking Machines Inkling 2 Mini (26B-A5.4B looped MoE, text + vision)
     "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text + vision)
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
