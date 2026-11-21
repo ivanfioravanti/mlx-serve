@@ -489,6 +489,9 @@ Used in mlx-serve:
     `_attention_reference`, and `kernels/rel_attn.metal` computes what
     `kernels.py`'s `relative_attention` does (the relative-position bias and
     the per-row sink logit inside a causal flash attention).
+  * `src/plugins/inkling2/kernels/depth_attn.metal` ports the same PR's
+    `depth_attention` kernel, and `src/plugins/inkling2/compiled.zig` compiles
+    the elementwise chains it compiles (`_l2_clip`, `_softcapped_swiglu`).
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c, and the GDN
 kernel is extended by a sequence variant (`GDN_KERNEL_SEQ_SOURCE`) that records

@@ -23,6 +23,12 @@ pub const l2Clip = compiled.l2Clip;
 /// Learned queries `[Q, H]` attend over the depth sources of each token (the `bank`'s block states, then `partial`,
 /// all `[1, L, H]` f32, which are also the values): `[1, L, Q, H]`.
 pub fn depth(g: *Graph, bank: []const Array, partial: Array, query: Array) !Array {
+    if (try @import("depth_attn.zig").fused(g, bank, partial, query)) |out| return out;
+    return depthChain(g, bank, partial, query);
+}
+
+/// `depth` as ops: the sources stacked, scored, softmaxed and mixed.
+pub fn depthChain(g: *Graph, bank: []const Array, partial: Array, query: Array) !Array {
     var parts: [64]Array = undefined;
     std.debug.assert(bank.len < parts.len);
     for (bank, 0..) |x, i| parts[i] = try g.expandDims(x, 2);
