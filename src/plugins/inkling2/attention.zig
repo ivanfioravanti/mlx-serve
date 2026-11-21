@@ -99,8 +99,8 @@ pub fn forward(w: *const Weights, c: *Ctx, qs: Array, ks: Array, vs: Array, k_pr
         .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd))),
         .window = w.window,
     });
-    const gated = try g.mul(try blocks.f32Of(g, try g.reshape(out, &.{ 1, l, w.heads * hd })), try g.sigmoid(try blocks.f32Of(g, gate)));
-    return .{ .out = try w.o.forward(g, try g.astype(gated, ops.dtype(gate))), .k = kc, .v = vc };
+    const gated = try @import("compiled.zig").sigmoidGate(g, try g.reshape(out, &.{ 1, l, w.heads * hd }), gate);
+    return .{ .out = try w.o.forward(g, gated), .k = kc, .v = vc };
 }
 
 /// `1 + alpha * log(max((position + 1) / floor, 1))` per query row, `[1, L, 1, 1]` f32.

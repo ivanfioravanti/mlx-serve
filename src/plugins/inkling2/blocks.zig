@@ -17,14 +17,8 @@ pub fn rms(g: *Graph, x: Array, eps: f32) !Array {
     return g.rmsNorm(x, .{}, eps);
 }
 
-/// `x * scale` (null = 1) shrunk to L2 norm `threshold` over the last axis, in f32, cast back.
-pub fn l2Clip(g: *Graph, x: Array, scale: ?Array, threshold: f32) !Array {
-    var st = try f32Of(g, x);
-    if (scale) |s| st = try g.mul(st, try f32Of(g, s));
-    const norm = try g.sqrt(try g.sum(try g.square(st), -1, true));
-    const factor = try g.minimum(try g.div(try g.scalar(threshold, .float32), try g.addScalar(norm, 1e-6)), try g.scalar(1, .float32));
-    return g.astype(try g.mul(st, factor), ops.dtype(x));
-}
+const compiled = @import("compiled.zig");
+pub const l2Clip = compiled.l2Clip;
 
 /// Learned queries `[Q, H]` attend over the depth sources of each token (the `bank`'s block states, then `partial`,
 /// all `[1, L, H]` f32, which are also the values): `[1, L, Q, H]`.
@@ -59,9 +53,7 @@ pub const MessageGate = struct {
         const h = try f32Of(g, hidden);
         const pair = try g.concat(&.{ try rms(g, h, 1e-6), try rms(g, message, 1e-6) }, 2);
         const st = try f32Of(g, try g.matmul(try g.astype(pair, ops.dtype(w.down)), w.down));
-        const forget = try g.tanh(try g.matmul(st, w.forget));
-        const gain = try g.tanh(try g.matmul(st, w.message));
-        return g.add(try g.mul(try g.sub(try g.scalar(1, .float32), forget), h), try g.mul(gain, message));
+        return compiled.gateMix(g, try g.matmul(st, w.forget), try g.matmul(st, w.message), h, message);
     }
 };
 
@@ -87,8 +79,8 @@ pub fn sconv(g: *Graph, x: Array, w: Array, prev: ?Array) !Conv {
     const x32 = try f32Of(g, x);
     const win = try window(g, x32, prev, k);
     const y = try g.conv1d(try g.astype(win, ops.dtype(w)), w, 1, 0, 1, ops.shape(x)[2]);
-    const out = try g.mulScalar(try g.add(try f32Of(g, y), x32), 1.0 / @sqrt(@as(f32, @floatFromInt(k + 1))));
-    return .{ .out = try g.astype(out, ops.dtype(x)), .state = try tail(g, win, k), .input = win };
+    const out = try compiled.residualScale(g, y, x, 1.0 / @sqrt(@as(f32, @floatFromInt(k + 1))));
+    return .{ .out = out, .state = try tail(g, win, k), .input = win };
 }
 
 /// A global layer's conv on k or v: per-head taps `static` `[K, C]` plus `dynamic` `[1, L, heads * K]` (the layer
@@ -111,8 +103,8 @@ pub fn dynamicSconv(g: *Graph, x: Array, dynamic: Array, static: Array, heads: c
     }
     const wins = try g.reshape(try g.concat(lags[0..@intCast(k)], 3), &.{ sh[0], l, heads, d, k });
     const y = try g.reshape(try g.sum(try g.mul(wins, taps), -1, false), &.{ sh[0], l, c });
-    const out = try g.mulScalar(try g.add(y, x32), 1.0 / @sqrt(@as(f32, @floatFromInt(2 * k + 1))));
-    return .{ .out = try g.astype(out, ops.dtype(x)), .state = try tail(g, win, k), .input = win };
+    const out = try compiled.residualScale(g, y, x, 1.0 / @sqrt(@as(f32, @floatFromInt(2 * k + 1))));
+    return .{ .out = out, .state = try tail(g, win, k), .input = win };
 }
 
 // ── tests ──

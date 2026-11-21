@@ -6,6 +6,8 @@ const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const Bank = @import("../../sdk/bases/blocks/moe.zig").Bank;
 const gatherExpertMm = @import("../../sdk/blocks/moe/experts.zig").gatherExpertMm;
+const compiled = @import("compiled.zig");
+const router_kernel = @import("../../sdk/blocks/moe/router_kernel.zig");
 
 const Graph = ops.Graph;
 const Array = ops.Array;
@@ -26,18 +28,32 @@ pub const Weights = struct {
     up_softcap: f32,
 };
 
-fn softcap(g: *Graph, x: Array, cap: f32) !Array {
-    return g.mulScalar(try g.tanh(try g.mulScalar(x, 1.0 / cap)), cap);
-}
-
-fn gather(g: *Graph, x: Array, bank: *const Bank, rhs: Array) !Array {
+fn gather(g: *Graph, x: Array, bank: *const Bank, rhs: Array, sorted: bool) !Array {
     var y = mlx.mlx_array_new();
-    gatherExpertMm(&y, x, bank.w, bank.s, bank.b, .{ .ctx = null }, rhs, bank.qp.bits, bank.qp.group_size, bank.qp.mode, true, g.s) catch |e| {
+    gatherExpertMm(&y, x, bank.w, bank.s, bank.b, .{ .ctx = null }, rhs, bank.qp.bits, bank.qp.group_size, bank.qp.mode, sorted, g.s) catch |e| {
         _ = mlx.mlx_array_free(y);
         return e;
     };
     return g.adopt(y);
 }
+
+const Routing = struct { idx: Array, weights: Array };
+
+/// Each row's top-k experts by `sigmoid(logits) + bias` and their sigmoid scores, normalized and scaled: one
+/// kernel, or the op chain where it declines.
+fn route(w: *const Weights, g: *Graph, logits: Array) !Routing {
+    if (try router_kernel.moeRouterTopK(g.s, logits, w.bias, w.top_k, .sigmoid_bias, true, w.route_scale, .float32, 0, 0, null)) |r| {
+        return .{ .idx = try g.adopt(r.inds), .weights = try g.adopt(r.norm_scores) };
+    }
+    const scores = try g.sigmoid(logits);
+    const picked = try g.argpartition(try g.neg(try g.add(scores, w.bias)), w.top_k - 1, -1);
+    const idx = try g.astype(try g.sliceAxis(picked, 1, 0, w.top_k), .uint32);
+    const top = try g.takeAlong(scores, idx, 1);
+    return .{ .idx = idx, .weights = try g.mulScalar(try g.div(top, try g.addScalar(try g.sum(top, -1, true), 1e-20)), w.route_scale) };
+}
+
+/// Row-expert pairs from which the pairs are sorted by expert, so each expert's rows stream once (mlx-lm's bar).
+const SORT_PAIRS = 64;
 
 /// `x` `[1, L, hidden]` through its top-k experts, weighted and summed in f32, in `x`'s dtype.
 pub fn forward(w: *const Weights, g: *Graph, x: Array) !Array {
@@ -48,30 +64,33 @@ pub fn forward(w: *const Weights, g: *Graph, x: Array) !Array {
     const dt = ops.dtype(x);
     const flat = try g.reshape(x, &.{ t, d });
 
-    const scores = try g.sigmoid(try g.matmul(try g.astype(flat, .float32), w.router));
-    const picked = try g.argpartition(try g.neg(try g.add(scores, w.bias)), k - 1, -1);
-    const idx = try g.astype(try g.sliceAxis(picked, 1, 0, k), .uint32);
-    const top = try g.takeAlong(scores, idx, 1);
-    var weights = try g.mulScalar(try g.div(top, try g.addScalar(try g.sum(top, -1, true), 1e-20)), w.route_scale);
+    const routing = try route(w, g, try g.matmul(try g.astype(flat, .float32), w.router));
+    const idx = routing.idx;
+    var weights = routing.weights;
 
-    // Sorted by expert, so each expert's rows stream once.
     const ids = try g.reshape(idx, &.{t * k});
-    const order = try g.argsort(ids, 0);
-    const inv = try g.argsort(order, 0);
-    const sorted = try g.take(ids, order, 0);
-    const src = try g.call(mlx.mlx_floor_divide, .{ order, try g.adopt(mlx.mlx_array_new_int(k)) });
-    const rows = try g.reshape(try g.take(flat, src, 0), &.{ t * k, 1, d });
+    const sort = t * k >= SORT_PAIRS;
+    var sorted = ids;
+    var inv: Array = .{};
+    var rows: Array = undefined;
+    if (sort) {
+        const order = try g.argsort(ids, 0);
+        inv = try g.argsort(order, 0);
+        sorted = try g.take(ids, order, 0);
+        const src = try g.call(mlx.mlx_floor_divide, .{ order, try g.adopt(mlx.mlx_array_new_int(k)) });
+        rows = try g.reshape(try g.take(flat, src, 0), &.{ t * k, 1, d });
+    } else {
+        rows = try g.reshape(try g.broadcast(try g.reshape(flat, &.{ t, 1, d }), &.{ t, k, d }), &.{ t * k, 1, d });
+    }
 
-    var gu = try g.astype(try gather(g, rows, &w.gate_up, sorted), .float32);
-    if (w.gate_up_scale.ctx != null) gu = try g.mul(gu, try g.reshape(try g.take(w.gate_up_scale, sorted, 0), &.{ t * k, 1, 1 }));
-    const pairs = try g.reshape(gu, &.{ t * k, @divExact(ops.shape(gu)[2], 2), 2 });
-    const gate = try g.sliceAxis(pairs, 2, 0, 1);
-    const up = try g.sliceAxis(pairs, 2, 1, 2);
-    const act = try g.mul(try g.mul(try softcap(g, gate, w.gate_softcap), try g.sigmoid(gate)), try softcap(g, up, w.up_softcap));
-    const inner = ops.shape(act)[1];
-    const down = try gather(g, try g.astype(try g.reshape(act, &.{ t * k, 1, inner }), dt), &w.down, sorted);
+    const gu = try gather(g, rows, &w.gate_up, sorted, sort);
+    const inner = @divExact(ops.shape(gu)[2], 2);
+    const pairs = try g.reshape(gu, &.{ t * k, inner, 2 });
+    const scale: ?Array = if (w.gate_up_scale.ctx != null) try g.reshape(try g.take(w.gate_up_scale, sorted, 0), &.{ t * k, 1, 1 }) else null;
+    const act = try compiled.softcappedSwiglu(g, try g.sliceAxis(pairs, 2, 0, 1), try g.sliceAxis(pairs, 2, 1, 2), scale, w.gate_softcap, w.up_softcap);
+    const down = try gather(g, try g.reshape(act, &.{ t * k, 1, inner }), &w.down, sorted, sort);
 
-    const out = try g.reshape(try g.take(try g.reshape(down, &.{ t * k, d }), inv, 0), &.{ t, k, d });
+    const out = try g.reshape(if (sort) try g.take(try g.reshape(down, &.{ t * k, d }), inv, 0) else down, &.{ t, k, d });
     if (w.down_scale.ctx != null) weights = try g.mul(weights, try g.take(w.down_scale, idx, 0));
     const sum = try g.sum(try g.mul(try g.astype(out, .float32), try g.expandDims(weights, -1)), 1, false);
     return g.reshape(try g.astype(sum, dt), sh);
