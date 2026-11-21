@@ -483,6 +483,10 @@ pub const Generator = struct {
     /// Steps spent in disabled mode since the gate tripped (drives the
     /// periodic `specShouldReenable` re-check).
     disabled_steps: u64 = 0,
+    /// What PLD's tokens cost this request against plain ones (`gates.PldCost`).
+    pld_cost: @import("../spec/gates.zig").PldCost = .{},
+    /// The cost probe's last plain step has run: the next step decides.
+    pld_probe_over: bool = false,
     pub const RUNTIME_GATE_WARMUP = @import("../spec/gates.zig").RUNTIME_GATE_WARMUP;
     pub const RUNTIME_GATE_MIN_PER_DRAFT_RATE = @import("../spec/gates.zig").RUNTIME_GATE_MIN_PER_DRAFT_RATE;
     pub const runtimeGateShouldDisable = @import("../spec/gates.zig").runtimeGateShouldDisable;

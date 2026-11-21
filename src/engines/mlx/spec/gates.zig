@@ -129,6 +129,106 @@ pub fn specShouldReenable(committed: []const u32, generated_len: usize) bool {
     return frac >= SPEC_REENABLE_MIN_FRACTION;
 }
 
+// ── PLD cost gate ──
+// The gates above count drafts; none of them knows what a round costs. Past a few thousand keys a 16-row verify
+// (and the re-forward a partial accept owes) costs more wall time than the tokens it emits, at any acceptance.
+
+/// Enabled steps (verify rounds and cold steps) before the cost gate asks what a plain step costs, so a request of
+/// a few steps never probes, and before a loss within the margin's reach is believed.
+pub const PLD_COST_PROBE_AFTER: u32 = 3;
+pub const PLD_COST_WARMUP: u32 = 8;
+/// A loss this large is believed as soon as both costs are known: at 65k keys a round's token costs 3.5 plain
+/// ones, and every further round is a quarter second.
+pub const PLD_COST_DECISIVE: f32 = 2.0;
+/// Plain steps a probe runs; the first follows the hand-off from a round and is not a sample.
+pub const PLD_COST_PROBE: u32 = 3;
+/// PLD is dropped when its ms per emitted token passes a plain step's by this factor. Wide: a request's first
+/// rounds are its dearest (few matches yet), and at 2k keys a 1.05 margin dropped a PLD that ends at half the
+/// plain cost.
+pub const PLD_COST_MARGIN: f32 = 1.25;
+const PLD_COST_BETA: f32 = 0.25;
+
+/// One request's measured price of PLD against plain decode. Pure: the generator feeds it wall times.
+pub const PldCost = struct {
+    /// EMAs over enabled steps: wall ms, and tokens emitted.
+    spec_ms: f32 = 0,
+    spec_tok: f32 = 0,
+    spec_n: u32 = 0,
+    /// EMA of a plain step's ms; `plain_n` 0 = never timed.
+    plain_ms: f32 = 0,
+    plain_n: u32 = 0,
+    probe_left: u32 = 0,
+    probed: bool = false,
+    /// The next plain step follows a spec step: it pays the hand-off and is not a sample.
+    hand_off: bool = false,
+    /// The last spec stretch cost more per token than plain: no re-enable until `restart`.
+    lost: bool = false,
+
+    pub const Verdict = enum { keep, probe, disable };
+
+    fn fold(ema: *f32, n: u32, x: f32) void {
+        ema.* = if (n == 0) x else ema.* + PLD_COST_BETA * (x - ema.*);
+    }
+
+    /// An enabled step took `ms` and emitted `tokens`.
+    pub fn spec(c: *PldCost, ms: f32, tokens: u32) Verdict {
+        fold(&c.spec_ms, c.spec_n, ms);
+        fold(&c.spec_tok, c.spec_n, @floatFromInt(tokens));
+        c.spec_n += 1;
+        if (c.spec_n < PLD_COST_PROBE_AFTER) return .keep;
+        if (c.plain_n == 0) return if (c.probed) .keep else .probe;
+        if (c.ratio() <= (if (c.spec_n < PLD_COST_WARMUP) PLD_COST_DECISIVE else PLD_COST_MARGIN)) return .keep;
+        c.lost = true;
+        return .disable;
+    }
+
+    /// A plain step took `ms`. True when it was a probe's last step.
+    pub fn plain(c: *PldCost, ms: f32) bool {
+        if (c.hand_off) {
+            c.hand_off = false;
+        } else {
+            fold(&c.plain_ms, c.plain_n, ms);
+            c.plain_n += 1;
+        }
+        if (c.probe_left == 0) return false;
+        c.probe_left -= 1;
+        return c.probe_left == 0;
+    }
+
+    /// The next `PLD_COST_PROBE` steps run plain, once a request.
+    pub fn beginProbe(c: *PldCost) void {
+        c.probed = true;
+        c.probe_left = PLD_COST_PROBE;
+        c.hand_off = true;
+    }
+
+    /// PLD stopped for another reason: the plain steps that follow are samples after the hand-off.
+    pub fn handOff(c: *PldCost) void {
+        c.hand_off = true;
+    }
+
+    /// PLD's ms per token over a plain step's; 0 while either is unmeasured.
+    pub fn ratio(c: *const PldCost) f32 {
+        if (c.spec_n == 0 or c.plain_n == 0 or c.spec_tok <= 0 or c.plain_ms <= 0) return 0;
+        return c.spec_ms / c.spec_tok / c.plain_ms;
+    }
+
+    /// Whether PLD may run: nothing measured yet says its tokens cost more than plain ones.
+    pub fn pays(c: *const PldCost) bool {
+        return !c.lost and c.ratio() <= (if (c.spec_n < PLD_COST_WARMUP) PLD_COST_DECISIVE else PLD_COST_MARGIN);
+    }
+
+    /// A fresh spec stretch (the generated tail turned repetitive): it is judged on its own steps.
+    pub fn restart(c: *PldCost) void {
+        c.spec_n = 0;
+        c.lost = false;
+    }
+
+    pub fn msPerToken(c: *const PldCost) f32 {
+        return if (c.spec_tok > 0) c.spec_ms / c.spec_tok else 0;
+    }
+};
+
 /// Decode plain in the batched group. Sticky for DFlash (plain rounds do not extend the
 /// assistant context); PLD's periodic re-enable check resumes once the slot is solo.
 pub fn yieldSpecToCompany(self: *Generator, mode: []const u8) void {
@@ -335,4 +435,66 @@ test "Generator.specShouldReenable gates mid-request PLD re-activation" {
 
     // Too little generated yet → not enough signal, stay disabled.
     try testing.expect(!Generator.specShouldReenable(&committed, 8));
+}
+
+test "PldCost: a few steps never probe; then a probe, and a loss of twice the plain cost ends PLD at once" {
+    var c: PldCost = .{};
+    for (0..PLD_COST_PROBE_AFTER - 1) |_| try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(270, 3));
+    // Nothing says yet what a plain token costs.
+    try std.testing.expectEqual(PldCost.Verdict.probe, c.spec(270, 3));
+    c.beginProbe();
+    // The hand-off step is not a sample; the probe ends on its last counted step.
+    try std.testing.expect(!c.plain(90));
+    try std.testing.expect(!c.plain(27));
+    try std.testing.expect(c.plain(27));
+    // 90 ms a token in rounds against 27 plain.
+    try std.testing.expect(!c.pays());
+    try std.testing.expectEqual(PldCost.Verdict.disable, c.spec(270, 3));
+    try std.testing.expect(c.lost);
+}
+
+test "PldCost: a loss inside twice the plain cost waits for the warmup, and the probe runs once" {
+    var c: PldCost = .{};
+    for (0..PLD_COST_PROBE_AFTER) |_| _ = c.spec(36, 1);
+    c.beginProbe();
+    for (0..PLD_COST_PROBE) |_| _ = c.plain(27);
+    // 36 against 27: early rounds are the dearest, so not yet.
+    try std.testing.expect(c.pays());
+    for (PLD_COST_PROBE_AFTER..PLD_COST_WARMUP - 1) |_| try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(36, 1));
+    try std.testing.expectEqual(PldCost.Verdict.disable, c.spec(36, 1));
+
+    // A probe that timed nothing (the request's plain steps were all hand-offs) is not repeated.
+    var blind: PldCost = .{ .probed = true };
+    for (0..PLD_COST_WARMUP + 4) |_| try std.testing.expectEqual(PldCost.Verdict.keep, blind.spec(500, 1));
+}
+
+test "PldCost: rounds cheaper per token than a plain step keep PLD on, within the margin too" {
+    var c: PldCost = .{};
+    for (0..PLD_COST_WARMUP) |_| _ = c.spec(40, 4);
+    c.beginProbe();
+    for (0..PLD_COST_PROBE) |_| _ = c.plain(22);
+    try std.testing.expect(c.pays());
+    try std.testing.expectEqual(PldCost.Verdict.keep, c.spec(40, 4));
+    // 26 ms a token against 22 plain is inside the margin.
+    var near: PldCost = .{};
+    for (0..PLD_COST_WARMUP) |_| _ = near.spec(26, 1);
+    near.beginProbe();
+    for (0..PLD_COST_PROBE) |_| _ = near.plain(22);
+    try std.testing.expectEqual(PldCost.Verdict.keep, near.spec(26, 1));
+}
+
+test "PldCost: cold steps count as PLD's cost, and a later stretch is judged on its own" {
+    var c: PldCost = .{};
+    c.beginProbe();
+    for (0..PLD_COST_PROBE) |_| _ = c.plain(20);
+    // One token a step at 30 ms (no match, an unpipelined forward): slower than plain.
+    var v = PldCost.Verdict.keep;
+    for (0..PLD_COST_WARMUP) |_| v = c.spec(30, 1);
+    try std.testing.expectEqual(PldCost.Verdict.disable, v);
+    try std.testing.expect(!c.pays());
+    // The tail turns repetitive and PLD is given a fresh stretch.
+    c.restart();
+    try std.testing.expect(c.pays());
+    for (0..PLD_COST_WARMUP) |_| v = c.spec(60, 6);
+    try std.testing.expectEqual(PldCost.Verdict.keep, v);
 }
