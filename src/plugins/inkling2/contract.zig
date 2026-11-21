@@ -11,6 +11,7 @@ const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const attn = @import("../../sdk/blocks/attention/contract.zig");
 const rel_attn = @import("rel_attn.zig");
 const depth = @import("contract_depth.zig");
+const l2clip = @import("contract_l2clip.zig");
 const rel_attn_nax = @import("rel_attn_nax.zig");
 
 const spec = kc.spec;
@@ -432,6 +433,7 @@ pub fn register(set: *kc.Set) !void {
     inline for (registrations) |r| try set.add(RelAttn, .init(set.a, &launch, r[1]), relSpec(r[0], r[1], r[2]), null);
     inline for (nax_registrations) |r| try set.add(attn.NaxAttn, .init(set.a, r[3], r[1]), attn.naxSpec(r[0], r[1], r[2]), null);
     try depth.register(set);
+    try l2clip.register(set);
 }
 
 // ── tests ──

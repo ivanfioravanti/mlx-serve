@@ -18,7 +18,13 @@ pub fn rms(g: *Graph, x: Array, eps: f32) !Array {
 }
 
 const compiled = @import("compiled.zig");
-pub const l2Clip = compiled.l2Clip;
+
+/// `x * scale` (f32; null = 1) shrunk to L2 norm `threshold` over the last axis, in f32, cast back to `x`'s dtype: one
+/// kernel, or the compiled chain where it declines.
+pub fn l2Clip(g: *Graph, x: Array, scale: ?Array, threshold: f32) !Array {
+    if (try @import("l2_clip.zig").fused(g, x, scale, threshold)) |out| return out;
+    return compiled.l2Clip(g, x, scale, threshold);
+}
 
 /// Learned queries `[Q, H]` attend over the depth sources of each token (the `bank`'s block states, then `partial`,
 /// all `[1, L, H]` f32, which are also the values): `[1, L, Q, H]`.
@@ -56,11 +62,12 @@ pub fn row(g: *Graph, x: Array, i: c_int) !Array {
     return g.reshape(try g.sliceAxis(x, 2, i, i + 1), &.{ sh[0], sh[1], sh[3] });
 }
 
-/// A loop message mixed into a layer input. Weights are stored `[in, out]`.
+/// A loop message mixed into a layer input. Weights are stored as the checkpoint's `[out, in]`, so a kernel's group
+/// reads its own output's row contiguously.
 pub const MessageGate = struct {
-    /// `[2H, rank]` in the checkpoint's dtype.
+    /// `[rank, 2H]` in the checkpoint's dtype.
     down: Array,
-    /// `[rank, H]` f32.
+    /// `[H, rank]` f32.
     forget: Array,
     message: Array,
 
@@ -74,10 +81,14 @@ pub const MessageGate = struct {
     pub fn forward(w: *const MessageGate, g: *Graph, hidden: Array, message: Array) !Array {
         const h = try f32Of(g, hidden);
         const pair = try g.concat(&.{ try rms(g, h, 1e-6), try rms(g, message, 1e-6) }, 2);
-        const st = try f32Of(g, try g.matmul(try g.astype(pair, ops.dtype(w.down)), w.down));
-        return compiled.gateMix(g, try g.matmul(st, w.forget), try g.matmul(st, w.message), h, message);
+        const st = try f32Of(g, try g.matmul(try g.astype(pair, ops.dtype(w.down)), try tr(g, w.down)));
+        return compiled.gateMix(g, try g.matmul(st, try tr(g, w.forget)), try g.matmul(st, try tr(g, w.message)), h, message);
     }
 };
+
+fn tr(g: *Graph, x: Array) !Array {
+    return g.transpose(x, &.{ 1, 0 });
+}
 
 /// The conv input: the `k - 1` rows before the chunk (`prev`, zeros at the sequence start) then `x`, f32.
 fn window(g: *Graph, x32: Array, prev: ?Array, k: c_int) !Array {

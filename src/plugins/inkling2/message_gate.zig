@@ -57,21 +57,22 @@ fn launch(g: *Graph, k: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kerne
     return kept;
 }
 
-/// `hidden` `[1, L, H]`, `messages` `[1, L, Q, H]` f32 whose row `j` is the gate's message, `down` `[2H, rank]`,
-/// `forget` and `gain` `[rank, H]` f32: `[1, L, H]` f32. Null where it declines: off Metal, more than `MAX_ROWS`
+/// `hidden` `[1, L, H]`, `messages` `[1, L, Q, H]` f32 whose row `j` is the gate's message, `down` `[rank, 2H]`,
+/// `forget` and `gain` `[H, rank]` f32: `[1, L, H]` f32. Null where it declines: off Metal, more than `MAX_ROWS`
 /// rows, a weight or input dtype it does not read.
 pub fn fused(g: *Graph, hidden: Array, messages: Array, j: c_int, down: Array, forget: Array, gain: Array) !?Array {
     if (!mlx.streamIsGpu(g.s)) return null;
     const sh = ops.shape(hidden);
     const ms = ops.shape(messages);
     const ds = ops.shape(down);
+    const fs = ops.shape(forget);
     if (sh.len != 3 or ms.len != 4 or ds.len != 2) return null;
     const rows = sh[0] * sh[1];
     const h = sh[2];
-    const rank = ds[1];
+    const rank = ds[0];
     if (rows < 1 or rows > MAX_ROWS or h < TG or rank < 1) return null;
-    if (ms[0] != sh[0] or ms[1] != sh[1] or ms[3] != h or j < 0 or j >= ms[2] or ds[0] != 2 * h) return null;
-    if (!std.mem.eql(c_int, ops.shape(forget), &.{ rank, h }) or !std.mem.eql(c_int, ops.shape(gain), &.{ rank, h })) return null;
+    if (ms[0] != sh[0] or ms[1] != sh[1] or ms[3] != h or j < 0 or j >= ms[2] or ds[1] != 2 * h) return null;
+    if (!std.mem.eql(c_int, fs, &.{ h, rank }) or !std.mem.eql(c_int, ops.shape(gain), &.{ h, rank })) return null;
     if (!float(ops.dtype(hidden)) or !float(ops.dtype(down))) return null;
     if (ops.dtype(messages) != .float32 or ops.dtype(forget) != .float32 or ops.dtype(gain) != .float32) return null;
     const proj = getKernel(0) catch return null;
@@ -113,6 +114,13 @@ fn normal(g: *Graph, sh: []const c_int, seed: u64, scale: f32, dt: ops.Dtype) !A
     return x;
 }
 
+/// `[in, out]` as the checkpoint's `[out, in]`.
+fn outIn(g: *Graph, x: Array) !Array {
+    const y = try g.contiguous(try g.transpose(x, &.{ 1, 0 }));
+    try ops.eval(y);
+    return y;
+}
+
 /// The op chain in f32 on the CPU, its two roundings to `down`'s dtype written out: a CPU bf16 matmul and a
 /// tensor-unit GPU's f32 one are both less exact than this.
 fn chain(c: *Graph, gate: *const blocks.MessageGate, hidden: Array, message: Array) !Array {
@@ -120,9 +128,9 @@ fn chain(c: *Graph, gate: *const blocks.MessageGate, hidden: Array, message: Arr
     const h = try c.astype(hidden, .float32);
     const pair = try c.concat(&.{ try blocks.rms(c, h, 1e-6), try blocks.rms(c, message, 1e-6) }, 2);
     const rounded = try c.astype(try c.astype(pair, dt), .float32);
-    const st = try c.astype(try c.astype(try c.matmul(rounded, try c.astype(gate.down, .float32)), dt), .float32);
+    const st = try c.astype(try c.astype(try c.matmul(rounded, try c.transpose(try c.astype(gate.down, .float32), &.{ 1, 0 })), dt), .float32);
     const one = try c.scalar(1, .float32);
-    return c.add(try c.mul(try c.sub(one, try c.tanh(try c.matmul(st, gate.forget))), h), try c.mul(try c.tanh(try c.matmul(st, gate.message)), message));
+    return c.add(try c.mul(try c.sub(one, try c.tanh(try c.matmul(st, try c.transpose(gate.forget, &.{ 1, 0 })))), h), try c.mul(try c.tanh(try c.matmul(st, try c.transpose(gate.message, &.{ 1, 0 }))), message));
 }
 
 // Bar: a rounding of the projection that lands the other way moves a few outputs by its ulp, so the mean is held
@@ -138,9 +146,9 @@ test "inkling2 message_gate: the kernels give the op chain's rows for each messa
         const hidden = try normal(&g, &.{ 1, rows, h }, 10 * n + 1, 2, dt);
         const messages = try normal(&g, &.{ 1, rows, 4, h }, 10 * n + 2, 1, .float32);
         const gate = blocks.MessageGate{
-            .down = try normal(&g, &.{ 2 * h, 64 }, 10 * n + 3, 0.05, dt),
-            .forget = try normal(&g, &.{ 64, h }, 10 * n + 4, 0.2, .float32),
-            .message = try normal(&g, &.{ 64, h }, 10 * n + 5, 0.2, .float32),
+            .down = try outIn(&g, try normal(&g, &.{ 2 * h, 64 }, 10 * n + 3, 0.05, dt)),
+            .forget = try outIn(&g, try normal(&g, &.{ 64, h }, 10 * n + 4, 0.2, .float32)),
+            .message = try outIn(&g, try normal(&g, &.{ 64, h }, 10 * n + 5, 0.2, .float32)),
         };
         for (0..4) |j| {
             const got = (try fused(&g, hidden, messages, @intCast(j), gate.down, gate.forget, gate.message)) orelse return error.KernelDeclined;
@@ -159,5 +167,5 @@ test "inkling2 message_gate: the kernels give the op chain's rows for each messa
     };
     const hidden = try normal(&g, &.{ 1, MAX_ROWS + 1, h }, 1, 1, .bfloat16);
     const messages = try normal(&g, &.{ 1, MAX_ROWS + 1, 4, h }, 2, 1, .float32);
-    try testing.expectEqual(@as(?Array, null), try fused(&g, hidden, messages, 0, try normal(&g, &.{ 2 * h, 64 }, 3, 1, .bfloat16), try normal(&g, &.{ 64, h }, 4, 1, .float32), try normal(&g, &.{ 64, h }, 5, 1, .float32)));
+    try testing.expectEqual(@as(?Array, null), try fused(&g, hidden, messages, 0, try normal(&g, &.{ 64, 2 * h }, 3, 1, .bfloat16), try normal(&g, &.{ h, 64 }, 4, 1, .float32), try normal(&g, &.{ h, 64 }, 5, 1, .float32)));
 }
