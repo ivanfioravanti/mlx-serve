@@ -22,6 +22,9 @@ pub const D = 128;
 const BK: c_int = 32;
 const THREADS: c_int = 128;
 
+/// The key-block edges of the passes, in place of `passEdges`' (the contract's drift guard).
+pub var edges_override: ?[]const c_int = null;
+
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;
 
@@ -71,7 +74,7 @@ pub fn nax(g: *Graph, a: Args) !?Array {
 
     var edges_buf: [nax_attention.MAX_PASSES + 1]c_int = undefined;
     const nk = @divTrunc(kl + BK - 1, BK);
-    const edges = nax_attention.passEdges(&edges_buf, b * h * @divTrunc(ql + 63, 64), nk, window);
+    const edges = edges_override orelse nax_attention.passEdges(&edges_buf, b * h * @divTrunc(ql + 63, 64), nk, window);
     const wn: c_int = if (edges.len > 2) 2 else 1;
     const wm = @divExact(4, wn);
     const bq = 16 * wm;

@@ -453,7 +453,7 @@ fn a256Launch(comptime bdk: usize, comptime bdv: usize) metal.Launch {
 
 /// One dispatch of the key range: the whole of it, or a budgeted chunk that hands its state on (out), takes and
 /// hands it (through), or takes it and normalizes (in).
-const Phase = enum { single, out, through, in };
+pub const Phase = enum { single, out, through, in };
 
 const A256Cfg = struct {
     dt: mlx.mlx_dtype = .bfloat16,
@@ -2294,7 +2294,7 @@ const FINITE_MIN: f64 = -std.math.floatMax(f32);
 
 /// One instantiation: q/k width (v is 128), the sliding window, sinks; `phase` single is one dispatch (WN 1),
 /// out / through / in the key-range passes (WN 2). `q8`: the int8 Q/K hd-256 entry (WN 2, causal).
-const NaxCfg = struct {
+pub const NaxCfg = struct {
     dt: mlx.mlx_dtype = .bfloat16,
     dk: usize = 192,
     gqa: usize = 2,
@@ -2302,6 +2302,10 @@ const NaxCfg = struct {
     sinks: bool = false,
     phase: Phase = .single,
     q8: bool = false,
+    /// The relative-bias entry (inkling2's): a bias table of this extent per query row, a sink per ROW, and a first
+    /// key (`start`, in thirds of the keys). q/k 128 wide.
+    rel: usize = 0,
+    start: usize = 0,
 };
 
 fn naxLaunch(comptime q8: bool, comptime wn: u32) metal.Launch {
@@ -2320,7 +2324,7 @@ fn naxLaunch(comptime q8: bool, comptime wn: u32) metal.Launch {
 }
 
 /// rows = kv heads, n = query length, k = key length.
-const NaxAttn = struct {
+pub const NaxAttn = struct {
     rig: metal.Rig,
     launch: *const metal.Launch,
     cfg: NaxCfg,
@@ -2330,6 +2334,8 @@ const NaxAttn = struct {
     k: []f64 = &.{},
     v: []f64 = &.{},
     sinks: []f64 = &.{},
+    rel: []f64 = &.{},
+    first_key: usize = 0,
     state: []f64 = &.{},
     qi: []f64 = &.{},
     ki: []f64 = &.{},
@@ -2339,7 +2345,7 @@ const NaxAttn = struct {
     args: [10]mlx.mlx_array = undefined,
     owned: [2]mlx.mlx_array = @splat(.{ .ctx = null }),
 
-    fn init(a: std.mem.Allocator, launch: *const metal.Launch, cfg: NaxCfg) NaxAttn {
+    pub fn init(a: std.mem.Allocator, launch: *const metal.Launch, cfg: NaxCfg) NaxAttn {
         return .{ .rig = metal.Rig.init(a), .launch = launch, .cfg = cfg, .arena = .init(a) };
     }
 
@@ -2368,7 +2374,7 @@ const NaxAttn = struct {
         return if (self.cfg.q8) 256 else 128;
     }
 
-    fn last(phase: Phase) bool {
+    pub fn last(phase: Phase) bool {
         return phase == .single or phase == .in;
     }
 
@@ -2400,12 +2406,12 @@ const NaxAttn = struct {
         if (!c.q8) {
             g.int("WN", self.wn());
             g.int("WINDOW", c.window);
-            g.int("DK", c.dk);
+            if (c.rel > 0) g.int("REL", c.rel) else g.int("DK", c.dk);
         }
         g.flag("ALIGN_Q", ql % bq == 0);
         g.flag("ALIGN_K", kl % NAX_BK == 0);
         if (!c.q8) {
-            g.flag("HAS_SINKS", c.sinks);
+            if (c.rel == 0) g.flag("HAS_SINKS", c.sinks);
             g.flag("FIRST", phase == .single or phase == .out);
             g.flag("LAST", last(phase));
         }
@@ -2450,7 +2456,9 @@ const NaxAttn = struct {
             host.plant(self.q, h * ql, c.dk);
             host.plant(self.v, hk * kl, self.vWidth());
         }
-        self.sinks = try host.uniform(a, rng, h, -1, 3, c.dt);
+        self.sinks = if (c.rel > 0) try host.uniform(a, rng, ql * h, -1, 3, .float32) else try host.uniform(a, rng, h, -1, 3, c.dt);
+        if (c.rel > 0) self.rel = try host.uniform(a, rng, ql * h * c.rel, -3, 3, c.dt);
+        self.first_key = c.start * kl / 3;
         self.scale = host.rt(.float32, 1 / @sqrt(@as(f64, @floatFromInt(c.dk))));
         // A carried state per row (the padded tail rows too): O, max (log2 units), sum.
         self.state = try a.alloc(f64, h * nq * self.rowsPerTile() * 130);
@@ -2518,9 +2526,13 @@ const NaxAttn = struct {
             try rig.input(c.dt, &.{ 1, h, ql, cInt(c.dk) }, self.q),
             kv[0],
             kv[1],
-            if (c.sinks) try rig.input(c.dt, &.{h}, self.sinks) else try rig.input(c.dt, &.{1}, &.{0}),
+            if (c.rel > 0) try rig.input(.float32, &.{ 1, ql, h }, self.sinks) else if (c.sinks) try rig.input(c.dt, &.{h}, self.sinks) else try rig.input(c.dt, &.{1}, &.{0}),
             if (phase == .single or phase == .out) try rig.input(.float32, &.{1}, &.{0}) else try rig.input(.float32, &.{cInt(self.state.len)}, self.state),
             try rig.input(.int32, &.{16}, &pv),
+        };
+        if (c.rel > 0) self.args[6..8].* = .{
+            try rig.input(c.dt, &.{ 1, ql, h, cInt(c.rel) }, self.rel),
+            try rig.input(.int32, &.{1}, &.{@floatFromInt(self.first_key)}),
         };
         if (c.q8) self.args[6..10].* = .{
             try rig.input(.int8, &.{ 1, h, ql, 256 }, self.qi),
@@ -2531,7 +2543,7 @@ const NaxAttn = struct {
     }
 
     fn nargs(self: *const NaxAttn) usize {
-        return if (self.cfg.q8) 10 else 6;
+        return if (self.cfg.q8) 10 else if (self.cfg.rel > 0) 8 else 6;
     }
 
     pub fn run(self: *NaxAttn) !void {
@@ -2587,7 +2599,7 @@ const NaxAttn = struct {
                 for (0..NAX_BK) |j| {
                     const col = kb * NAX_BK + j;
                     const v = if (col < kl) self.v[(hk * kl + col) * dv ..][0..dv] else zv;
-                    const hide = col >= kl or pos < col or (c.window > 0 and col + c.window <= pos);
+                    const hide = col >= kl or pos < col or col < self.first_key or (c.window > 0 and col + c.window <= pos);
                     keys[n] = if (hide) .{ .s = FINITE_MIN, .on = false, .v = v } else blk: {
                         if (c.q8) {
                             // int32 products of the int8 rows (exact), times the tile's and block's scales and scale x log2(e).
@@ -2597,7 +2609,10 @@ const NaxAttn = struct {
                         }
                         const qrow = if (row < ql) self.q[(hh * ql + row) * c.dk ..][0..c.dk] else zq;
                         const d = dot(qrow, self.k[(hk * kl + col) * c.dk ..][0..c.dk], scale2, c.dk + 1, 3, sim, terms);
-                        break :blk .{ .s = d.v, .e = d.e, .v = v };
+                        if (c.rel == 0 or row >= ql or pos - col >= c.rel) break :blk .{ .s = d.v, .e = d.e, .v = v };
+                        // The bias's product with log2(e) and its sum with the score are two more fp32 roundings.
+                        const b = self.rel[((row * h + hh) * c.rel) + pos - col] * LOG2E;
+                        break :blk .{ .s = d.v + b, .e = d.e + host.U * (3 * @abs(b) + @abs(d.v + b)), .v = v };
                     };
                     n += 1;
                 }
@@ -2607,7 +2622,11 @@ const NaxAttn = struct {
             const srow = hh * nq * bq + row;
             const start: Init = if (c.phase == .through or c.phase == .in)
                 .{ .m = self.state[srow * 130 + 128], .l = self.state[srow * 130 + 129], .o = self.state[srow * 130 ..][0..128] }
-            else if (c.sinks)
+            else if (c.rel > 0) blk: {
+                // A sink per row; a padded tail row starts from 0.
+                const sink = if (row < ql) self.sinks[row * h + hh] * LOG2E else 0;
+                break :blk .{ .m = sink, .e = 2 * host.U * @abs(sink), .l = 1 };
+            } else if (c.sinks)
                 .{ .m = self.sinks[hh] * LOG2E, .e = 2 * host.U * @abs(self.sinks[hh] * LOG2E), .l = 1 }
             else
                 .{ .m = FINITE_MIN };
@@ -2643,7 +2662,7 @@ const NaxAttn = struct {
 
     /// The declared launch as the wrapper runs it: one dispatch, or the three passes with the state read back and
     /// bound between them; the output viewed [B, H, qL, 128] as the wrapper returns it.
-    fn declared(self: *NaxAttn, a: std.mem.Allocator) ![]u8 {
+    pub fn declared(self: *NaxAttn, a: std.mem.Allocator) ![]u8 {
         const rig = &self.rig;
         var args = self.args;
         if (self.cfg.phase == .single or self.cfg.q8) {
@@ -2651,7 +2670,7 @@ const NaxAttn = struct {
         } else for ([_]Phase{ .out, .through, .in }) |phase| {
             const pv = self.params(phase);
             args[5] = try rig.input(.int32, &.{16}, &pv);
-            try rig.launch(self.launch, self.geometryAt(self.shape, phase).?, args[0..6]);
+            try rig.launch(self.launch, self.geometryAt(self.shape, phase).?, args[0..self.nargs()]);
             if (phase == .in) break;
             const st = try host.read(a, rig.output(1), rig.stream());
             defer a.free(st);
@@ -2695,7 +2714,7 @@ const NaxAttn = struct {
     }
 };
 
-fn naxSpec(comptime name: []const u8, cfg: NaxCfg, served: []const Shape) spec.Spec {
+pub fn naxSpec(comptime name: []const u8, cfg: NaxCfg, served: []const Shape) spec.Spec {
     return .{
         .name = name,
         .nax = true,

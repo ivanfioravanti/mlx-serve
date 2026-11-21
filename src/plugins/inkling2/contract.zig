@@ -1,13 +1,16 @@
 //! Kernel contract registrations for inkling2: `inkling2_rel_attn`, the prefill attention with a relative bias and
 //! a sink per query row, at the 4-bit pack's widths (3 query heads a KV head, head 128, bias table 1024, window
-//! 1024 or none) and its three kinds of key pass.
+//! 1024 or none) and its three kinds of key pass; and its TensorOps arm `inkling2_rel_attn_nax`, on the SDK's NAX
+//! contract type.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
+const device = @import("../../mlx/device.zig");
 const ops = @import("../../mlx/ops.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const attn = @import("../../sdk/blocks/attention/contract.zig");
 const rel_attn = @import("rel_attn.zig");
+const rel_attn_nax = @import("rel_attn_nax.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
@@ -392,8 +395,41 @@ const registrations = .{
     .{ "inkling2_rel_attn bf16 (global, fp32 bias)", Cfg{ .rel_dt = .float32 }, qk(&.{ .{ 1, 16, 200 }, .{ 1, 80, 300 } }) },
 };
 
+/// The TensorOps arm: the SDK's NAX attention with its relative-bias entry, one dispatch (WN 1) or key passes (WN 2).
+fn naxLaunch(comptime wn: u32) metal.Launch {
+    return .{
+        .name = "inkling2_rel_attn_nax",
+        .inputs = &rel_attn_nax.INPUTS,
+        .outputs = &rel_attn_nax.OUTPUTS,
+        .source = rel_attn_nax.SOURCE,
+        .header = rel_attn_nax.HEADER,
+        .contiguous = false,
+        .tg_bytes = if (wn == 2) 2 * 2 * 16 * 32 * 4 else 4,
+        .offline = false,
+        .min_gen = 17,
+    };
+}
+
+const nax_one = naxLaunch(1);
+const nax_two = naxLaunch(2);
+
+fn naxCfg(window: usize, start: usize, phase: attn.Phase) attn.NaxCfg {
+    return .{ .dk = D, .gqa = GQ, .rel = 1024, .window = window, .start = start, .phase = phase };
+}
+
+const nax_registrations = .{
+    .{ "inkling2_rel_attn_nax bf16 (window 1024)", naxCfg(1024, 0, .single), qk(&.{ .{ 1, 16, 1100 }, .{ 1, 65, 1090 } }), &nax_one },
+    .{ "inkling2_rel_attn_nax bf16 (global)", naxCfg(0, 0, .single), qk(&.{ .{ 1, 16, 200 }, .{ 1, 80, 300 }, .{ 2, 130, 200 } }), &nax_one },
+    .{ "inkling2_rel_attn_nax bf16 (global, keys past the bias table)", naxCfg(0, 0, .single), qk(&.{.{ 1, 16, 1100 }}), &nax_one },
+    .{ "inkling2_rel_attn_nax bf16 (global, first key a third in)", naxCfg(0, 1, .single), qk(&.{ .{ 1, 16, 200 }, .{ 1, 80, 300 } }), &nax_one },
+    .{ "inkling2_rel_attn_nax bf16 (global, first key-range pass)", naxCfg(0, 0, .out), qk(&.{ .{ 1, 16, 96 }, .{ 1, 64, 300 } }), &nax_two },
+    .{ "inkling2_rel_attn_nax bf16 (global, middle key-range pass)", naxCfg(0, 0, .through), qk(&.{ .{ 1, 16, 96 }, .{ 1, 64, 300 } }), &nax_two },
+    .{ "inkling2_rel_attn_nax bf16 (global, last key-range pass)", naxCfg(0, 0, .in), qk(&.{ .{ 1, 16, 96 }, .{ 1, 64, 300 } }), &nax_two },
+};
+
 pub fn register(set: *kc.Set) !void {
     inline for (registrations) |r| try set.add(RelAttn, .init(set.a, &launch, r[1]), relSpec(r[0], r[1], r[2]), null);
+    inline for (nax_registrations) |r| try set.add(attn.NaxAttn, .init(set.a, r[3], r[1]), attn.naxSpec(r[0], r[1], r[2]), null);
 }
 
 // ── tests ──
@@ -404,7 +440,7 @@ test "kernel contract inkling2: the declared launch is the shipped wrapper's, by
     var set = kc.Set.init(a);
     defer set.deinit();
     try register(&set);
-    for (set.kernels.items) |k| {
+    for (set.kernels.items[0..registrations.len]) |k| {
         const t: *RelAttn = @ptrCast(@alignCast(k.ctx));
         for (k.spec.served) |shape| {
             try std.testing.expect(try t.prepare(shape, .random, 7));
@@ -420,6 +456,32 @@ test "kernel contract inkling2: the declared launch is the shipped wrapper's, by
             defer a.free(ours);
             const budget: i64 = if (t.cfg.phase == .in) @intCast(shape.rows * GQ * shape.n * RelAttn.chunk(shape.k)) else 0;
             try std.testing.expectEqualSlices(u8, ours, try t.wrapper(budget));
+        }
+    }
+}
+
+test "kernel contract inkling2: the NAX launch is the shipped wrapper's, byte for byte" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var set = kc.Set.init(a);
+    defer set.deinit();
+    try register(&set);
+    for (set.kernels.items[registrations.len..]) |k| {
+        const t: *attn.NaxAttn = @ptrCast(@alignCast(k.ctx));
+        // The chain's first two passes ride its last one's registration.
+        if (t.cfg.phase == .out or t.cfg.phase == .through) continue;
+        for (k.spec.served) |shape| {
+            try std.testing.expect(try t.prepare(shape, .random, 7));
+            const ours = try t.declared(a);
+            defer a.free(ours);
+            const nk: c_int = @intCast((shape.k + 31) / 32);
+            rel_attn_nax.edges_override = if (t.cfg.phase == .in) &.{ 0, @divTrunc(nk, 3), @divTrunc(2 * nk, 3), nk } else &.{ 0, nk };
+            defer rel_attn_nax.edges_override = null;
+            var g = ops.Graph.init(a, t.rig.stream());
+            defer g.deinit();
+            const x = t.args;
+            const got = (try rel_attn_nax.nax(&g, .{ .q = x[0], .k = x[1], .v = x[2], .rel = x[6], .sinks = x[3], .key_start = x[7], .scale = @floatCast(t.scale), .window = @intCast(t.cfg.window) })) orelse return error.Declined;
+            try std.testing.expectEqualSlices(u8, ours, try t.rig.bytesOf(&.{try g.transpose(got, &.{ 0, 2, 1, 3 })}));
         }
     }
 }
