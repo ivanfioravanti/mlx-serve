@@ -118,19 +118,31 @@ pub fn attend(g: *Graph, a: rel_attn.Args) !Array {
     const s = ops.shape(a.k)[2];
     const r = ops.shape(a.rel)[3];
     const dt = ops.dtype(a.q);
-    // Key j sits `s - 1 - j` behind the row.
+    const mask = try rowBias(g, try g.reshape(a.rel, &.{ hq, r }), s, a.window);
+    const y = try sdpaSinks(g, a.q, a.k, a.v, a.scale, "array", try g.reshape(try g.astype(mask, dt), &.{ 1, hq, 1, s }), try g.astype(try g.reshape(a.sinks, &.{hq}), dt), false);
+    return g.transpose(y, &.{ 0, 2, 1, 3 });
+}
+
+/// One row's additive mask `[hq, s]` from its bias `[hq, r]`: key j sits `s - 1 - j` behind the row, so the mask
+/// is the bias read backwards, zero past the table and -inf past the window.
+fn rowBias(g: *Graph, rel: Array, s: c_int, window: u32) !Array {
+    const hq = ops.shape(rel)[0];
+    const r = ops.shape(rel)[1];
+    if (window == 0 or s <= @as(c_int, @intCast(window))) {
+        // No key is past the window: the reversed bias is a view, and only an open layer pads it.
+        const n = @min(r, s);
+        const near = try g.call(mlx.mlx_slice, .{ rel, &[_]c_int{ 0, n - 1 }, @as(usize, 2), &[_]c_int{ hq, -r - 1 }, @as(usize, 2), &[_]c_int{ 1, -1 }, @as(usize, 2) });
+        return if (s > r) g.concat(&.{ try g.zeros(&.{ hq, s - r }, ops.dtype(rel)), near }, 1) else near;
+    }
     const dist = try g.arange(@floatFromInt(s - 1), -1, -1, .int32);
     const int = struct {
         fn of(gr: *Graph, v: c_int) !Array {
             return gr.adopt(mlx.mlx_array_new_int(v));
         }
     }.of;
-    const at = try g.minimum(dist, try int(g, r - 1));
-    const near = try g.take(try g.reshape(a.rel, &.{ hq, r }), at, 1);
-    var mask = try g.where(try g.less(dist, try int(g, r)), near, try g.scalarLike(near, 0));
-    if (a.window > 0) mask = try g.where(try g.less(dist, try int(g, @intCast(a.window))), mask, try g.scalarLike(near, -std.math.inf(f32)));
-    const y = try sdpaSinks(g, a.q, a.k, a.v, a.scale, "array", try g.reshape(try g.astype(mask, dt), &.{ 1, hq, 1, s }), try g.astype(try g.reshape(a.sinks, &.{hq}), dt), false);
-    return g.transpose(y, &.{ 0, 2, 1, 3 });
+    const near = try g.take(rel, try g.minimum(dist, try int(g, r - 1)), 1);
+    const mask = try g.where(try g.less(dist, try int(g, r)), near, try g.scalarLike(near, 0));
+    return g.where(try g.less(dist, try int(g, @intCast(window))), mask, try g.scalarLike(near, -std.math.inf(f32)));
 }
 
 // ── tests ──
@@ -178,5 +190,24 @@ test "inkling2 attention: the decode row equals the last row of the chunk" {
         const diff = try g.max(try g.reshape(try g.abs(try g.sub(last, one)), &.{hq * d}), 0, false);
         try ops.eval(diff);
         try testing.expect(mlx.mlx_array_data_float32(diff).?[0] < 1e-5);
+    }
+}
+
+test "inkling2 attention: a row's mask is its bias read backwards, zero past the table, -inf past the window" {
+    var g = Graph.init(testing.allocator, mlx.mlx_default_cpu_stream_new());
+    defer g.deinit();
+    const rel = try g.fromSlice(f32, &.{ 1, 2, 3, 4, 5, 10, 20, 30, 40, 50 }, &.{ 2, 5 });
+    const inf = std.math.inf(f32);
+    const cases = [_]struct { s: c_int, window: u32, want: []const f32 }{
+        .{ .s = 3, .window = 0, .want = &.{ 3, 2, 1, 30, 20, 10 } },
+        .{ .s = 5, .window = 8, .want = &.{ 5, 4, 3, 2, 1, 50, 40, 30, 20, 10 } },
+        .{ .s = 7, .window = 0, .want = &.{ 0, 0, 5, 4, 3, 2, 1, 0, 0, 50, 40, 30, 20, 10 } },
+        .{ .s = 4, .window = 2, .want = &.{ -inf, -inf, 2, 1, -inf, -inf, 20, 10 } },
+    };
+    for (cases) |cs| {
+        const got = try g.contiguous(try rowBias(&g, rel, cs.s, cs.window));
+        try ops.eval(got);
+        try testing.expectEqualSlices(c_int, &.{ 2, cs.s }, ops.shape(got));
+        try testing.expectEqualSlices(f32, cs.want, mlx.mlx_array_data_float32(got).?[0..cs.want.len]);
     }
 }

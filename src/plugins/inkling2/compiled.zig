@@ -113,6 +113,24 @@ pub fn residualScale(g: *Graph, y: Array, x: Array, by: f32) !Array {
     return Compiled(3, residualScaleBody).call(g, .{ y, x, try g.scalar(by, .float32) });
 }
 
+fn sumBody(g: *Graph, a: [2]Array) !Array {
+    return g.add(try g.astype(a[0], .float32), try g.astype(a[1], .float32));
+}
+
+/// `a + b` in f32.
+pub fn sum(g: *Graph, a: Array, b: Array) !Array {
+    return Compiled(2, sumBody).call(g, .{ a, b });
+}
+
+fn sumAsBody(g: *Graph, a: [2]Array) !Array {
+    return g.astype(try sumBody(g, a), ops.dtype(a[1]));
+}
+
+/// `a + b` in f32, in `b`'s dtype.
+pub fn sumAs(g: *Graph, a: Array, b: Array) !Array {
+    return Compiled(2, sumAsBody).call(g, .{ a, b });
+}
+
 // ── tests ──
 
 const testing = std.testing;
@@ -155,6 +173,8 @@ test "inkling2 compiled: the closures give the op chains' values, in the input's
         const m = try randn(&g, &.{ 1, 5, 16 }, 7, .float32);
         try testing.expect(try maxDiff(&g, try gateMix(&g, m, h, h, m), try gateMixBody(&g, .{ m, h, h, m })) <= 1e-5);
         try testing.expect(try maxDiff(&g, try sigmoidGate(&g, gate, up), try sigmoidGateBody(&g, .{ gate, up })) <= 1e-5);
+        try testing.expect(try maxDiff(&g, try sum(&g, gate, up), try sumBody(&g, .{ gate, up })) <= 1e-5);
+        try testing.expect(try maxDiff(&g, try sumAs(&g, h, try g.astype(m, dt)), try sumAsBody(&g, .{ h, try g.astype(m, dt) })) <= 1e-5);
         try testing.expect(try maxDiff(&g, try residualScale(&g, gate, up, 0.5), try residualScaleBody(&g, .{ gate, up, try g.scalar(0.5, .float32) })) <= 1e-5);
     }
 }

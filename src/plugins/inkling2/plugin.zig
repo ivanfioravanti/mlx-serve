@@ -18,6 +18,7 @@ const head_block = @import("../../sdk/bases/blocks/head.zig");
 const loader = @import("../llama/load.zig");
 const attention = @import("attention.zig");
 const blocks = @import("blocks.zig");
+const compiled = @import("compiled.zig");
 const moe = @import("moe.zig");
 const vision = @import("vision.zig");
 pub const config = @import("config.zig");
@@ -164,11 +165,12 @@ pub const Model = struct {
             const a = try attention.forward(&L.attn, c, normed[0], normed[1], normed[2], prev[0], prev[1]);
             const ac = try blocks.sconv(g, a.out, L.attn_conv, prev[2]);
 
-            var res = try blocks.f32Of(g, ac.out);
+            var res: Array = undefined;
             if (L.boundary) {
+                res = try blocks.f32Of(g, ac.out);
                 t.bank[t.blocks] = try t.g.keep(normed_in);
                 t.blocks += 1;
-            } else res = try g.add(try blocks.f32Of(g, t.h), res);
+            } else res = try compiled.sum(g, t.h, ac.out);
 
             var x = try blocks.row(g, try blocks.depth(g, t.bank[0..t.blocks], try blocks.rms(g, res, 1e-6), L.mlp_query), 0);
             if (messages) |m| x = try L.gates.?[3].forward(g, x, try blocks.row(g, m, 3));
@@ -178,7 +180,7 @@ pub const Model = struct {
             // A verify forward's rejected rows are rolled back from the conv inputs.
             if (c.capture_spec) try kv.setState(c, .conv_input, try g.concat(&.{ a.k.input, a.v.input, ac.input, mc.input }, 2));
 
-            try t.move(try g.astype(try g.add(res, try blocks.f32Of(g, mc.out)), dt));
+            try t.move(try compiled.sumAs(g, res, mc.out));
             try t.run.capture(t.g, t.visit, t.h);
             try t.run.cadence(t.visit, t.visits, t.h);
             t.visit += 1;
