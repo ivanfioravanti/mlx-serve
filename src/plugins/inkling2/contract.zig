@@ -39,8 +39,8 @@ const launch = metal.Launch{
 };
 
 /// One dispatch of the key range: all of it, or a pass that hands its state on (out), takes and hands it
-/// (through), or takes it and normalizes (in).
-const Phase = enum { single, out, through, in };
+/// (through), or takes it and normalizes (in); or every key chunk at once, each from a fresh state (split).
+const Phase = enum { single, out, through, in, split };
 
 const Cfg = struct {
     dt: mlx.mlx_dtype = .bfloat16,
@@ -101,11 +101,19 @@ const RelAttn = struct {
 
     fn geometryAt(self: *const RelAttn, shape: Shape, phase: Phase) ?metal.Geometry {
         const c = self.cfg;
-        if (shape.n < rel_attn.MIN_ROWS or shape.k < shape.n) return null;
+        const least: usize = if (phase == .split) 1 else rel_attn.MIN_ROWS;
+        if (shape.n < least or shape.k < shape.n) return null;
         const hq: c_int = @intCast(shape.rows * GQ);
         const l: c_int = @intCast(shape.n);
-        var g = metal.Geometry{ .grid = .{ @divTrunc(l + BQ - 1, BQ) * rel_attn.TG, hq, 1 }, .tg = .{ rel_attn.TG, 1, 1 } };
-        if (final(phase)) {
+        const nch: c_int = if (phase == .split) @intCast(chunks(shape.k)) else 1;
+        var g = metal.Geometry{ .grid = .{ @divTrunc(l + BQ - 1, BQ) * nch * rel_attn.TG, hq, 1 }, .tg = .{ rel_attn.TG, 1, 1 } };
+        if (phase == .split) {
+            g.out(&.{1}, c.dt);
+            g.out(&.{ nch, l * hq }, .float32);
+            g.out(&.{ nch, l * hq }, .float32);
+            g.out(&.{ nch, l * hq, D }, .float32);
+            g.unread = 0b0001;
+        } else if (final(phase)) {
             g.out(&.{ 1, l, hq, D }, c.dt);
             for (0..3) |_| g.out(&.{1}, .float32);
             g.unread = 0b1110;
@@ -127,6 +135,12 @@ const RelAttn = struct {
         return g;
     }
 
+    /// Key chunks a split launch makes of `s` keys.
+    fn chunks(s: usize) usize {
+        const each: usize = @intCast(rel_attn.chunkKeys(@intCast(s)));
+        return (s + each - 1) / each;
+    }
+
     /// The pass length the chain splits the keys at: whole blocks, a third of the keys.
     fn chunk(s: usize) usize {
         return @max(BK, s / 3 / BK * BK);
@@ -139,6 +153,8 @@ const RelAttn = struct {
             .out => .{ 0, c },
             .through => .{ c, 2 * c },
             .in => .{ 2 * c, s },
+            // The kernel reads a chunk's keys where a pass reads its first key.
+            .split => .{ @intCast(rel_attn.chunkKeys(@intCast(s))), 0 },
         };
     }
 
@@ -182,7 +198,7 @@ const RelAttn = struct {
     }
 
     fn sizesOf(rig: *metal.Rig, l: usize, s: usize, kr: [2]usize, phase: Phase) !mlx.mlx_array {
-        const bits = @as(u32, @intFromBool(phase == .through or phase == .in)) | (@as(u32, @intFromBool(final(phase))) << 1);
+        const bits = @as(u32, @intFromBool(phase == .through or phase == .in)) | (@as(u32, @intFromBool(final(phase))) << 1) | (@as(u32, @intFromBool(phase == .split)) << 2);
         return rig.input(.int32, &.{5}, &.{ @floatFromInt(l), @floatFromInt(s), @floatFromInt(kr[0]), @floatFromInt(kr[1]), @floatFromInt(bits) });
     }
 
@@ -228,6 +244,7 @@ const RelAttn = struct {
 
     pub fn count(self: *const RelAttn) usize {
         const rows = self.shape.rows * GQ * self.shape.n;
+        if (self.cfg.phase == .split) return chunks(self.shape.k) * rows * (2 + D);
         return if (final(self.cfg.phase)) rows * D else rows * (2 + D);
     }
 
@@ -250,13 +267,15 @@ const RelAttn = struct {
         var eo: [D]f64 = undefined;
         const scale2 = self.scale * LOG2E;
         const carry = c.phase == .through or c.phase == .in;
-        for (0..l) |r| for (0..hq) |h| {
+        const nch = if (c.phase == .split) chunks(s) else 1;
+        for (0..nch) |ch| for (0..l) |r| for (0..hq) |h| {
+            const kr: [2]usize = if (c.phase == .split) .{ ch * self.kr[0], (ch + 1) * self.kr[0] } else self.kr;
             const hk = h / GQ;
             const row = r * hq + h;
             const q_lo = s - l + r / BQ * BQ;
             const pos = s - l + r;
-            const kb_lim = @min((@min(self.kr[1], s) + BK - 1) / BK, (q_lo + BQ - 1 + BK) / BK);
-            var kb = @max(self.kr[0], self.start) / BK;
+            const kb_lim = @min((@min(kr[1], s) + BK - 1) / BK, (q_lo + BQ - 1 + BK) / BK);
+            var kb = @max(kr[0], self.start) / BK;
             if (c.window > 0) kb = @max(kb, (q_lo + 1 -| c.window) / BK);
             const qrow = self.q[(h * l + r) * D ..][0..D];
             var n: usize = 0;
@@ -280,6 +299,9 @@ const RelAttn = struct {
             const sink = self.sinks[row] * LOG2E;
             const first: attn.Init = if (carry)
                 .{ .m = self.m_in[row], .l = self.l_in[row], .o = self.o_in[row * D ..][0..D] }
+            else if (ch > 0)
+                // Only the first chunk holds the sink.
+                .{ .m = @as(f32, -3.0e38) }
             else
                 .{ .m = sink, .e = 2 * host.U * @abs(sink), .l = 1 };
             const st = attn.online(.{ .base2 = true }, first, keys[0..n], ends[0..nb], &o, &eo);
@@ -291,14 +313,15 @@ const RelAttn = struct {
                 };
                 continue;
             }
-            const rows = hq * l;
-            want[row] = st.m;
-            want[rows + row] = st.l;
-            @memcpy(want[2 * rows + row * D ..][0..D], &o);
+            const rows = nch * hq * l;
+            const at = ch * hq * l + row;
+            want[at] = st.m;
+            want[rows + at] = st.l;
+            @memcpy(want[2 * rows + at * D ..][0..D], &o);
             if (mag) |m| {
-                m[row] = host.allowance(st.em);
-                m[rows + row] = host.allowance(st.el);
-                for (m[2 * rows + row * D ..][0..D], eo) |*x, e| x.* = host.allowance(e);
+                m[at] = host.allowance(st.em);
+                m[rows + at] = host.allowance(st.el);
+                for (m[2 * rows + at * D ..][0..D], eo) |*x, e| x.* = host.allowance(e);
             }
         };
     }
@@ -319,6 +342,15 @@ const RelAttn = struct {
         defer g.deinit();
         const x = self.args;
         const got = (try rel_attn.simd(&g, .{ .q = x[0], .k = x[1], .v = x[2], .rel = x[3], .sinks = x[4], .key_start = x[5], .scale = @floatCast(self.scale), .window = @intCast(self.cfg.window) })) orelse return error.Declined;
+        return self.rig.bytesOf(&.{got});
+    }
+
+    /// The shipped key-split wrapper on the same inputs.
+    fn splitWrapper(self: *RelAttn) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const x = self.args;
+        const got = (try rel_attn.split(&g, .{ .q = x[0], .k = x[1], .v = x[2], .rel = x[3], .sinks = x[4], .key_start = x[5], .scale = @floatCast(self.scale), .window = @intCast(self.cfg.window) })) orelse return error.Declined;
         return self.rig.bytesOf(&.{got});
     }
 
@@ -369,7 +401,7 @@ fn relSpec(comptime name: []const u8, cfg: Cfg, served: []const Shape) spec.Spec
         .accum = .f32,
         .depth = host.depthOne,
         .out = if (RelAttn.final(cfg.phase)) host.elemOf(cfg.dt) else .f32,
-        .tiles = .{ .{}, .{ .size = BQ, .min = rel_attn.MIN_ROWS }, .{ .size = BK, .min = rel_attn.MIN_ROWS } },
+        .tiles = .{ .{}, .{ .size = BQ, .min = if (cfg.phase == .split) 1 else rel_attn.MIN_ROWS }, .{ .size = BK, .min = rel_attn.MIN_ROWS } },
         .served = served,
         .sums = .{ .exact = false },
     };
@@ -394,6 +426,8 @@ const registrations = .{
     .{ "inkling2_rel_attn bf16 (global, pass hands its state on)", Cfg{ .phase = .out }, qk(&.{ .{ 1, 16, 96 }, .{ 1, 64, 288 } }) },
     .{ "inkling2_rel_attn bf16 (global, pass carries the state through)", Cfg{ .phase = .through }, qk(&.{ .{ 1, 16, 96 }, .{ 1, 64, 288 } }) },
     .{ "inkling2_rel_attn bf16 (global, last pass takes the state)", Cfg{ .phase = .in }, qk(&.{ .{ 1, 16, 96 }, .{ 1, 64, 288 } }) },
+    .{ "inkling2_rel_attn bf16 (global, key chunks from fresh states)", Cfg{ .phase = .split }, qk(&.{ .{ 1, 6, 2300 }, .{ 1, 1, 200 }, .{ 1, 16, 1100 } }) },
+    .{ "inkling2_rel_attn bf16 (window 1024, key chunks from fresh states)", Cfg{ .phase = .split, .window = 1024 }, qk(&.{.{ 1, 9, 2100 }}) },
     .{ "inkling2_rel_attn f16 (global)", Cfg{ .dt = .float16, .rel_dt = .float16 }, qk(&.{ .{ 1, 16, 200 }, .{ 1, 80, 300 } }) },
     .{ "inkling2_rel_attn bf16 (global, fp32 bias)", Cfg{ .rel_dt = .float32 }, qk(&.{ .{ 1, 16, 200 }, .{ 1, 80, 300 } }) },
 };
@@ -430,9 +464,153 @@ const nax_registrations = .{
     .{ "inkling2_rel_attn_nax bf16 (global, last key-range pass)", naxCfg(0, 0, .in), qk(&.{ .{ 1, 16, 96 }, .{ 1, 64, 300 } }), &nax_two },
 };
 
+
+// ── inkling2_rel_attn_merge: a split launch's chunk states joined ──
+
+const merge_launch = metal.Launch{
+    .name = "inkling2_rel_attn_merge",
+    .inputs = &rel_attn.MERGE_INPUTS,
+    .outputs = &.{"out"},
+    .source = rel_attn.MERGE_SOURCE,
+    .tg_bytes = 0,
+    .m1 = 1024,
+    .m2 = 1024,
+};
+
+/// A shape's rows are the query rows of every head, n the key chunks, k the head width.
+const Merge = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch,
+    dt: mlx.mlx_dtype,
+    arena: std.heap.ArenaAllocator,
+    shape: Shape = undefined,
+    ms: []f64 = &.{},
+    ls: []f64 = &.{},
+    os: []f64 = &.{},
+    args: [3]mlx.mlx_array = undefined,
+
+    fn init(a: std.mem.Allocator, l: *const metal.Launch, dt: mlx.mlx_dtype) Merge {
+        return .{ .rig = metal.Rig.init(a), .launch = l, .dt = dt, .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *Merge) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(self: *const Merge, shape: Shape) ?metal.Geometry {
+        if (shape.n < 1 or shape.n > rel_attn.MAX_CHUNKS) return null;
+        var g = metal.Geometry{ .grid = .{ ci(shape.rows * 32), 1, 1 }, .tg = .{ 32, 1, 1 } };
+        g.out(&.{ ci(shape.rows), ci(shape.k) }, self.dt);
+        g.dtype("T", self.dt);
+        g.int("D", shape.k);
+        g.int("CH", shape.n);
+        return g;
+    }
+
+    pub fn prepare(self: *Merge, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const cells = shape.n * shape.rows;
+        self.ms = try host.uniform(a, rng, cells, -3, 3, .float32);
+        self.ls = try host.uniform(a, rng, cells, 0.5, 4, .float32);
+        self.os = try host.uniform(a, rng, cells * shape.k, -4, 4, .float32);
+        // A chunk past the first that saw no key: the kernel's empty state.
+        for (shape.rows..cells) |i| if (rng.uintLessThan(u32, 3) == 0) {
+            self.ms[i] = @as(f32, -3.0e38);
+            self.ls[i] = 0;
+            @memset(self.os[i * shape.k ..][0..shape.k], 0);
+        };
+        if (fill == .nonfinite) host.plant(self.os[0 .. shape.rows * shape.k], shape.rows, shape.k);
+        try self.bind();
+        return true;
+    }
+
+    fn bind(self: *Merge) !void {
+        const rig = &self.rig;
+        const shape = self.shape;
+        rig.reset();
+        self.args = .{
+            try rig.input(.float32, &.{ ci(shape.n), ci(shape.rows) }, self.ms),
+            try rig.input(.float32, &.{ ci(shape.n), ci(shape.rows) }, self.ls),
+            try rig.input(.float32, &.{ ci(shape.n), ci(shape.rows), ci(shape.k) }, self.os),
+        };
+    }
+
+    pub fn run(self: *Merge) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Merge) usize {
+        return self.shape.rows * self.shape.k;
+    }
+
+    fn emit(self: *const Merge, want: []f64, mag: ?[]f64, sim: attn.Sim) void {
+        const rows = self.shape.rows;
+        const d = self.shape.k;
+        const nch = self.shape.n;
+        var w: [rel_attn.MAX_CHUNKS]f64 = undefined;
+        var ew: [rel_attn.MAX_CHUNKS]f64 = undefined;
+        var terms: [rel_attn.MAX_CHUNKS]f64 = undefined;
+        const sums = spec.gamma(@floatFromInt(nch + 1), host.U);
+        for (0..rows) |row| {
+            var top = -std.math.inf(f64);
+            for (0..nch) |c| top = @max(top, self.ms[c * rows + row]);
+            var eden: f64 = 0;
+            for (0..nch) |c| {
+                const span = top - self.ms[c * rows + row];
+                w[c] = @exp2(-span);
+                // A fast exp2 and the product.
+                ew[c] = host.fastExp(span * std.math.ln2) + 2 * host.U + sums;
+                terms[c] = self.ls[c * rows + row] * w[c];
+                eden += @abs(terms[c]) * ew[c];
+            }
+            const den = if (sim) |x| spec.sumIn(x.acc, x.order, terms[0..nch]) else host.sum(terms[0..nch]);
+            for (0..d) |col| {
+                var enum_: f64 = 0;
+                for (0..nch) |c| {
+                    terms[c] = self.os[(c * rows + row) * d + col] * w[c];
+                    enum_ += @abs(terms[c]) * ew[c];
+                }
+                const num = if (sim) |x| spec.sumIn(x.acc, x.order, terms[0..nch]) else host.sum(terms[0..nch]);
+                const out = num / den;
+                want[row * d + col] = out;
+                if (mag) |m| m[row * d + col] = host.allowance((enum_ + @abs(out) * eden) / @abs(den) + 2 * host.U * @abs(out));
+            }
+        }
+    }
+
+    pub fn reference(self: *const Merge, want: []f64, mag: []f64) !void {
+        self.emit(want, mag, null);
+    }
+
+    pub fn simulate(self: *const Merge, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        self.emit(out, null, .{ .acc = acc, .order = order });
+    }
+};
+
+fn mergeSpec(comptime name: []const u8, dt: mlx.mlx_dtype, served: []const Shape) spec.Spec {
+    return .{
+        .name = name,
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = host.elemOf(dt),
+        .served = served,
+        .sums = .{ .f16 = 0, .bf16 = 0, .why = "a row sums a few dozen chunk states of fp32 weights: the output's own rounding is coarser", .exact = false },
+    };
+}
+
+/// A decode-width window over three chunks, a full window's rows over the most chunks, one chunk.
+const merge_shapes = qk(&.{ .{ 18, 3, 128 }, .{ 48, 64, 128 }, .{ 3, 1, 128 } });
+
 pub fn register(set: *kc.Set) !void {
     inline for (registrations) |r| try set.add(RelAttn, .init(set.a, &launch, r[1]), relSpec(r[0], r[1], r[2]), null);
     inline for (nax_registrations) |r| try set.add(attn.NaxAttn, .init(set.a, r[3], r[1]), attn.naxSpec(r[0], r[1], r[2]), null);
+    inline for (.{ .{ "bf16", mlx.mlx_dtype.bfloat16 }, .{ "f16", mlx.mlx_dtype.float16 } }) |t| try set.add(Merge, .init(set.a, &merge_launch, t[1]), mergeSpec("inkling2_rel_attn_merge " ++ t[0], t[1], merge_shapes), null);
     try depth.register(set);
     try gates.register(set);
     try l2clip.register(set);
@@ -454,6 +632,20 @@ test "kernel contract inkling2: the declared launch is the shipped wrapper's, by
                 // The chain's first two passes ride its last one's registration.
                 .out, .through => continue,
                 .in => try t.chained(a),
+                .split => blk: {
+                    // The split launch's states through the declared merge.
+                    try t.run();
+                    var m = Merge.init(a, &merge_launch, t.cfg.dt);
+                    defer m.deinit();
+                    const rows = shape.rows * GQ * shape.n;
+                    m.shape = .{ .rows = rows, .n = RelAttn.chunks(shape.k), .k = D };
+                    m.ms = try host.read(m.arena.allocator(), t.rig.output(1), t.rig.stream());
+                    m.ls = try host.read(m.arena.allocator(), t.rig.output(2), t.rig.stream());
+                    m.os = try host.read(m.arena.allocator(), t.rig.output(3), t.rig.stream());
+                    try m.bind();
+                    try m.run();
+                    break :blk try a.dupe(u8, m.rig.outputBytes());
+                },
                 .single => blk: {
                     try t.run();
                     break :blk try a.dupe(u8, t.rig.outputBytes());
@@ -461,7 +653,7 @@ test "kernel contract inkling2: the declared launch is the shipped wrapper's, by
             };
             defer a.free(ours);
             const budget: i64 = if (t.cfg.phase == .in) @intCast(shape.rows * GQ * shape.n * RelAttn.chunk(shape.k)) else 0;
-            try std.testing.expectEqualSlices(u8, ours, try t.wrapper(budget));
+            try std.testing.expectEqualSlices(u8, ours, if (t.cfg.phase == .split) try t.splitWrapper() else try t.wrapper(budget));
         }
     }
 }
