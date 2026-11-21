@@ -51,7 +51,7 @@ pub const Weights = struct {
     eps: f32,
 };
 
-pub const Out = struct { out: Array, k_state: Array, v_state: Array };
+pub const Out = struct { out: Array, k: blocks.Conv, v: blocks.Conv };
 
 /// The layer's attention over its normed q, k and v inputs `[1, L, hidden]`; `k_prev`/`v_prev` are the conv windows.
 pub fn forward(w: *const Weights, c: *Ctx, qs: Array, ks: Array, vs: Array, k_prev: ?Array, v_prev: ?Array) !Out {
@@ -100,7 +100,7 @@ pub fn forward(w: *const Weights, c: *Ctx, qs: Array, ks: Array, vs: Array, k_pr
         .window = w.window,
     });
     const gated = try g.mul(try blocks.f32Of(g, try g.reshape(out, &.{ 1, l, w.heads * hd })), try g.sigmoid(try blocks.f32Of(g, gate)));
-    return .{ .out = try w.o.forward(g, try g.astype(gated, ops.dtype(gate))), .k_state = kc.state, .v_state = vc.state };
+    return .{ .out = try w.o.forward(g, try g.astype(gated, ops.dtype(gate))), .k = kc, .v = vc };
 }
 
 /// `1 + alpha * log(max((position + 1) / floor, 1))` per query row, `[1, L, 1, 1]` f32.

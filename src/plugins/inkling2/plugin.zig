@@ -170,7 +170,9 @@ pub const Model = struct {
             if (messages) |m| x = try L.gates.?[3].forward(g, x, try blocks.row(g, m, 3));
             const y = try moe.forward(&L.mlp, g, try g.astype(try g.rmsNorm(x, L.post_norm, eps), dt));
             const mc = try blocks.sconv(g, y, L.mlp_conv, prev[3]);
-            try kv.setState(c, .conv, try g.concat(&.{ a.k_state, a.v_state, ac.state, mc.state }, 2));
+            try kv.setState(c, .conv, try g.concat(&.{ a.k.state, a.v.state, ac.state, mc.state }, 2));
+            // A verify forward's rejected rows are rolled back from the conv inputs.
+            if (c.capture_spec) try kv.setState(c, .conv_input, try g.concat(&.{ a.k.input, a.v.input, ac.input, mc.input }, 2));
 
             try t.move(try g.astype(try g.add(res, try blocks.f32Of(g, mc.out)), dt));
             try t.run.capture(t.g, t.visit, t.h);

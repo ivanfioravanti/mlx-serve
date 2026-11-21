@@ -78,7 +78,8 @@ fn tail(g: *Graph, win: Array, k: c_int) !Array {
     return g.contiguous(try g.sliceAxis(win, 1, n - (k - 1), n));
 }
 
-pub const Conv = struct { out: Array, state: Array };
+/// `input` is the whole conv input `[1, K-1+L, C]` (what a verify forward leaves for the rollback).
+pub const Conv = struct { out: Array, state: Array, input: Array };
 
 /// Depthwise causal conv `w` `[C, K, 1]` in the weight's dtype plus the input, over `sqrt(K + 1)`.
 pub fn sconv(g: *Graph, x: Array, w: Array, prev: ?Array) !Conv {
@@ -87,7 +88,7 @@ pub fn sconv(g: *Graph, x: Array, w: Array, prev: ?Array) !Conv {
     const win = try window(g, x32, prev, k);
     const y = try g.conv1d(try g.astype(win, ops.dtype(w)), w, 1, 0, 1, ops.shape(x)[2]);
     const out = try g.mulScalar(try g.add(try f32Of(g, y), x32), 1.0 / @sqrt(@as(f32, @floatFromInt(k + 1))));
-    return .{ .out = try g.astype(out, ops.dtype(x)), .state = try tail(g, win, k) };
+    return .{ .out = try g.astype(out, ops.dtype(x)), .state = try tail(g, win, k), .input = win };
 }
 
 /// A global layer's conv on k or v: per-head taps `static` `[K, C]` plus `dynamic` `[1, L, heads * K]` (the layer
@@ -111,7 +112,7 @@ pub fn dynamicSconv(g: *Graph, x: Array, dynamic: Array, static: Array, heads: c
     const wins = try g.reshape(try g.concat(lags[0..@intCast(k)], 3), &.{ sh[0], l, heads, d, k });
     const y = try g.reshape(try g.sum(try g.mul(wins, taps), -1, false), &.{ sh[0], l, c });
     const out = try g.mulScalar(try g.add(y, x32), 1.0 / @sqrt(@as(f32, @floatFromInt(2 * k + 1))));
-    return .{ .out = try g.astype(out, ops.dtype(x)), .state = try tail(g, win, k) };
+    return .{ .out = try g.astype(out, ops.dtype(x)), .state = try tail(g, win, k), .input = win };
 }
 
 // ── tests ──
