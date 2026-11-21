@@ -7,6 +7,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const attn256 = @import("../../sdk/blocks/attention/attn256.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const Array = ops.Array;
 const Graph = ops.Graph;
@@ -106,6 +107,7 @@ pub fn passKeys(rows: i64, s: i64, budget: i64) i64 {
 }
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
+var engaged = false;
 
 fn getKernel() !mlx.mlx_fast_metal_kernel {
     if (kernel) |k| return k;
@@ -215,6 +217,10 @@ pub fn simd(g: *Graph, a: Args) !?Array {
         n += 1;
     }
     last_dispatches = n;
+    if (!engaged) {
+        engaged = true;
+        log.info("[inkling2] rel_attn simd engaged: L={d} S={d} window={d} passes={d}\n", .{ l, s, a.window, n });
+    }
     return try g.keep(out);
 }
 
