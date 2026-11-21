@@ -5213,9 +5213,14 @@ fn rowPicks(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, p0: usize, l: usi
 /// the one-row kernel; null (nothing moved) where `rowQmv` declines wo_a or wo_b.
 fn blockRowsAttnOut(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, p0: usize, w: *const dkern.wq_b.Out, topk: A, tr: usize) !?A {
     const ly = &m.layers[li];
-    const ls = &st.layers[li];
     if (ly.wo_a.s.ctx == null or ly.wo_b.s.ctx == null) return null;
-    const L = dim(w.q, 0);
+    return blockRowsProject(sc, m, ly, try blockRowsHeads(sc, m, st, li, p0, w.q, topk, tr));
+}
+
+fn blockRowsHeads(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, p0: usize, q: A, topk: A, tr: usize) !A {
+    const ly = &m.layers[li];
+    const ls = &st.layers[li];
+    const L = dim(q, 0);
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.cfg.head_dim)));
     const inv = ropeFor(m, li).inv;
     // The indexer already masks each row's future picks. Its visible prefix fits this layer's
@@ -5223,18 +5228,22 @@ fn blockRowsAttnOut(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, p0: usize
     const window_only = ly.ratio == 0 or topk.ctx == null;
     const grouped = m.exact_attn_group and (window_only or (tr >= ly.ratio and
         picksAt(tr, m.cfg.dsv4_index_topk, p0 + 1) == dim(topk, 1)));
-    const r = if (grouped) blk: {
+    return if (grouped) blk: {
         const comp = if (window_only) none else try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view((p0 + L) / ly.ratio, sc.s));
         m.grouped_attn_layers += 1;
-        break :blk try attnDecode(sc, m, ly, w.q, ls.win, comp, if (window_only) none else topk, p0, scale, inv);
+        break :blk try attnDecode(sc, m, ly, q, ls.win, comp, if (window_only) none else topk, p0, scale, inv);
     } else blk: {
         var heads: [dkern.max_rows]A = undefined;
         for (0..L) |l| {
             const cr = try rowPicks(sc, m, st, li, p0, l, topk, tr);
-            heads[l] = try attnDecode(sc, m, ly, try sc.slice(w.q, 0, l, l + 1), ls.win, cr[0], cr[1], p0 + l, scale, inv);
+            heads[l] = try attnDecode(sc, m, ly, try sc.slice(q, 0, l, l + 1), ls.win, cr[0], cr[1], p0 + l, scale, inv);
         }
         break :blk try sc.concat(heads[0..L], 0);
     };
+}
+
+fn blockRowsProject(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, r: A) !?A {
+    const L = dim(r, 0);
     const og = dim(ly.wo_a.w, 0);
     const ob = try sc.transpose(try sc.reshape(r, &.{ ci(L), ci(og), -1 }), &.{ 1, 0, 2 }); // [og, L, in]
     const oa = try rowQmv(sc, &ly.wo_a, ob) orelse return null; // [og, L, o_lora]
@@ -7261,6 +7270,10 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
 /// is one decode token a state; with `verify` each chunk is a DSpark verify `[t1, drafts…]` (`dsparkBeginWith`'s
 /// rollback anchors, kept by `finishVerify`). Returns every row's `[R, V]` f32 logits, state by state (caller frees).
 pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, chunks: []const []const u32, verify: bool) !A {
+    return extendBatchedImpl(m, gpa, states, gens, chunks, verify, false);
+}
+
+fn extendBatchedImpl(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, chunks: []const []const u32, verify: bool, comptime join_ffn: bool) !A {
     const c = &m.cfg;
     const N = chunks.len;
     if (N == 0 or N > region_rows or states.len != N or gens.len != N or m.pair != null or m.streamed != null) return error.Dsv41BatchUnsupported;
@@ -7273,6 +7286,7 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
         offs[k + 1] = offs[k] + ch.len;
     }
     const R = offs[N];
+    if (join_ffn and (!verify or N != 2 or R > dkern.max_rows or !exactServes(m) or m.tp != null or m.dec.attn != null or !m.exact_ffn_group)) return error.Dsv41BatchUnsupported;
     for (states, 0..) |st, k| for (states[0..k]) |o| if (o == st) return error.Dsv41BatchUnsupported;
     for (states, gens) |st, g| {
         if (st.verify != null) return error.Dsv41BatchUnsupported;
@@ -7345,7 +7359,7 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
         }
     }
     for (0..m.n_layers) |li| {
-        try batchedLayer(m, gpa, states, &sp, li);
+        if (join_ffn) try twoStreamLayer(m, gpa, states, &sp, li) else try batchedLayer(m, gpa, states, &sp, li);
         if (li + 1 == m.n_layers) break;
         // As a solo decode step: hand each layer to the GPU as it is built.
         var ev: std.ArrayList(A) = .empty;
@@ -7363,11 +7377,18 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
         if (verify) st.verify.?.mh = sc.out(mh) else try commitMain(&sc, m, st, mh, st.n);
     };
     for (states, chunks) |st, ch| st.n += ch.len;
-    const rows = try gpa.alloc(A, N);
+    const rows = try gpa.alloc(A, if (join_ffn) R else N);
     defer gpa.free(rows);
-    for (rows, 0..) |*h, k| h.* = try hcCollapse(&sc, sp.xs[k], sp.pres[k]);
+    if (join_ffn) {
+        for (chunks, 0..) |ch, k| for (0..ch.len) |j| {
+            rows[offs[k] + j] = try hcCollapse(&sc, try sc.slice(sp.xs[k], 0, j, j + 1), try sc.slice(sp.pres[k], 0, j, j + 1));
+        };
+    } else for (rows, 0..) |*h, k| {
+        h.* = try hcCollapse(&sc, sp.xs[k], sp.pres[k]);
+    }
     // A tensor rank past 0 holds no head: its last streams stand in for the logits.
-    const logits = if (!m.hasHead()) try sc.astype(try sc.concat(rows, 0), .float32) else try sc.astype(try m.head.apply(&sc, try sc.rms(try sc.concat(rows, 0), m.norm, c.rms_norm_eps)), .float32);
+    const hidden = try sc.concat(rows, 0);
+    const logits = if (join_ffn) try headRows(&sc, m, hidden) else if (!m.hasHead()) try sc.astype(hidden, .float32) else try sc.astype(try m.head.apply(&sc, try sc.rms(hidden, m.norm, c.rms_norm_eps)), .float32);
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     try ev.append(gpa, logits);
@@ -7382,6 +7403,14 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     return sc.out(logits);
 }
 
+fn twoStreamLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, sp: *const Spans, li: usize) !void {
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    var x: [2]A = undefined;
+    for (&x, 0..) |*row, k| row.* = try spanInAt(&sc, m, gpa, sp, li, k, true);
+    if (!try batchedFused(&sc, m, states, sp, li, &x, true)) return error.Dsv41BatchUnsupported;
+}
+
 /// Layer `li` of `extendBatched`: the compiled stretches over every state's rows, attention per state.
 fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, sp: *const Spans, li: usize) !void {
     const N = sp.xs.len;
@@ -7390,7 +7419,7 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
     const parts = try gpa.alloc(A, N);
     defer gpa.free(parts);
     for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
-    if (m.tp != null and try batchedFused(&sc, m, states, sp, li, parts)) return;
+    if (m.tp != null and try batchedFused(&sc, m, states, sp, li, parts, false)) return;
     if (li >= m.regions.len or !compiledAt(m, sp.L)) {
         // No compiled stretch at this width: each state's block alone.
         for (parts, states, 0..) |x, st, k| {
@@ -7446,7 +7475,7 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
 /// A tensor split's `batchedLayer` on the fused decode kernels, false (before any state moves) where they decline: the
 /// projections over every state's rows in one launch each, rows roped at their own state's positions; each state's
 /// window, compressor, indexer and attention its own. Without NAX only (the attention there is the split kernel).
-fn batchedFused(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const Spans, li: usize, parts: []const A) !bool {
+fn batchedFused(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const Spans, li: usize, parts: []const A, comptime exact: bool) !bool {
     const kp = &(m.dec.in_proj orelse return false);
     const kq = m.dec.wq_b orelse return false;
     if (m.dec.attn != null or sp.L > dkern.max_rows or li >= m.regions.len or m.streamed != null) return false;
@@ -7466,7 +7495,18 @@ fn batchedFused(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const S
         const lo, const hi = sp.bounds(k);
         const p0 = st.n;
         const ls = &st.layers[li];
-        try ls.win.write(try sc.slice(w.kv_row, 0, lo, hi), p0, sc.s);
+        const kv = try sc.slice(w.kv_row, 0, lo, hi);
+        const previous = if (exact) try sc.keep(ref(ls.win.buf)) else none;
+        try ls.win.write(kv, p0, sc.s);
+        if (exact) {
+            ls.win.prev = previous;
+            ls.win.fresh = try sc.astype(kv, mlx.mlx_array_dtype(previous));
+            ls.win.fresh_p0 = p0;
+        }
+        defer if (exact) {
+            ls.win.prev = none;
+            ls.win.fresh = none;
+        };
         var comp_rows = none;
         var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k] };
         if (ly.ratio > 0) {
@@ -7478,14 +7518,23 @@ fn batchedFused(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const S
             if (ly.idx) |_| sh.topk = if (clen == 0) none else try indexerQ(sc, m, st, li, try sc.slice(a.iw.?, 0, lo, hi), try sc.slice(w.q_idx.?, 0, lo, hi), p0, &sh);
             if (clen > 0 and sh.topk.ctx != null) comp_rows = try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s));
         }
-        heads[k] = try attnDecode(sc, m, ly, try sc.slice(w.q, 0, lo, hi), ls.win, comp_rows, sh.topk, p0, scale, inv);
+        const q = try sc.slice(w.q, 0, lo, hi);
+        heads[k] = if (exact) try blockRowsHeads(sc, m, st, li, p0, q, sh.topk, topkRatio(m, li)) else try attnDecode(sc, m, ly, q, ls.win, comp_rows, sh.topk, p0, scale, inv);
         hold(&sp.topks[k], sh.topk);
         hold(&sp.cands[k], sh.cand);
     }
-    var ao: [1]A = undefined;
-    try runRegion(sc, m, li, .attn_out, &.{try sc.concat(heads[0..states.len], 0)}, &ao);
+    const combined = try sc.concat(heads[0..states.len], 0);
     var pre = none;
-    const y = try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &w.sa, &pre);
+    const y = if (exact) blk: {
+        const ao = try blockRowsProject(sc, m, ly, combined) orelse return error.Dsv41BatchUnsupported;
+        const f = try blockRowsFfn(sc, m, li, x, ao, &w.sa) orelse return error.Dsv41BatchUnsupported;
+        pre = f[1];
+        break :blk f[0];
+    } else blk: {
+        var ao: [1]A = undefined;
+        try runRegion(sc, m, li, .attn_out, &.{combined}, &ao);
+        break :blk try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &w.sa, &pre);
+    };
     for (0..states.len) |k| {
         const lo, const hi = sp.bounds(k);
         hold(&sp.xs[k], try sc.slice(y, 0, lo, hi));
@@ -9985,6 +10034,199 @@ fn profColdRead(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
             std.debug.print("[cold-read] pass={d} arm={d} order={d} loads={d} tg={d} us={d:.2} GB/s={d:.1}\n", .{ pass, id, arm.order, arm.loads, arm.tg, us, 33554.432 / us });
         }
     }
+}
+
+test "dsv41 decode two-stream: verify rows and rollback against each serial greedy state" {
+    const dir = env.span(.DSV41_TWO_STREAM_METER) orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cfg = try testConfig(io, dir);
+    var weights = try loadPack(io, gpa, dir, false);
+    defer weights.deinit();
+    const m = try init(gpa, &cfg, &weights, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = true });
+    defer m.deinit();
+    try testing.expect(exactServes(m) and m.exact_ffn_group);
+    var sts: [2]State = undefined;
+    var oracle: [2]State = undefined;
+    var kept: [2]State = undefined;
+    var next: [2]u32 = undefined;
+    for (0..2) |k| {
+        var prompt: [1055]u32 = undefined;
+        const ids = prompt[0 .. 1023 + k * 32];
+        for (ids, 0..) |*t, i| t.* = @intCast((i * 7919 + 13 + k * 104729) % @min(m.vocab, 100000));
+        for ([_]*State{ &sts[k], &oracle[k], &kept[k] }) |st| {
+            st.* = try initState(m, gpa);
+            const l = try meterPrefill(m, gpa, st, ids);
+            defer _ = mlx.mlx_array_free(l);
+            next[k] = try argmaxHost(l);
+        }
+    }
+    defer for (&sts, &oracle, &kept) |*s, *o, *p| {
+        s.deinit();
+        o.deinit();
+        p.deinit();
+    };
+    const lens = [2]usize{ 3, 3 };
+    const keeps = [2]usize{ 3, 1 };
+    var ids: [2][3]u32 = undefined;
+    var chunks: [2][]const u32 = undefined;
+    var probes: [2]u32 = undefined;
+    var expected: std.ArrayList(f32) = .empty;
+    defer expected.deinit(gpa);
+    for (0..2) |k| {
+        for (0..lens[k]) |j| {
+            ids[k][j] = if (j == keeps[k]) @intCast((next[k] + 1) % m.vocab) else next[k];
+            const l = try extend(m, gpa, &oracle[k], ids[k][j..][0..1], .last);
+            defer _ = mlx.mlx_array_free(l);
+            const row = try hostF32(l);
+            defer gpa.free(row);
+            try expected.appendSlice(gpa, row);
+            next[k] = try argmaxHost(l);
+            if (j < keeps[k]) {
+                const keep = try extend(m, gpa, &kept[k], ids[k][j..][0..1], .last);
+                defer _ = mlx.mlx_array_free(keep);
+                probes[k] = try argmaxHost(keep);
+            }
+        }
+        chunks[k] = ids[k][0..lens[k]];
+    }
+    const l = try extendBatchedImpl(m, gpa, &.{ &sts[0], &sts[1] }, &.{ 1, 2 }, &chunks, true, true);
+    defer _ = mlx.mlx_array_free(l);
+    const actual = try hostF32(l);
+    defer gpa.free(actual);
+    try testing.expectEqual(expected.items.len, actual.len);
+    var mismatches: usize = 0;
+    for (0..6) |j| {
+        const off = j * m.vocab;
+        var changed: usize = 0;
+        for (actual[off..][0..m.vocab], expected.items[off..][0..m.vocab]) |a, b| {
+            if (@as(u32, @bitCast(a)) != @as(u32, @bitCast(b))) changed += 1;
+        }
+        mismatches += changed;
+        std.debug.print("[two-proof] row={d} differing-words={d}/{d}\n", .{ j, changed, m.vocab });
+    }
+    for (0..2) |k| {
+        try finishVerify(m, gpa, &sts[k], keeps[k]);
+        try testing.expectEqual(kept[k].n, sts[k].n);
+        const probe = try extend(m, gpa, &sts[k], probes[k..][0..1], .last);
+        defer _ = mlx.mlx_array_free(probe);
+        const solo_probe = try extend(m, gpa, &kept[k], probes[k..][0..1], .last);
+        defer _ = mlx.mlx_array_free(solo_probe);
+        const a = try hostF32(probe);
+        defer gpa.free(a);
+        const b = try hostF32(solo_probe);
+        defer gpa.free(b);
+        var changed: usize = 0;
+        for (a, b) |x, y| {
+            if (@as(u32, @bitCast(x)) != @as(u32, @bitCast(y))) changed += 1;
+        }
+        mismatches += changed;
+        std.debug.print("[two-proof] slot={d} kept={d} next-differing-words={d}/{d}\n", .{ k, keeps[k], changed, m.vocab });
+    }
+    try testing.expectEqual(@as(usize, 0), mismatches);
+    if (env.span(.DSV41_ROUND_SERIES)) |arm| {
+        var tok = try @import("../../sdk/tokenizer/tokenizer.zig").loadTokenizer(io, gpa, dir);
+        defer tok.deinit();
+        var prompts: [2][]const u32 = undefined;
+        var owned: [2][]u32 = undefined;
+        var oracle_ids: [2][48]u32 = undefined;
+        const paths: [2][]const u8 = if (env.get(.DSV41_ROUND_PROOF)) |_| .{ "docs/reference.md", "src/engines/mlx/scheduler.zig" } else .{ "docs/gotchas/engine-mlx.md", "src/plugins/deepseek_v41/config.zig" };
+        for (paths, 0..) |path, k| {
+            const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4 << 20));
+            defer gpa.free(text);
+            owned[k] = try tok.encode(gpa, text);
+            prompts[k] = owned[k][0 .. 1023 + 32 * k];
+            var st = try initState(m, gpa);
+            defer st.deinit();
+            _ = try serialGreedy(m, &st, prompts[k], oracle_ids[k].len, &oracle_ids[k]);
+        }
+        defer for (owned) |ids_| gpa.free(ids_);
+        var it = std.mem.tokenizeScalar(u8, arm, ',');
+        while (it.next()) |name| {
+            const mode = std.meta.stringToEnum(TwoStreamMode, name) orelse return error.UnknownArm;
+            try twoStreamTime(m, gpa, prompts, mode, oracle_ids);
+        }
+    }
+}
+
+const TwoStreamMode = enum { plain, dspark, exact_plain, replay };
+
+fn twoStreamTime(m: *Dsv41Model, gpa: std.mem.Allocator, prompts: [2][]const u32, mode: TwoStreamMode, oracle: [2][48]u32) !void {
+    const spec = mode == .dspark;
+    const exact = spec or mode == .exact_plain;
+    var sts = [_]State{ try initState(m, gpa), try initState(m, gpa) };
+    defer for (&sts) |*st| st.deinit();
+    const ptrs = [_]*State{ &sts[0], &sts[1] };
+    var next: [2]u32 = undefined;
+    for (&sts, prompts, &next) |*st, p, *n| {
+        const l = try meterPrefill(m, gpa, st, p);
+        defer _ = mlx.mlx_array_free(l);
+        n.* = try argmaxHost(l);
+    }
+    var sent = [2]usize{ 0, 0 };
+    var emitted: [2][48]u32 = undefined;
+    var paired: usize = 0;
+    var accepted: usize = 0;
+    var submitted: usize = 0;
+    var draft_us: i64 = 0;
+    var verify_us: i64 = 0;
+    const begin = monoUs();
+    while (sent[0] < 48 and sent[1] < 48) {
+        var chunks = [2][]const u32{ next[0..1], next[1..2] };
+        var drafts: [2]DsparkDraft = undefined;
+        if (spec) {
+            const at = monoUs();
+            try dsparkDraftBatched(m, gpa, &ptrs, &next, false, &drafts);
+            draft_us += monoUs() - at;
+            for (&drafts, &chunks) |d, *c| c.* = d.ids[0..@min(3, d.len + 1)];
+        }
+        defer if (spec) for (&drafts) |*d| d.deinit(gpa);
+        const start = monoUs();
+        const l = if (exact) try extendBatchedImpl(m, gpa, &ptrs, &.{ 1, 2 }, &chunks, true, true) else try extendBatched(m, gpa, &ptrs, &.{ 1, 2 }, &chunks, false);
+        defer _ = mlx.mlx_array_free(l);
+        var sc = Scope.init(gpa, m.s);
+        defer sc.deinit();
+        const best = try hostI32(try sc.astype(try sc.argmax(l, -1), .int32));
+        defer gpa.free(best);
+        var off: usize = 0;
+        for (chunks, 0..) |ch, k| {
+            var keep: usize = 1;
+            var bonus: u32 = undefined;
+            while (true) {
+                bonus = @intCast(best[off + keep - 1]);
+                if (keep == ch.len or keep == 48 - sent[k] or bonus != ch[keep]) break;
+                keep += 1;
+            }
+            @memcpy(emitted[k][sent[k]..][0..keep], ch[0..keep]);
+            if (exact) try finishVerify(m, gpa, &sts[k], keep);
+            submitted += ch.len - 1;
+            accepted += keep - 1;
+            sent[k] += keep;
+            next[k] = if (mode == .replay and sent[k] < 48) oracle[k][sent[k]] else bonus;
+            off += ch.len;
+        }
+        verify_us += monoUs() - start;
+        paired += 1;
+    }
+    const together = monoUs() - begin;
+    const joint_tokens = sent[0] + sent[1];
+    for (&sts, &sent, &next, &emitted) |*st, *n, *t, *out| {
+        while (n.* < 48) {
+            out[n.*] = t.*;
+            const l = try extend(m, gpa, st, t[0..1], .last);
+            defer _ = mlx.mlx_array_free(l);
+            t.* = try argmaxHost(l);
+            n.* += 1;
+        }
+    }
+    const elapsed = monoUs() - begin;
+    var differs: usize = 0;
+    for (emitted, oracle) |a, b| for (a, b) |x, y| {
+        if (x != y) differs += 1;
+    };
+    std.debug.print("[two-time] mode={s} us={d} joint-us={d} joint-tokens={d} rounds={d} accepted={d}/{d} draft-us={d} verify-us={d} token-diffs={d}\n", .{ @tagName(mode), elapsed, together, joint_tokens, paired, accepted, submitted, draft_us, verify_us, differs });
+    if (exact) try testing.expectEqual(@as(usize, 0), differs);
 }
 
 test "dsv41 decode rows: fresh prompts and eight independent greedy states (DSV41_ROW_METER)" {
