@@ -114,7 +114,7 @@ fn logScale(g: *Graph, offset: c_int, l: c_int, floor: u32, alpha: f32) !Array {
 pub fn attend(g: *Graph, a: rel_attn.Args) !Array {
     const qs = ops.shape(a.q);
     if (qs[2] != 1) {
-        if (qs[2] >= rel_attn.MIN_ROWS) return rel_attn.attend(g, a);
+        if (qs[2] > rel_attn.MIN_ROWS) return rel_attn.attend(g, a);
         // A window under the kernel's floor (a speculative round's verify rows): each row as a decode row reads
         // it, over its own keys. The op chain scores every key for every row and rounds differently from decode.
         const total = ops.shape(a.k)[2];
