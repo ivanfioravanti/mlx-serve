@@ -96,7 +96,7 @@ pub fn parts(w: *const Weights, g: *Graph, x: Array, x32: ?Array) !Parts {
     const experts_n = ops.shape(w.gate_up.w)[0];
     // Under four pairs an expert MLX gathers one pair at a time, reading each expert's weights again for every row
     // that picked it; padding to four takes its sorted row-block kernel, which reads each expert once. Below 1.5
-    // pairs an expert the padding costs more than the reads it saves (M3 Ultra: even at 24 rows of top-8 of 128).
+    // pairs an expert the padding costs more than the reads it saves.
     const pad: c_int = if (sort and t * k < 4 * experts_n and 2 * t * k >= 3 * experts_n) 4 * experts_n - t * k else 0;
     if (sort and pad > 0) {
         // Padded pairs repeat the chunk's own experts on a zero row, so no other expert is read.
