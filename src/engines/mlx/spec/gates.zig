@@ -229,6 +229,38 @@ pub const PldCost = struct {
     }
 };
 
+/// A lost context lets every this-many-th request speculate again, so a verdict cannot outlive what caused it.
+pub const PLD_MEMORY_RETRY: u32 = 8;
+
+/// What the cost gate last decided per context size on one loaded model, in memory only: a request in a context
+/// that lost by `PLD_COST_DECISIVE` starts with PLD off instead of paying three rounds and a probe to find out
+/// again.
+pub const PldMemory = struct {
+    /// One cell per power of two of the context's tokens.
+    lost: [32]bool = @splat(false),
+    skipped: [32]u32 = @splat(0),
+
+    fn bucket(tokens: usize) usize {
+        return std.math.log2_int(usize, @max(tokens, 1));
+    }
+
+    /// Asked once at a request's first PLD step: whether it starts with PLD off.
+    pub fn startsOff(m: *PldMemory, tokens: usize) bool {
+        const b = bucket(tokens);
+        if (!m.lost[b]) return false;
+        m.skipped[b] += 1;
+        return m.skipped[b] % PLD_MEMORY_RETRY != 0;
+    }
+
+    /// A request's verdict at `tokens` of context: `ratio` is PLD's ms per token over plain's when it was dropped,
+    /// or anything under the margin when it was kept.
+    pub fn record(m: *PldMemory, tokens: usize, ratio: f32) void {
+        const b = bucket(tokens);
+        m.lost[b] = ratio >= PLD_COST_DECISIVE;
+        if (!m.lost[b]) m.skipped[b] = 0;
+    }
+};
+
 /// Decode plain in the batched group. Sticky for DFlash (plain rounds do not extend the
 /// assistant context); PLD's periodic re-enable check resumes once the slot is solo.
 pub fn yieldSpecToCompany(self: *Generator, mode: []const u8) void {
@@ -497,4 +529,20 @@ test "PldCost: cold steps count as PLD's cost, and a later stretch is judged on 
     try std.testing.expect(c.pays());
     for (0..PLD_COST_WARMUP) |_| v = c.spec(60, 6);
     try std.testing.expectEqual(PldCost.Verdict.keep, v);
+}
+
+test "PldMemory: a decisive loss turns PLD off for that context size, with a retry, until a request keeps it" {
+    var m: PldMemory = .{};
+    try std.testing.expect(!m.startsOff(60_000));
+    m.record(60_000, 3.4);
+    // 36k and 65k share a power of two; 2k does not.
+    for (1..PLD_MEMORY_RETRY) |_| try std.testing.expect(m.startsOff(36_000));
+    try std.testing.expect(!m.startsOff(65_000));
+    try std.testing.expect(m.startsOff(65_000));
+    try std.testing.expect(!m.startsOff(2_200));
+    // A loss inside twice the plain cost is not remembered, and a kept request clears the cell.
+    m.record(2_200, 1.4);
+    try std.testing.expect(!m.startsOff(2_200));
+    m.record(60_000, 0.5);
+    try std.testing.expect(!m.startsOff(36_000));
 }

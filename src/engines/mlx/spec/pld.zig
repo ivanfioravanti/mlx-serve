@@ -5,6 +5,7 @@ const transformer_mod = @import("../transformer.zig");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const PLD_COST_MARGIN = @import("gates.zig").PLD_COST_MARGIN;
+const PLD_COST_WARMUP = @import("gates.zig").PLD_COST_WARMUP;
 const pld_index = @import("../../../sdk/spec/pld_index.zig");
 const SSMCacheEntrySnapshot = transformer_mod.SSMCacheEntrySnapshot;
 const ssmSnapshot = transformer_mod.ssmSnapshot;
@@ -103,6 +104,7 @@ pub fn nextPld(
             if (!self.pld_cost.pays()) {
                 if (probe_over) {
                     self.pld_cost.lost = true;
+                    self.xfm.pld_memory.record(contextTokens(self), self.pld_cost.ratio());
                     log.info("  pld=disabled (cost gate: {d:.1} ms/token in rounds vs {d:.1} plain)\n", .{ self.pld_cost.msPerToken(), self.pld_cost.plain_ms });
                 }
                 break :reenable;
@@ -159,6 +161,17 @@ pub fn nextPld(
                 .accepted_tokens = 0,
                 .used_lookup = false,
             };
+        }
+    }
+
+    if (!self.pld_memory_asked) {
+        self.pld_memory_asked = true;
+        if (self.xfm.pld_memory.startsOff(contextTokens(self))) {
+            log.info("  pld=disabled (cost gate: this context size lost to plain decode on an earlier request)\n", .{});
+            self.spec_disabled_runtime = true;
+            self.disabled_steps = 0;
+            self.pld_cost.lost = true;
+            return nextPld(self, allocator, draft_len, key_len);
         }
     }
 
@@ -530,6 +543,10 @@ pub fn nextPld(
     };
 }
 
+fn contextTokens(self: *const Generator) usize {
+    return self.prompt_ids_owned.len + self.generated_ids.items.len;
+}
+
 fn msSince(watch: io_util.Stopwatch) f32 {
     return @as(f32, @floatFromInt(watch.read())) / 1.0e6;
 }
@@ -540,10 +557,15 @@ fn costStep(self: *Generator, ms: f32, tokens: u32) void {
     const verdict = self.pld_cost.spec(ms, tokens);
     if (self.spec_disabled_runtime) return self.pld_cost.handOff();
     switch (verdict) {
-        .keep => return,
+        .keep => {
+            // Judged at the margin and kept: a later request in this context starts with PLD on.
+            if (self.pld_cost.spec_n == PLD_COST_WARMUP and self.pld_cost.plain_n > 0) self.xfm.pld_memory.record(contextTokens(self), self.pld_cost.ratio());
+            return;
+        },
         .probe => self.pld_cost.beginProbe(),
         .disable => {
             self.pld_cost.handOff();
+            self.xfm.pld_memory.record(contextTokens(self), self.pld_cost.ratio());
             log.info("  pld=disabled (cost gate: {d:.1} ms/token in rounds vs {d:.1} plain, margin {d:.2})\n", .{ self.pld_cost.msPerToken(), self.pld_cost.plain_ms, PLD_COST_MARGIN });
         },
     }
