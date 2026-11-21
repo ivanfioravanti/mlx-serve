@@ -22,7 +22,8 @@ const compiled = @import("compiled.zig");
 /// `x * scale` (f32; null = 1) shrunk to L2 norm `threshold` over the last axis, in f32, cast back to `x`'s dtype: one
 /// kernel, or the compiled chain where it declines.
 pub fn l2Clip(g: *Graph, x: Array, scale: ?Array, threshold: f32) !Array {
-    if (try @import("l2_clip.zig").fused(g, x, scale, threshold)) |out| return out;
+    // A prefill chunk keeps the chain until the kernel's prefill parity on the M3 Ultra is understood.
+    if (ops.shape(x)[1] <= 16) if (try @import("l2_clip.zig").fused(g, x, scale, threshold)) |out| return out;
     return compiled.l2Clip(g, x, scale, threshold);
 }
 
