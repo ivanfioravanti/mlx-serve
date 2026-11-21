@@ -23,8 +23,8 @@ const proj_launch = metal.Launch{
     .source = gate.PROJ_SOURCE,
     .header = gate.PROJ_HEADER,
     .tg_bytes = 4 * TG / 32,
-    .m1 = 1024,
-    .m2 = 1024,
+    .m1 = 928,
+    .m2 = 928,
 };
 
 const mix_launch = metal.Launch{

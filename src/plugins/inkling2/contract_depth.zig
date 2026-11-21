@@ -19,8 +19,8 @@ const launch = metal.Launch{
     .outputs = &depth_attn.OUTPUTS,
     .source = depth_attn.SOURCE,
     .tg_bytes = @intCast(depth_attn.tgBytes(depth_attn.MAX_BANK, depth_attn.MAX_QUERIES, 2304)),
-    .m1 = 576,
-    .m2 = 576,
+    .m1 = 512,
+    .m2 = 512,
 };
 
 /// A shape's rows are the token rows, n the bank's block states, k the hidden width.

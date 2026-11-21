@@ -483,6 +483,9 @@ pub const Generator = struct {
     /// Steps spent in disabled mode since the gate tripped (drives the
     /// periodic `specShouldReenable` re-check).
     disabled_steps: u64 = 0,
+    /// `pld_attempted` / `pld_accepted_tokens` when PLD was last (re-)enabled: the per-draft gate's zero.
+    pld_gate_attempted0: u64 = 0,
+    pld_gate_accepted0: u64 = 0,
     /// What PLD's tokens cost this request against plain ones (`gates.PldCost`).
     pld_cost: @import("../spec/gates.zig").PldCost = .{},
     /// The cost probe's last plain step has run: the next step decides.
