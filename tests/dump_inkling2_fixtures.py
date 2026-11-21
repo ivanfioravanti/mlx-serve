@@ -2,10 +2,13 @@
 # Needs mlx-lm with the inkling2 model (PR #2086 until it merges). Per prompt: the ids, the last row's top-10 logits
 # after a whole-prompt prefill, and a greedy continuation fed one token at a time. The prompts cover a short one, the
 # chat template, one past the sliding window (1024), one past the log-scaling floor (8192, two prefill chunks) and
-# one with an image.
+# one with an image. Each text prompt is also run on the reference's op chains (its Metal kernels off): their logits at
+# the kernel run's top ids ('chain_logits'), their own top-10 ('chain_top_ids') and the worst gap between the two over
+# the kernel run's top-10 ('self_gap'), the reference's disagreement with itself that a served logit is held to.
 import json, sys
 import mlx.core as mx
 from mlx_lm import load
+import mlx_lm.models.inkling2.layers as inkling2_layers
 
 path, out = sys.argv[1], sys.argv[2]
 model, tok = load(path)
@@ -31,8 +34,16 @@ for name, text in cases.items():
         nxt = int(mx.argmax(logits).item())
     entry["greedy_ids"] = gen
     entry["greedy_text"] = tok.decode(gen)
+    kernels = inkling2_layers._use_kernels
+    inkling2_layers._use_kernels = lambda: False
+    chain = model(mx.array([ids]), cache=model.make_cache())[0, -1].astype(mx.float32)
+    mx.eval(chain)
+    inkling2_layers._use_kernels = kernels
+    entry["chain_logits"] = [chain[i].item() for i in top]
+    entry["chain_top_ids"] = mx.argsort(-chain)[:10].tolist()
+    entry["self_gap"] = max(abs(a - b) for a, b in zip(entry["top_logits"], entry["chain_logits"]))
     res[name] = entry
-    print(name, len(ids), repr(entry["greedy_text"]), top[:3], entry["top_logits"][:3], flush=True)
+    print(name, len(ids), repr(entry["greedy_text"]), top[:3], entry["top_logits"][:3], f"self_gap {entry['self_gap']:.3f}", flush=True)
 
 # One image (220 x 300, off the 40-pixel block grid, so the processor pads it): the tower's rows spliced into a chat.
 import base64, struct, zlib

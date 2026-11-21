@@ -36,5 +36,5 @@ attention block, `rel_attn.zig` the attention read and its simdgroup kernel, `re
 - Declined by name: a variable loop, shared experts, a core off the block boundaries, `use_value_norm_no_gamma` or
   `attn_res_normalize_values` off, q/o biases.
 - Oracle: mlx-lm PR #2086 on `mlx-community/Inkling-2-Mini-4bit` (`tests/dump_inkling2_fixtures.py`,
-  `tests/test_inkling2.sh`); its kernels and its own op chains differ by up to 0.5 logit on a prompt's top tokens,
-  which is the bar a served logit is held to.
+  `tests/test_inkling2.sh`). A prompt's bar is the reference's own kernel-vs-op-chain spread (`self_gap`, floor
+  0.75): a rounding-equivalent change moves a long prompt's worst gap by 0.1-0.3, so no fixed bar tells it from a bug.
