@@ -346,9 +346,13 @@ const TestPair = struct {
     fn prefill(a: std.mem.Allocator, pack: *conformance.Loaded, tokens: []const u32) ![]f32 {
         var cache = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
         defer cache.deinit();
+        return run(a, pack, &cache, tokens, .prefill);
+    }
+
+    fn run(a: std.mem.Allocator, pack: *conformance.Loaded, cache: *test_cache.TestCache, tokens: []const u32, mode: abi.Mode) ![]f32 {
         const h = [_]abi.Handle{cache.handle()};
         var out: abi.ForwardOut = .{};
-        const v = plugin.table.forward(pack.model, &.{ .mode = .prefill, .logits = .all_rows, .rows = @intCast(tokens.len), .tokens = .of(tokens), .slots = .of(&[_]u32{0}), .positions = .of(&[_]u32{0}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out);
+        const v = plugin.table.forward(pack.model, &.{ .mode = mode, .logits = .all_rows, .rows = @intCast(tokens.len), .tokens = .of(tokens), .slots = .of(&[_]u32{0}), .positions = .of(&[_]u32{0}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out);
         if (!v.isOk()) return error.ForwardRefused;
         if (out.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.hidden.ctx });
         return conformance.consumeF32(a, out.logits);
@@ -405,6 +409,35 @@ test "inkling2 tp: rank 0's split plus the worker's share is one node's prefill;
     try testing.expectEqual(@as(usize, 0), fh.lines);
     TestPair.present = true;
     r0.pair.live = true;
+
+    // A capturing forward (the engine's verify mode) over a split chunk leaves the conv inputs the rows' own prefill
+    // would: cut at a row past TP_ROWS, they are one node's state there (the proof's GPU bound).
+    {
+        const long = try a.alloc(u32, TP_ROWS + 60);
+        for (long, 0..) |*t, i| t.* = @intCast(1 + (i * 37 + i / 7) % 59);
+        const visits = rank0.parsed.shell.num_hidden_layers;
+        var held = try test_cache.TestCache.init(a, visits);
+        defer held.deinit();
+        TestPair.calls = 0;
+        _ = try TestPair.run(a, &rank0, &held, long, .verify);
+        try testing.expect(TestPair.calls > 0);
+        const cut = TP_ROWS + 20;
+        var part = try test_cache.TestCache.init(a, visits);
+        defer part.deinit();
+        _ = try TestPair.run(a, &whole, &part, long[0..cut], .prefill);
+        for (held.layers, part.layers) |w, p| {
+            var g = Graph.init(testing.allocator, mlx.gpuStream());
+            defer g.deinit();
+            const state: Array = .{ .ctx = p.conv.ctx };
+            const km1 = ops.shape(state)[1];
+            const got = try g.sliceAxis(.{ .ctx = w.conv_input.ctx }, 1, cut, cut + km1);
+            const diff = try g.call(mlx.mlx_max, .{ try g.abs(try g.sub(got, state)), false });
+            try ops.eval(diff);
+            var v: f32 = 0;
+            try mlx.check(mlx.mlx_array_item_float32(&v, diff));
+            try testing.expect(v <= 2e-2);
+        }
+    }
 
     TestPair.fail_at = 3;
     try testing.expect(agree(want, try TestPair.prefill(a, &rank0, tokens)) >= 98);

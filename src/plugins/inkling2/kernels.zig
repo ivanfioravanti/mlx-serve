@@ -992,7 +992,7 @@ pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle,
     // A long prefill chunk on a tensor-parallel pair: rank 0's pairs and the worker's row sums through the sum kernel.
     if (open == null and !few) if (try tp.exchange(g, L, cfg, m.x, picks[0], weights)) |sp| {
         const o = try pickSum(g, sp.dn, sp.sel, sp.inverse, caps, sp.weights, m.residual, st, L.mlp_conv, conv_scale, sp.picks, false);
-        return .{ .h = o[0], .state = try convState(g, st, kp, vp, m.op, o[1]) };
+        return .{ .h = o[0], .state = try convState(g, st, kp, vp, m.op, o[1]), .xm = o[1] };
     };
 
     const act: [1]Array = if (up) |u| .{u[0]} else if (packed_up) .{(try ups(g, L, cfg, m.x, .{ .picks = sel }))[0]} else blk: {
