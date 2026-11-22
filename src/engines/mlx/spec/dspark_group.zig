@@ -12,6 +12,8 @@ const dflash_policy = @import("dflash/policy.zig");
 const intree = @import("../plugin/intree.zig");
 const modules = @import("../modules/call.zig");
 const dspark = @import("dspark.zig");
+const dspark_mod = dspark;
+const plugin_driver = @import("../plugin/driver.zig");
 const Generator = @import("../generate/generator.zig").Generator;
 const DrafterStepResult = @import("drafter.zig").DrafterStepResult;
 const Transformer = @import("../transformer.zig").Transformer;
@@ -35,6 +37,8 @@ pub const MAX_SLOTS: usize = dflash_policy.MAX_GROUP_ROWS;
 /// Whether `xfm` runs DSpark group rounds: a DeepSeek-V4.1 module with its stages that batches its states (resident,
 /// unpaired). Its DSpark slots keep drafting beside company instead of yielding to the plain batch.
 pub fn groupable(xfm: *const Transformer) bool {
+    // A served model whose drafter rounds several slots at once groups its greedy DSpark slots.
+    if (plugin_driver.nativeSlotsRound(xfm) != null) return true;
     const m = intree.dsv41(xfm) orelse return false;
     // An exact model's DSpark slots join no group round, whose verify and accept run the batched kernels. With company
     // they yield to the plain batch after `COMPANY_YIELD_TICKS` (prefill_interleave), as any slot that does not group:
@@ -53,7 +57,10 @@ pub fn exactSolo(xfm: *const Transformer) bool {
 pub fn slotGroupable(slot: *const Slot) bool {
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (gen.spec_disabled_runtime or slotSpecMode(slot, gen) != .dspark) return false;
-    return groupable(slot.model.transformer orelse return false);
+    const xfm = slot.model.transformer orelse return false;
+    // The native batched round is greedy: a sampled request accepts its own blocks, one slot at a time.
+    if (plugin_driver.nativeSlotsRound(xfm) != null and gen.dspark_stochastic) return false;
+    return groupable(xfm);
 }
 
 /// The decode tick's DSpark slots on groupable models: one group round per model, `MAX_SLOTS` slots at a time; a slot
@@ -117,7 +124,10 @@ fn runGroupTickInner(sch: *Scheduler, group: []*Slot) !void {
     if (n == 0) return;
     if (n == 1) return runSingleDecodeTick(sch, live[0]);
     var results: [MAX_SLOTS]DrafterStepResult = undefined;
-    try modules.call("dspark_group_round", .{ gens[0..n], allocs[0..n], results[0..n] });
+    if (plugin_driver.nativeSlotsRound(gens[0].xfm) != null)
+        try dspark_mod.nativeGroupRound(gens[0..n], allocs[0..n], results[0..n])
+    else
+        try modules.call("dspark_group_round", .{ gens[0..n], allocs[0..n], results[0..n] });
     for (live[0..n], gens[0..n], results[0..n]) |slot, gen, r| {
         defer slot.allocator.free(r.tokens);
         publishSpeculativeBlock(sch, slot, gen, r.tokens);

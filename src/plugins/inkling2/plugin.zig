@@ -48,12 +48,15 @@ pub const Spec = struct {
     context: draft.ContextKv = .{},
     /// The engine slot the ring is of, and the rings of other slots, the least recently parked replaced first.
     owner: u32 = 0,
-    parked: [3]Parked = @splat(.{}),
+    /// A ring a slot of a batched group (the engine groups up to 16), each its own context.
+    parked: [15]Parked = @splat(.{}),
     clock: u64 = 0,
     /// Set for a verify: the visits read the caches without appending and leave their rows here.
     opens: ?[]kernels.Open = null,
     /// Set for a batched slots' verify: `visits x slots` Opens, a visit's slots together in slot order.
     batch_opens: ?[]kernels.Open = null,
+    /// A batched forward's engine slots, in its order: each slot's taps go to its own ring.
+    batch_slots: []const u32 = &.{},
     /// A verify's taps `[1, S, taps * hidden]`, held until its accept.
     held: Array = .{},
 
@@ -109,8 +112,11 @@ pub const Spec = struct {
     }
 
     fn deinit(sp: *Spec) void {
-        for ([_]Array{ sp.ring, sp.held, sp.parked[0].ring, sp.parked[1].ring, sp.parked[2].ring }) |a| if (a.ctx != null) {
+        for ([_]Array{ sp.ring, sp.held }) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
+        };
+        for (sp.parked) |p| if (p.ring.ctx != null) {
+            _ = mlx.mlx_array_free(p.ring);
         };
         sp.context.release();
         for (&sp.parked) |*p| p.context.release();
@@ -184,6 +190,8 @@ pub const Model = struct {
 
         const visits = cfg.visits();
         const spec: ?*Spec = if (batched) null else w.spec;
+        // Batched slots tap too: a slot's ring stays current while it decodes in company.
+        const tap_spec: ?*Spec = if (batched and (w.spec == null or w.spec.?.batch_slots.len != run.slots)) null else w.spec;
         const batch_opens: ?[]kernels.Open = if (batched) (if (w.spec) |sp| sp.batch_opens else null) else null;
         const n_slots: usize = @intCast(run.slots);
         var taps: [config.max_taps]ops.Array = undefined;
@@ -203,7 +211,7 @@ pub const Model = struct {
                     n_blocks = loop_blocks;
                 }
             }
-            if (spec) |sp| for (sp.visits, 0..) |tap, k| if (tap == v) {
+            if (tap_spec) |sp| for (sp.visits, 0..) |tap, k| if (tap == v) {
                 taps[k] = try g.keep(h);
             };
             var lg = g.scope();
@@ -242,7 +250,20 @@ pub const Model = struct {
                 if (sp.held.ctx != null) _ = mlx.mlx_array_free(sp.held);
                 sp.held = g.escape(rows);
             } else try sp.push(g, run.positions[0] + @as(u64, @intCast(from)), rows);
-        }
+        } else if (batched) if (tap_spec) |sp| {
+            // Every slot's rows' taps: held for a verify's per-slot commit, else each slot's on its own ring.
+            taps[sp.visits.len] = final;
+            const rows = try g.concat(taps[0 .. sp.visits.len + 1], 2);
+            if (batch_opens != null) {
+                if (sp.held.ctx != null) _ = mlx.mlx_array_free(sp.held);
+                sp.held = g.escape(rows);
+            } else for (sp.batch_slots, 0..) |slot, i| {
+                const r: c_int = run.rows;
+                const at: c_int = @as(c_int, @intCast(i)) * r;
+                sp.select(slot);
+                try sp.push(g, run.positions[i], try g.sliceAxis(rows, 1, at, at + r));
+            }
+        };
         if (batched) final = try g.reshape(final, &.{ run.slots, run.rows, -1 });
         return run.finish(g, &c, final, layers.Head, &w.head);
     }
@@ -260,7 +281,7 @@ pub const table = abi.ModelTable{
     .cache = &.{ .layout = config.layout },
     .weights = &.{},
     .media = &.{ .tower = &media.tower, .prepare = &media.prepare },
-    .spec = &.{ .native_drafter = &.{ .step = &draftStep, .verify = &draftVerify, .finish = &draftFinish, .active = &draftActive } },
+    .spec = &.{ .native_drafter = &.{ .step = &draftStep, .verify = &draftVerify, .finish = &draftFinish, .active = &draftActive, .step_slots = &draftStepSlots } },
 };
 
 fn draftStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
@@ -272,6 +293,12 @@ fn draftStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callco
 fn draftVerify(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
     const m: *Loaded = @ptrCast(@alignCast(mp));
     verifyRound(m, f, out) catch |e| return .{ .code = .failed, .why = abi.Str.of(@errorName(e)) };
+    return .ok;
+}
+
+fn draftStepSlots(mp: *anyopaque, f: *const abi.Forward, rounds: [*]abi.Round) callconv(.c) abi.Verdict {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    roundSlots(m, f, rounds) catch |e| return .{ .code = .failed, .why = abi.Str.of(@errorName(e)) };
     return .ok;
 }
 
@@ -474,6 +501,96 @@ fn round(m: *Loaded, f: *const abi.Forward, out: *abi.ForwardOut) !void {
     @memcpy(out.round.tokens[0 .. 1 + accepted], o.ids[0 .. 1 + accepted]);
 }
 
+/// One greedy round for each of `f`'s slots (`NativeDrafter.step_slots`): each drafts from its own ring, all read
+/// their blocks in ONE batched open verify (each padded to the widest by repeating its last id), and each keeps the
+/// rows its own picks agree with, committed from its own windows with their taps on its ring. With no slot drafting,
+/// one batched plain step.
+fn roundSlots(m: *Loaded, f: *const abi.Forward, rounds: [*]abi.Round) !void {
+    const w = &m.base.weights;
+    const cfg = &w.body.cfg;
+    const n = f.slots.len;
+    if (n < 2 or n > max_group or f.caches.len != n or f.positions.len < n or f.tokens.len != n) return error.Inkling2DraftRound;
+    const co = f.cache_ops orelse return error.Inkling2DraftRound;
+    const sp = w.spec orelse return error.Inkling2DraftRound;
+    const dr = m.drafter orelse return error.Inkling2DraftRound;
+    const slots = f.slots.slice();
+    const caches = f.caches.slice();
+    const positions = f.positions.slice();
+    const g = try gpa.create(ops.Graph);
+    g.* = ops.Graph.init(gpa, m.base.s);
+    defer {
+        g.deinit();
+        gpa.destroy(g);
+    }
+    const cap: u32 = @min(f.accept_cap, dr.cfg.block - 1);
+    const min_sure = m.row_cost.cut();
+    var drafts: [max_group]u32 = @splat(0);
+    var ids: [max_group][abi.max_round_tokens]u32 = undefined;
+    var width: u32 = 1;
+    for (0..n) |i| {
+        const t1 = f.tokens.slice()[i];
+        ids[i][0] = t1;
+        sp.select(slots[i]);
+        if (cap == 0 or sp.rows(positions[i]) == 0) continue;
+        const pos = [_]u32{positions[i]};
+        const r: run_mod.Run = .{ .mode = .verify, .rows = 1, .positions = &pos, .caches = caches[i .. i + 1], .cache_ops = co };
+        var c = r.ctx(g, &m.base.shared);
+        const first = try g.fromSlice(i32, &.{@intCast(t1)}, &.{1});
+        const anchor = try g.rmsNorm(try b.embed.TableEmbed.forward(&w.embed, &c, try g.reshape(first, &.{ 1, 1 })), w.embed_norm, cfg.rms_norm_eps);
+        const drafted = try dr.draft(g, first, anchor, sp.ring, @intCast(positions[i]), &w.head.lin, w.head.vocab, w.head.softcap, &sp.context);
+        try ops.evalMany(&.{ drafted.tokens, drafted.confidence });
+        const sure = mlx.mlx_array_data_float32(drafted.confidence) orelse return error.Inkling2DraftRound;
+        const tokens = mlx.mlx_array_data_int32(drafted.tokens) orelse return error.Inkling2DraftRound;
+        drafts[i] = draftsToVerify(sure[0..cap], tokens[0..cap], min_sure, f.stop_ids.slice());
+        for (0..drafts[i]) |k| ids[i][1 + k] = @intCast(tokens[k]);
+        width = @max(width, 1 + drafts[i]);
+    }
+    var flat: [max_group * abi.max_round_tokens]u32 = undefined;
+    for (0..n) |i| for (0..width) |k| {
+        flat[i * width + k] = ids[i][@min(k, drafts[i])];
+    };
+    const opens = try gpa.alloc(kernels.Open, if (width > 1) cfg.visits() * n else 0);
+    defer gpa.free(opens);
+    @memset(opens, .{ .g = g });
+    sp.batch_slots = slots;
+    defer sp.batch_slots = &.{};
+    if (width > 1) sp.batch_opens = opens;
+    defer sp.batch_opens = null;
+    var fo: abi.ForwardOut = .{};
+    defer for ([_]abi.Array{ fo.logits, fo.hidden }) |x| if (x.ctx != null) {
+        _ = mlx.mlx_array_free(.{ .ctx = x.ctx });
+    };
+    const v = run_mod.tableForward(Model, &m.base, &.{ .mode = .batched_rows, .logits = .all_rows, .rows = width, .tokens = .of(flat[0 .. n * width]), .slots = f.slots, .positions = f.positions, .caches = f.caches, .cache_ops = co }, &fo);
+    if (!v.isOk()) return error.Inkling2DraftRound;
+    const picked = try picks(g, .{ .ctx = fo.logits.ctx }, f.suppress_mask);
+    try ops.eval(picked);
+    const want = mlx.mlx_array_data_int32(picked) orelse return error.Inkling2DraftRound;
+    const mine = try gpa.alloc(kernels.Open, cfg.visits());
+    defer gpa.free(mine);
+    for (0..n) |i| {
+        const row = want[i * width ..][0..width];
+        var accepted: u32 = 0;
+        while (accepted < drafts[i] and row[accepted] == @as(i32, @intCast(ids[i][1 + accepted]))) accepted += 1;
+        const kept: u32 = 1 + accepted;
+        // A plain step's row was appended by the forward; a verify's kept rows are committed from its windows.
+        if (width > 1) {
+            for (mine, 0..) |*o, vi| o.* = opens[vi * n + i];
+            const pos = [_]u32{positions[i]};
+            const r: run_mod.Run = .{ .mode = .verify, .rows = @intCast(kept), .positions = &pos, .caches = caches[i .. i + 1], .cache_ops = co };
+            var c = r.ctx(g, &m.base.shared);
+            try kernels.commit(&c, cfg, mine, @intCast(kept));
+            sp.select(slots[i]);
+            const at: c_int = @intCast(i * width);
+            try sp.push(g, positions[i], try g.sliceAxis(sp.held, 1, at, at + @as(c_int, @intCast(kept))));
+        }
+        rounds[i] = .{ .n = kept, .accepted = accepted, .next_token = @intCast(row[accepted]), .rows = 1 + drafts[i], .position = positions[i] + kept };
+        @memcpy(rounds[i].tokens[0..kept], ids[i][0..kept]);
+    }
+}
+
+/// Slots a batched round takes: the engine's DSpark group.
+const max_group = 16;
+
 /// The first half of a sampled round (`NativeDrafter.verify`): the open verify's rows' ids and logits `[rows, vocab]`
 /// f32 for the engine to accept, the verify kept open until `finishVerify` (a new one discards it).
 fn verifyRound(m: *Loaded, f: *const abi.Forward, out: *abi.ForwardOut) !void {
@@ -558,6 +675,12 @@ fn unload(mp: *anyopaque) callconv(.c) void {
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
     const m: *Loaded = @ptrCast(@alignCast(mp));
     if (f.slots.len == 1) m.spec.select(f.slots.slice()[0]);
+    // A batched tick's slots tap their own rings (a stacked prompt's prefill, a verify, a decode step).
+    const batched = f.mode == .batched_rows and f.slots.len > 1;
+    if (batched) m.spec.batch_slots = f.slots.slice();
+    defer if (batched) {
+        m.spec.batch_slots = &.{};
+    };
     return run_mod.tableForward(Model, &m.base, f, out);
 }
 
@@ -1031,15 +1154,24 @@ test "inkling2 draft taps: each engine slot keeps its own ring" {
     try std.testing.expectEqual(@as(c_int, 2), sp.rows(12));
     sp.select(9);
     try std.testing.expectEqual(@as(c_int, 1), sp.rows(13));
-    // Slot 1 parks 9 and slot 2 parks 1 in the free places; slot 3 then takes the place of 7, parked longest.
-    for ([_]u32{ 1, 2, 3 }) |id| {
+    // A group of 16 slots keeps 16 rings (the current one and 15 parked): each still ends where it was pushed.
+    var ids: [16]u32 = undefined;
+    for (&ids, 0..) |*id, k| id.* = @intCast(100 + k);
+    for (ids) |id| {
         sp.select(id);
-        try sp.push(&g, 0, row);
+        try sp.push(&g, 5, row);
     }
-    sp.select(9);
-    try std.testing.expectEqual(@as(c_int, 1), sp.rows(13));
-    sp.select(7);
-    try std.testing.expectEqual(@as(c_int, 0), sp.rows(12));
+    for (ids) |id| {
+        sp.select(id);
+        try std.testing.expectEqual(@as(c_int, 1), sp.rows(6));
+    }
+    // A 17th takes the place of the one parked longest (100, selected first above), and only that one.
+    sp.select(200);
+    try sp.push(&g, 5, row);
+    sp.select(ids[1]);
+    try std.testing.expectEqual(@as(c_int, 1), sp.rows(6));
+    sp.select(ids[0]);
+    try std.testing.expectEqual(@as(c_int, 0), sp.rows(6));
 }
 
 // Bar: the drafter loads from an M3 on (and where the generation is unknown), never on an M1 (g13) or M2 (g14).

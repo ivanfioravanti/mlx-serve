@@ -1480,6 +1480,57 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop_
     return out.round;
 }
 
+/// The served drafter's rounds over several slots at once (`NativeDrafter.step_slots`), null without one.
+pub fn nativeSlotsRound(xfm: *const Transformer) ?*const fn (*anyopaque, *const abi.Forward, [*]abi.Round) callconv(.c) abi.Verdict {
+    const nd = nativeDrafter(xfm) orelse return null;
+    if (nd.size < @offsetOf(abi.NativeDrafter, "step_slots") + @sizeOf(@TypeOf(nd.step_slots))) return null;
+    return nd.step_slots;
+}
+
+/// `nativeRound` for each of `ctxs` in one call: slot i's committed token `t1s[i]`, its round in `out[i]`. `cap` is the
+/// most drafts any slot keeps (the tightest of theirs).
+pub fn nativeRoundSlots(xfm: *Transformer, ctxs: []const *ForwardCtx, t1s: []const u32, cap: u32, stop_ids: []const u32, out: []abi.Round) !void {
+    const b = xfm.plugin.?;
+    const step_slots = nativeSlotsRound(xfm) orelse return error.PluginForwardUnsupported;
+    const n = ctxs.len;
+    if (n > MAX_BATCH_ROWS or t1s.len != n or out.len != n) return error.PluginForwardUnsupported;
+    var slots: [MAX_BATCH_ROWS]cache_ops.Slot = undefined;
+    var handles: [MAX_BATCH_ROWS]abi.Handle = undefined;
+    var positions: [MAX_BATCH_ROWS]u32 = undefined;
+    var slot_ids: [MAX_BATCH_ROWS]u32 = undefined;
+    for (ctxs, 0..) |c, i| {
+        if (c.ablation != null) return error.PluginForwardUnsupported;
+        slots[i] = slotFor(xfm, c);
+        handles[i] = slots[i].handle();
+        positions[i] = @intCast(c.cache.step);
+        slot_ids[i] = settle.slotId(b, c);
+    }
+    const f: abi.Forward = .{
+        .mode = .batched_rows,
+        .rows = 1,
+        .tokens = .of(t1s),
+        .slots = .of(slot_ids[0..n]),
+        .positions = .of(positions[0..n]),
+        .caches = .of(handles[0..n]),
+        .cache_ops = &cache_ops.ops,
+        .accept_cap = cap,
+        .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
+        .stop_ids = .of(stop_ids),
+    };
+    intree.enterBatch(ctxs);
+    const v = step_slots(b.model, &f, out.ptr);
+    intree.leaveBatch();
+    if (!v.isOk()) {
+        log.err("[plugin] {s}: batched draft round failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
+        return error.PluginForwardFailed;
+    }
+    for (ctxs, out) |c, r| {
+        if (r.n == 0 or r.n > abi.max_round_tokens) return error.PluginForwardFailed;
+        c.cache.step = @intCast(r.position);
+        c.moe_seq_offset.* = @intCast(r.position);
+    }
+}
+
 /// Whether the served drafter lets the engine accept a block itself (`NativeDrafter.verify` and `finish`): a sampled request.
 pub fn nativeSplit(xfm: *const Transformer) bool {
     const nd = nativeDrafter(xfm) orelse return false;

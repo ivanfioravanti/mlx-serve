@@ -931,6 +931,10 @@ pub const NativeDrafter = extern struct {
     /// Whether this load drafts: a load may leave its drafter out (a GPU it loses on), and then the model has no
     /// stages. Null = always. Read it only when `size` reaches it.
     active: ?*const fn (m: *anyopaque) callconv(.c) bool = null,
+    /// `step` for several slots at once (`f.slots`, their caches and positions; `f.tokens` each one's `t1`): every
+    /// slot drafts from its own context, all verify in one forward, each keeps what its own argmax agrees with and
+    /// writes `rounds[i]`, as its own `step` would. Null = one slot at a time. Read it only when `size` reaches it.
+    step_slots: ?*const fn (m: *anyopaque, f: *const Forward, rounds: [*]Round) callconv(.c) Verdict = null,
 };
 
 /// A trunk tensor a drafter reads beside the trunk's forward.

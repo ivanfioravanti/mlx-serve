@@ -30,6 +30,7 @@ const specDecodeUnsupported = @import("verify.zig").specDecodeUnsupported;
 const intree = @import("../plugin/intree.zig");
 const abi = @import("../../../abi/plugin.zig");
 const plugin_driver = @import("../plugin/driver.zig");
+const log = @import("../../../sdk/util/log.zig");
 
 
 /// Which DSpark accept rule (if any) the dsv4 chokepoint may arm for a
@@ -148,6 +149,38 @@ fn nativeRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResu
         pol.drafting.record(@as(f32, @floatFromInt(r.n)) * pol.plain.ms, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
     };
     return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = r.accepted, .next_token = r.next_token }, @intCast(r.position));
+}
+
+/// A DSpark group's slots (`dspark_group.MAX_SLOTS`).
+const group_slots = 16;
+
+/// One greedy native round for each of `gens` at once (`plugin_driver.nativeRoundSlots`), `results[i]` slot i's.
+pub fn nativeGroupRound(gens: []*Generator, allocs: []std.mem.Allocator, results: []DrafterStepResult) !void {
+    const n = gens.len;
+    if (n > group_slots) return error.PluginForwardUnsupported;
+    var ctxs: [group_slots]*@import("../forward_ctx.zig").ForwardCtx = undefined;
+    var t1s: [group_slots]u32 = undefined;
+    var cap: u32 = abi.max_round_tokens - 1;
+    for (gens, 0..) |gen, i| {
+        try plugin_settle.activate(gen.xfm, &gen.ctx);
+        ctxs[i] = &gen.ctx;
+        t1s[i] = gen.next_token_id;
+        cap = @min(cap, capAcceptedForTokenBudget(std.math.maxInt(u32), gen.completion_tokens, gen.max_tokens));
+    }
+    var rounds: [group_slots]abi.Round = undefined;
+    const Once = struct {
+        var logged: bool = false;
+    };
+    if (!Once.logged) {
+        Once.logged = true;
+        log.info("[dspark] native draft rounds batched across slots (slots={d})\n", .{n});
+    }
+    try plugin_driver.nativeRoundSlots(gens[0].xfm, ctxs[0..n], t1s[0..n], cap, gens[0].eos_token_ids, rounds[0..n]);
+    for (gens, allocs, results, rounds[0..n]) |gen, a, *res, r| {
+        const tokens = try a.dupe(u32, r.tokens[0..r.n]);
+        gen.dspark_stats.record(r.rows -| 1, r.accepted);
+        res.* = (try gen.commitDsparkRound(a, .{ .tokens = tokens, .accepted = r.accepted, .next_token = r.next_token }, @intCast(r.position))).?;
+    }
 }
 
 /// One DSpark round on the DeepSeek-V4/V4.1 module itself (`modules.call`).
