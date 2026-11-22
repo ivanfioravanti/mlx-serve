@@ -96,11 +96,10 @@ pub const Host = extern struct {
     /// also answers null for a host older than this field. Any thread.
     quant_claimant: ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable = null,
 
-    /// Tensor-parallel experts (`--dist tensor`): hands the paired worker one MoE layer's rows `x` `[t, d]`, their
-    /// routes `idx` `[t, k]` u32 and weights `[t, k]` f32, and writes its share's partial `[t, d]` (f32, or bf16 for
-    /// bf16 rows) to `out` as a
-    /// receive queued behind the sends, so a graph that adds it after the local share overlaps the wire. A refusal =
-    /// no worker or it left: the caller runs the whole MLP. Inference thread. Read it through `expertExchangeOf`.
+    /// Tensor-parallel experts (`--dist tensor`): hands the paired worker one MoE layer's rows `x` `[t, d]`, its
+    /// pairs `idx` `[p, 2]` u32 (row, expert; sorted by expert) and their weights `[p]` f32, and writes the worker's
+    /// weighted sum over them `[t, d]` (f32, or bf16 for bf16 rows) to `out`. A refusal = no worker or it left: the
+    /// caller runs the whole MLP. Inference thread. Read it through `expertExchangeOf`.
     expert_exchange: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, weights: Array, out: *Array) callconv(.c) Verdict = null,
 };
 

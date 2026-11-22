@@ -1059,9 +1059,9 @@ pub const DistHooks = extern struct {
     plan: ?*const fn (p: *const Parsed, hosts: u32, out: [*]LayerSpan, cap: u32) callconv(.c) u32 = null,
     /// This machine's part of a forward.
     serve: ?*const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict = null,
-    /// A tensor-parallel worker's share of one MoE layer (`--dist tensor`, the model loaded at `LoadCtx.tp_rank`):
-    /// rows `x` `[t, d]` through the routes `idx` `[t, k]` u32 with weights `[t, k]` f32, the result `[t, d]` f32, the
-    /// share's weighted sum that rank 0 adds to its own (`Host.expert_exchange`). Null = the model splits no experts.
+    /// A tensor-parallel worker's part of one MoE layer (`--dist tensor`, the model loaded at `LoadCtx.tp_rank` 1):
+    /// rows `x` `[t, d]` through the pairs `idx` `[p, 2]` u32 (row, expert) with weights `[p]` f32, the weighted sum
+    /// `[t, d]` f32 that rank 0 adds to its own (`Host.expert_exchange`). Null = the model splits no experts.
     expert_share: ?*const fn (m: *anyopaque, layer: u32, x: Array, idx: Array, weights: Array, out: *Array) callconv(.c) Verdict = null,
 };
 
