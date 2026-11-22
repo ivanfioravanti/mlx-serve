@@ -203,6 +203,10 @@ pub const Loaded = struct {
         zero_experts: bool = false,
         /// On the GPU stream (the stream's reads land behind Metal events), not the CPU's.
         gpu: bool = false,
+        /// `LoadCtx.host`, `tp_rank` and `tp_size`.
+        host: ?*const @import("../../abi/host.zig").Host = null,
+        tp_rank: u32 = 0,
+        tp_size: u32 = 0,
     };
 
     pub fn open(io: std.Io, a: Allocator, name: []const u8, table: *const model_abi.ModelTable, fx: fixture.Fixture) !Loaded {
@@ -238,7 +242,7 @@ pub const Loaded = struct {
         }
         const src = weights.source();
         var why: Verdict = .{};
-        self.model = table.load(&.{ .model_dir = .of(self.staged.path), .dir = &self.staged.dir, .parsed = &self.parsed, .settings_json = .of(opts.settings), .stream = .{ .ctx = self.stream.ctx }, .weights = &src }, &why) orelse {
+        self.model = table.load(&.{ .model_dir = .of(self.staged.path), .dir = &self.staged.dir, .parsed = &self.parsed, .settings_json = .of(opts.settings), .stream = .{ .ctx = self.stream.ctx }, .weights = &src, .host = opts.host, .tp_rank = opts.tp_rank, .tp_size = opts.tp_size }, &why) orelse {
             // A plugin whose kernels this device cannot run says so by name; the suite has nothing to check here.
             if (why.code == .unsupported) return error.UnsupportedOnThisDevice;
             return fail(name, "load of its fixture", why.why);
