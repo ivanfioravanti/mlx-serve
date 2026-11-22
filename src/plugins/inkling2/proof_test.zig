@@ -444,6 +444,86 @@ test "inkling2 proof: batched slots serve what each slot serves alone" {
     if (!(mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable())) try batchedApart(a);
 }
 
+/// One stacked prompt forward: slot i's `span` rows `tokens[i * span ..]` from `positions[i]`; the slots' last rows.
+fn stackedStep(a: std.mem.Allocator, pack: *conformance.Loaded, caches: []test_cache.TestCache, tokens: []const u32, positions: []const u32, span: usize) !?[]f32 {
+    var handles: [8]abi.Handle = undefined;
+    var slots: [8]u32 = undefined;
+    for (caches, 0..) |*c, i| {
+        handles[i] = c.handle();
+        slots[i] = @intCast(i);
+    }
+    var out: abi.ForwardOut = .{};
+    const v = pack.table.forward(pack.model, &.{ .mode = .batched_rows, .logits = .last_row, .rows = @intCast(span), .tokens = .of(tokens), .slots = .of(slots[0..caches.len]), .positions = .of(positions), .caches = .of(handles[0..caches.len]), .cache_ops = &test_cache.ops }, &out);
+    if (!v.isOk()) return null;
+    if (out.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.hidden.ctx });
+    return try conformance.consumeF32(a, out.logits);
+}
+
+// Bar: three slots of different lengths take a 6-row prompt span each in ONE batched forward (the kernels' rows, a
+// conv state per slot chained over its span, each slot's keys its own): each slot's last row is what the slot serves
+// alone, the next batched step too, and each slot's captured conv inputs cut to the state its span leaves. The op
+// chain (a CPU stream) refuses the stack by name.
+test "inkling2 proof: stacked prompt spans serve what each slot serves alone" {
+    const a = testing.allocator;
+    const lens = [3]usize{ 3, 7, 11 };
+    const span = 6;
+    {
+        var s = try Setup.init(a, false);
+        defer s.deinit(a);
+        var sl: Slots = .{};
+        defer sl.deinit();
+        try sl.init(a, &s.pack, lens);
+        var tokens: [3 * span]u32 = undefined;
+        var positions: [3]u32 = undefined;
+        for (lens, 0..) |n, i| {
+            @memcpy(tokens[i * span ..][0..span], prompt[n .. n + span]);
+            positions[i] = @intCast(n);
+        }
+        try testing.expect(try stackedStep(a, &s.pack, &sl.caches, &tokens, &positions, span) == null);
+    }
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return;
+    var s = try Setup.init(a, true);
+    defer s.deinit(a);
+    try testing.expect(s.pack.parsed.caps.stacks_prompts);
+    var alone: Slots = .{};
+    defer alone.deinit();
+    try alone.init(a, &s.pack, lens);
+    var stacked: Slots = .{};
+    defer stacked.deinit();
+    try stacked.init(a, &s.pack, lens);
+    var tokens: [3 * span]u32 = undefined;
+    var positions: [3]u32 = undefined;
+    for (lens, 0..) |n, i| {
+        @memcpy(tokens[i * span ..][0..span], prompt[n .. n + span]);
+        positions[i] = @intCast(n);
+    }
+    const got = (try stackedStep(a, &s.pack, &stacked.caches, &tokens, &positions, span)).?;
+    defer a.free(got);
+    for (lens, 0..) |n, i| {
+        const want = try step(a, &s.pack, &alone.caches[i], prompt[n .. n + span], n, .last_row);
+        defer a.free(want);
+        try expectRows(got[i * VOCAB .. (i + 1) * VOCAB], want);
+        for (stacked.caches[i].layers, alone.caches[i].layers) |st, al| {
+            const win: ops.Array = .{ .ctx = st.conv_input.ctx };
+            const want_state: ops.Array = .{ .ctx = al.conv.ctx };
+            const km1 = ops.shape(want_state)[1];
+            try testing.expectEqual(@as(c_int, span) + km1, ops.shape(win)[1]);
+            var g = ops.Graph.init(a, mlx.gpuStream());
+            defer g.deinit();
+            fx_stream = g.s;
+            try expectClose(try g.sliceAxis(win, 1, span, span + km1), want_state, 2e-2, "stacked capture");
+        }
+    }
+    const after = [3]usize{ lens[0] + span, lens[1] + span, lens[2] + span };
+    const got_next = try stacked.next(a, &s.pack, after, 0);
+    defer a.free(got_next);
+    for (after, 0..) |n, i| {
+        const want = try step(a, &s.pack, &alone.caches[i], prompt[n .. n + 1], n, .last_row);
+        defer a.free(want);
+        try expectRows(got_next[i * VOCAB .. (i + 1) * VOCAB], want);
+    }
+}
+
 /// Three slots, each a prompt prefix of its own length, prefilled on fresh caches.
 const Slots = struct {
     caches: [3]test_cache.TestCache = undefined,

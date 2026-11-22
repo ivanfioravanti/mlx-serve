@@ -3,7 +3,7 @@
 // threads each square their own element into BUF for the group to sum, so no thread loops over a head's inputs.
 // QP, GP [1, S, H * HD], RP [1, S, H * DREL], KP, VP [1, S, HKV * HD] are the q, gate, relative, k and v projections
 // (T); the k and v convs run over the rows behind the windows before them (ST [1, KT - 1, >= 2 * HKV * HD] f32, k
-// then v), or with SEQ 0 each row behind its own window (ST [S, KT - 1, .]: the rows are sequences of their own). Static convs take KW, VW [C, KT, 1] (WT) and round their sum to WT as the conv op does; dynamic ones (DYN)
+// then v), or a state per sequence of SR rows (ST [S / SR, KT - 1, .]: batched slots, a row or a prompt span each). Static convs take KW, VW [C, KT, 1] (WT) and round their sum to WT as the conv op does; dynamic ones (DYN)
 // take KW, VW [KT, C] (WT) plus each head's projected taps KDY, VDY [1, S, HKV * KT] (T), tap `lag` on the input
 // `lag` rows back. QS [H, HD] and RS [H, DREL] (S) scale q and the relative states before their L2 clips.
 // PR = { qk clip, rel clip, eps, tau, conv scale, KV }.
@@ -19,6 +19,9 @@ const uint QD = H * HD;
 const uint C = HKV * HD;
 const uint R = RJ_shape[1];
 const uint SW = ST_shape[2];
+// Rows a sequence: one state the rows chain behind (SR = ROWS), a state per row (SR = 1), or per slot of SR rows.
+const uint SR = ROWS / ST_shape[0];
+const uint local = row % SR, seq = row / SR;
 const float qk_thr = PR[0], rel_thr = PR[1], eps = PR[2], tau = PR[3], cs = PR[4];
 threadgroup float buf[HD];
 if (i < QD) {
@@ -44,9 +47,9 @@ if (r < 2 * C) {
     const float x = float(is_v ? VP[row * C + c] : KP[row * C + c]);
     float y = 0.0f;
     for (uint j = 0; j < KT; j++) {
-        // Tap j reads row `row + j` of [ST | the rows]; SEQ 0: tap j of [the row's own ST | the row].
+        // Tap j reads row `local + j` of [the sequence's ST | its rows].
         float wv = x;
-        if (SEQ ? row + j < KT - 1 : j + 1 < KT) wv = ST[(SEQ ? row + j : row * (KT - 1) + j) * SW + off + c];
+        if (local + j < KT - 1) wv = ST[(seq * (KT - 1) + local + j) * SW + off + c];
         else if (j + 1 < KT) wv = float(is_v ? VP[(row + j - (KT - 1)) * C + c] : KP[(row + j - (KT - 1)) * C + c]);
         float wt;
         if (DYN) {

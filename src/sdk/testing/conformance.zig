@@ -343,9 +343,13 @@ pub fn consumeF32(a: Allocator, arr: Array) ![]f32 {
     defer _ = mlx.mlx_array_free(x);
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
+    var t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t);
+    try mlx.check(mlx.mlx_astype(&t, x, .float32, s));
+    // An f32 view (one slot's last row of several) comes back from the cast as itself: read it row-major.
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
-    try mlx.check(mlx.mlx_astype(&f, x, .float32, s));
+    try mlx.check(mlx.mlx_contiguous(&f, t, false, s));
     try mlx.check(mlx.mlx_array_eval(f));
     const n = mlx.mlx_array_size(f);
     const data = mlx.mlx_array_data_float32(f) orelse return error.NoData;

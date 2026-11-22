@@ -137,12 +137,15 @@ pub const Model = struct {
         // The embedding is normed before the media rows land on it, as mlx-lm's `embed_inputs`.
         const h = try run.input(g, try g.rmsNorm(try b.embed.TableEmbed.forward(&w.embed, &c, ids), w.embed_norm, w.body.cfg.rms_norm_eps), ids);
         if (run.slots == 1) return sequence(w, shared, g, h, run);
-        // Batched slots, a row each, ride the kernels as rows; elsewhere (a CPU stream, several rows) a slot at a time.
-        if (run.rows == 1 and kernels.batches(g, &w.body, h, run.slots)) {
-            var out = try sequence(w, shared, g, try g.reshape(h, &.{ 1, run.slots, -1 }), run);
-            if (out.hidden.ctx != null) out.hidden = try g.reshape(out.hidden, &.{ run.slots, 1, -1 });
+        // Batched slots ride the kernels as rows, a row each or a prompt span each (stacked); elsewhere (a CPU stream)
+        // a row each, a slot at a time.
+        if (kernels.batches(g, &w.body, h, run.slots)) {
+            var out = try sequence(w, shared, g, try g.reshape(h, &.{ 1, run.slots * run.rows, -1 }), run);
+            if (out.hidden.ctx != null) out.hidden = try g.reshape(out.hidden, &.{ run.slots, run.rows, -1 });
             return out;
         }
+        // The op chain is one sequence a visit: a stack of prompt spans rides the kernels or is refused.
+        if (run.rows > 1) return error.Inkling2StackNeedsKernels;
         const n: usize = @intCast(run.slots);
         if (n > kernels.max_slots) return error.TooManySlots;
         var logits: [kernels.max_slots]ops.Array = undefined;
@@ -238,7 +241,7 @@ pub const Model = struct {
                 sp.held = g.escape(rows);
             } else try sp.push(g, run.positions[0] + @as(u64, @intCast(from)), rows);
         }
-        if (batched) final = try g.reshape(final, &.{ run.slots, 1, -1 });
+        if (batched) final = try g.reshape(final, &.{ run.slots, run.rows, -1 });
         return run.finish(g, &c, final, layers.Head, &w.head);
     }
 };
