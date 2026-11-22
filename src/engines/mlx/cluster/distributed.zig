@@ -20,6 +20,8 @@ const h3_split = @import("../../../plugins/minimax_h3/cluster.zig");
 const wire = @import("../../../sdk/util/wire.zig");
 const lan = @import("../../../host/lan/lan.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
+const plugin_driver = @import("../plugin/driver.zig");
+const sushi_pack = @import("../../../sdk/quant/exl3/sushi_pack.zig");
 
 pub const Mode = enum {
     /// Each rank owns a contiguous range of layers; the hidden stream hops at the seams.
@@ -287,6 +289,8 @@ const OP_DSV41_TP_FREE: i32 = 11;
 const OP_DSV41_TP_SNAP: i32 = 12;
 /// Tensor parallel: a snapshot rank 0 read from disk (`dsv41.tpLoadPlan`'s tensors), the worker's copy of its cache.
 const OP_DSV41_TP_LOAD: i32 = 13;
+/// Tensor mode, a plugin that splits its own experts: rows, routes and weights out, the worker's f32 share back.
+const OP_EXPERTS: i32 = 14;
 pub const OP_RELEASE = wire.OP_RELEASE;
 
 /// `link` as a plugin's split job talks over it (`sdk/util/wire.zig`).
@@ -505,6 +509,14 @@ pub const Peer = struct {
         const ls = mlx.getShape(logits);
         self.exchanges += 1;
         try self.sendOrdered(.{ OP_MOE, xs[0], xs[1], xs[2], ls[ls.len - 1], @backingInt(mlx.mlx_array_dtype(x)), @intCast(layer), @backingInt(mlx.mlx_array_dtype(logits)) }, &.{ x, logits });
+    }
+
+    /// Tensor mode, a plugin's experts: rows `x` `[t, d]`, routes `idx` `[t, k]` u32 and weights `[t, k]` f32.
+    pub fn sendExperts(self: *Peer, x: mlx.mlx_array, idx: mlx.mlx_array, weights: mlx.mlx_array, layer: u32) !void {
+        if (!self.ready) try self.awaitReady();
+        const xs = mlx.getShape(x);
+        self.exchanges += 1;
+        try self.sendOrdered(.{ OP_EXPERTS, xs[0], xs[1], mlx.getShape(idx)[1], @backingInt(mlx.mlx_array_dtype(x)), @intCast(layer), 0, 0 }, &.{ x, idx, weights });
     }
 
     /// The worker's partial for the layer input `x`: its shape and dtype.
@@ -749,10 +761,22 @@ pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Pa
 pub fn hostShare(model_dir: []const u8, config: *const model_mod.ModelConfig, whole: u64) u64 {
     if (!holds(model_dir)) return whole;
     const g = cluster().group.?;
+    // Rank 0 keeps its full banks beside its share of them.
+    if (g.mode == .tensor and config.sharesPluginExperts()) return whole + expertBytes(g.io, g.allocator, model_dir, whole) / 2;
     const n: u64 = config.num_hidden_layers;
     if (n == 0) return whole;
     if (peer()) |p| if (p.planned) return if (p.mode == .tensor) whole / 2 + whole / 10 else whole * p.span.len() / n;
     return shareFor(g, config, whole, status.getAvailableMemBytes() >> 20, worker_free_mib.load(.acquire));
+}
+
+/// The routed experts' bytes of the pack at `model_dir` (`.mlp.experts.` tensors); `whole` where its headers cannot be read.
+fn expertBytes(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, whole: u64) u64 {
+    const Experts = struct {
+        pub fn bill(_: @This(), t: sushi_pack.Stored) !u64 {
+            return if (std.mem.indexOf(u8, t.key, ".mlp.experts.") != null) t.bytes else 0;
+        }
+    };
+    return sushi_pack.residentBytes(io, a, model_dir, Experts{}) catch whole;
 }
 
 fn shareFor(g: Group, config: *const model_mod.ModelConfig, whole: u64, mine: u64, theirs: u64) u64 {
@@ -858,6 +882,16 @@ fn join() !*Peer {
 
 fn plan(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []const u8) !void {
     if (config.isDsv41()) return planDsv41(self, config, model_dir);
+    if (self.mode == .tensor and config.sharesPluginExperts()) {
+        self.shard = .{ .rank = 0, .size = 2 };
+        log.info("[dist] tensor: each expert of {s} split across this Mac and the worker on long prefill chunks\n", .{std.fs.path.basename(self.model)});
+        const n = config.num_hidden_layers;
+        const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts) };
+        self.plan_id = try pl.send(&self.link, model_dir);
+        self.planned = true;
+        expert_exchange.get().f = &expertExchange;
+        return;
+    }
     if (!config.isQwen4()) {
         log.err("[dist] {s}: this architecture ({s}) has no multi-Mac path yet\n", .{ self.model, config.model_type });
         return error.DistArchUnsupported;
@@ -882,6 +916,16 @@ fn plan(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []const u8
     }
     self.plan_id = try pl.send(&self.link, model_dir);
     self.planned = true;
+}
+
+const expert_exchange = @import("../../../host/plugin_host_impl.zig").expert_exchange_shared;
+
+/// Rank 0: a plugin's expert rows to the worker and its share back (`Host.expert_exchange`).
+fn expertExchange(layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, weights: mlx.mlx_array) anyerror!mlx.mlx_array {
+    const p = peer() orelse return error.DistWorkerNotJoined;
+    if (p.failed or !p.planned) return error.DistWorkerLeft;
+    try p.sendExperts(x, idx, weights, layer);
+    return queuedRecv(&p.link, &.{ mlx.getShape(x)[0], mlx.getShape(x)[1] }, .float32, 1);
 }
 
 /// DeepSeek-V4.1: the worker takes a run of layers its share of the memory holds, cut where
@@ -1483,6 +1527,10 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
         log.err("[dist] worker: {s}\n", .{@errorName(err)});
         return err;
     };
+    if (pl.mode == .tensor and config.sharesPluginExperts()) return servePluginExperts(io, allocator, link, dir, &config) catch |err| {
+        log.err("[dist] worker: {s}\n", .{@errorName(err)});
+        return err;
+    };
     var xfm = load(io, allocator, dir, &config, pl.mode, pl.span) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         fail.send(link, LOAD_FAILED);
@@ -1556,6 +1604,55 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
         }
     }
     log.info("[dist] worker: stopped by rank 0 after {d} forwards\n", .{forwards});
+    return false;
+}
+
+/// Worker, a plugin that splits its own experts: loaded at rank 1 (its share of every expert), one share per
+/// OP_EXPERTS, until rank 0 stops or releases it.
+fn servePluginExperts(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: []const u8, config: *model_mod.ModelConfig) !bool {
+    config.dist_shard = .{ .rank = 1, .size = 2 };
+    var t = plugin_driver.load(io, allocator, config, dir, mlx.gpuStream()) catch |err| {
+        log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
+        sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
+        return err;
+    };
+    defer t.deinit();
+    const bound = t.plugin.?;
+    const share = bound.table.dist.?.expert_share.?;
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    try sendMsg(link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
+    log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
+    var shares: u64 = 0;
+    while (true) {
+        const m = try recvMsg(link, 0);
+        switch (m[0]) {
+            OP_STOP => break,
+            OP_RELEASE => return true,
+            OP_EXPERTS => {
+                const x = try queuedRecv(link, &.{ m[1], m[2] }, @fromBackingInt(@intCast(m[4])), 0);
+                defer _ = mlx.mlx_array_free(x);
+                const idx = try queuedRecv(link, &.{ m[1], m[3] }, .uint32, 0);
+                defer _ = mlx.mlx_array_free(idx);
+                const w = try queuedRecv(link, &.{ m[1], m[3] }, .float32, 0);
+                defer _ = mlx.mlx_array_free(w);
+                var out: @import("../../../abi/common.zig").Array = .{};
+                const v = share(bound.model, @intCast(m[5]), .{ .ctx = x.ctx }, .{ .ctx = idx.ctx }, .{ .ctx = w.ctx }, &out);
+                if (!v.isOk()) {
+                    log.err("[dist] worker: expert share at layer {d} refused: {s}\n", .{ m[5], v.why.slice() });
+                    return error.DistBadMessage;
+                }
+                const y: mlx.mlx_array = .{ .ctx = out.ctx };
+                defer _ = mlx.mlx_array_free(y);
+                const sent = try link.send(y, 0);
+                defer _ = mlx.mlx_array_free(sent);
+                try evalOne(sent);
+                shares += 1;
+            },
+            else => return error.DistBadMessage,
+        }
+    }
+    log.info("[dist] worker: stopped by rank 0 after {d} expert shares\n", .{shares});
     return false;
 }
 
@@ -2136,4 +2233,31 @@ test "after the stop message rank 0 sends the worker nothing more" {
     defer cluster().peer_slot = null;
     shutdown();
     try std.testing.expect(!peer().?.ready); // the model's unload at teardown must not message a stopped worker
+}
+
+test "hostShare: rank 0 of a plugin that splits its own experts holds the pack and half its experts again" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest; // a cluster exists only on macOS
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const zeros = try a.alloc(f32, 32);
+    @memset(zeros, 0);
+    const fx = @import("../../../sdk/testing/fixture.zig");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = try fx.safetensors(a, &.{
+        .{ .name = "m.layers.0.mlp.experts.gate_up_proj.weight", .shape = &.{ 4, 8 }, .data = zeros },
+        .{ .name = "m.layers.0.self_attn.q_proj.weight", .shape = &.{ 2, 8 }, .data = zeros[0..16] },
+    }) });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    cluster().group = .{ .io = io, .allocator = a, .mode = .tensor, .model = dir, .split = null };
+    defer cluster().group = null;
+    cluster().joined.store(true, .release);
+    defer cluster().joined.store(false, .release);
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &@import("../../../plugins/inkling2/plugin.zig").table };
+    var c: model_mod.ModelConfig = .{ .model_type = "inkling2_loop", .plugin = &binding, .num_hidden_layers = 1 };
+    // 128 bytes of experts: 64 more than the pack.
+    try std.testing.expectEqual(@as(u64, 1064), hostShare(dir, &c, 1000));
 }
