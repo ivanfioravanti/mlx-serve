@@ -1313,6 +1313,13 @@ pub const ModelConfig = struct {
 
     /// Qwen3.8-Flash-Next (`qwen4_exp`): the qwen3_5 GDN + MoE trunk wrapped
     /// in hyper-connection residual streams, with the n-gram PLE and QSA.
+    /// A plugin that splits its own experts across a tensor-parallel pair (`DistHooks.expert_share`).
+    pub fn sharesPluginExperts(self: *const ModelConfig) bool {
+        const b = self.plugin orelse return false;
+        const d = b.table.dist orelse return false;
+        return d.expert_share != null;
+    }
+
     pub fn isQwen4(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "qwen4_exp");
     }
@@ -4996,7 +5003,9 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     }
     if (config.dist_span == null and config.dist_shard == null and config.dist_dsv41 == null) if (try distributed.planFor(model_dir, config)) |part| switch (part) {
         .span => |sp| try config.applyLayerSpan(sp),
-        .shard => |sh| try config.applyShard(sh),
+        .shard => |sh| if (config.sharesPluginExperts()) {
+            config.dist_shard = sh;
+        } else try config.applyShard(sh),
         .remote => |r| config.pairDsv41(.{ .lo = r.start, .hi = r.end, .worker = false }),
     };
     // A pack an outside quant plugin reads keeps its tensors as stored: the plugin reads its own dtypes.
