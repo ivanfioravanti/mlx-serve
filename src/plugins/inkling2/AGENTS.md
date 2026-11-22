@@ -24,8 +24,11 @@ attention block, `rel_attn.zig` the attention read and its simdgroup kernel, `re
 - Images: no resize (the processor pads to whole 40-pixel blocks at -1/255; an image over the engine's pixel budget
   is shrunk first), one row per block, spliced AFTER the embedding norm. The host renders no-think (`reasoning_effort`
   none = `Thinking effort level: 0.0`) unless the client asks; the reference's default is 0.9.
-- Serial (`batched_rows` refused). A verify forward leaves `.conv_input`, from which PLD's and the drafter's partial
-  accepts roll the conv windows back.
+- Batched decode, one row a slot: the rows ride the sequence axis, the convs run with the slots on the batch axis
+  (the fused conv-sum kernel reads rows as one sequence: skipped), each row attends its own keys. A verify forward
+  leaves `.conv_input`, from which PLD's and the drafter's partial accepts roll the conv windows back.
+- A batched row rounds apart from a solo row (its projections at the batch's width), so batched text is not serial's
+  byte for byte, like drafted text: `batched_test.zig` is the bar; the equivalence script acquits ties to 0.75.
 - Drafter: the checkpoint's DSpark (`mtp.safetensors` beside the pack; `mtp_config` in the trunk's `config.json`) is
   the engine's block drafter in its tap-mix variant (`spec/dflash`, `DflashConfig.tap_mix`). Its taps are the residual
   ENTERING visits 5, 23 and 41 (captured as the outputs of 4, 22, 40) and the final-normed output, published at
