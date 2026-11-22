@@ -1,6 +1,6 @@
 //! Inkling 2's elementwise chains as shapeless `mlx_compile` closures, as mlx-lm compiles them (`_l2_clip`,
 //! `_softcapped_swiglu`): one fused kernel where the op chain is ten dispatches, 48 visits a token. A closure is
-//! traced on the first GPU stream that calls it; a CPU stream, or a build with no GPU backend, runs the chain.
+//! traced on the GPU stream that calls it; a CPU stream, or a build with no GPU backend, runs the chain.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
@@ -45,8 +45,11 @@ fn Multi(comptime n: usize, comptime m: usize, comptime body: fn (*Graph, [n]Arr
 
         pub fn call(g: *Graph, args: [n]Array) ![m]Array {
             if (!mlx.streamOnGpuDevice(g.s)) return body(g, args);
-            if (!tried) {
+            // A retrace runs on the traced stream, and a stream belongs to the thread that made it: compile per stream.
+            if (!tried or !mlx.mlx_stream_equal(stream, g.s)) {
                 tried = true;
+                if (closure.ctx != null) _ = mlx.mlx_closure_free(closure);
+                closure = .{ .ctx = null };
                 stream = g.s;
                 const raw = mlx.mlx_closure_new_func_payload(&trace, null, null);
                 defer _ = mlx.mlx_closure_free(raw);
@@ -217,4 +220,24 @@ test "inkling2 compiled: the closures give the op chains' values, in the input's
         try testing.expect(try maxDiff(&g, both[1], both_want[1]) <= 1e-5);
         try testing.expect(try maxDiff(&g, try residualScale(&g, gate, up, 0.5), try residualScaleBody(&g, .{ gate, up, try g.scalar(0.5, .float32) })) <= 1e-5);
     }
+}
+
+test "inkling2 compiled: a closure traced on another thread's stream retraces on the caller's" {
+    // Bar: a dtype the closure has not seen, called from this thread after another thread traced it, evaluates.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const T = struct {
+        fn run() void {
+            var g = Graph.init(std.heap.c_allocator, mlx.gpuStream());
+            defer g.deinit();
+            const x = g.astype(g.ones(&.{ 1, 3, 8 }, .float32) catch return, .float16) catch return;
+            ops.eval(residualScale(&g, x, x, 0.5) catch return) catch return;
+        }
+    };
+    const th = try std.Thread.spawn(.{}, T.run, .{});
+    th.join();
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    const x = try g.ones(&.{ 1, 3, 8 }, .float32);
+    const y = try residualScale(&g, x, x, 0.5);
+    try testing.expect(try maxDiff(&g, y, x) == 0);
 }
