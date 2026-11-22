@@ -774,8 +774,6 @@ pub fn initWithOptions(
             .low_anchors = options.ssm_low_anchors,
         });
         ctx.prompt_spans = whole_plan.?.spans;
-        // The cache capacity the chunk loop reserves: a model that appends span by span grows it no more often.
-        ctx.cache.reserve(@intCast(reservedPrefillTokens(&xfm.config, total_ctx_for_chunk, max_tokens, PREFILL_CHUNK)));
         if (whole_plan.?.checkpoints.len > 0) {
             prompt_cps = .{
                 .allocator = allocator,
@@ -793,6 +791,8 @@ pub fn initWithOptions(
         }
     }
     if (one_forward_cp > 0) ctx.capture_ssm_seq = true;
+    // The chunk loop's capacity, also for a warm tail too short to chunk: a restored share regrows to it.
+    ctx.cache.reserve(@intCast(reservedPrefillTokens(&xfm.config, total_ctx_for_chunk, max_tokens, PREFILL_CHUNK)));
     const raw_logits = if (tail_mtp_capture) blk: {
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);

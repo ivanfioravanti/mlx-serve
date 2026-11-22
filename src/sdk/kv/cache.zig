@@ -585,16 +585,26 @@ pub const KVCache = struct {
         const drop: usize = if (entry.initialized and entry.keep > 0 and rows > entry.keep) (rows - entry.keep) / ring_drop_align * ring_drop_align else 0;
         const kept: usize = if (entry.initialized) rows - drop else 0;
         const cur_cap = if (oversized) rows else if (entry.initialized) bufferCapacity(entry.keys) else 0;
-        const cap = if (entry.keep > 0) nextCapacity(cur_cap, kept + new_len) else self.nextCapacityReserved(cur_cap, kept + new_len);
+        const cap = if (entry.keep > 0) nextCapacity(cur_cap, kept + new_len) else if (oversized) self.restoredRegrowCapacity(entry, new_len) else self.nextCapacityReserved(cur_cap, kept + new_len);
         return .{ .cap = @intCast(cap), .drop = drop, .kept = kept };
     }
 
     /// A restore that kept only a short prefix of a longer entry regrows from that prefix instead
     /// of copying the whole buffer: a "hi" session restored from an 80k one kept the 80k capacity.
+    /// So does one whose reservation holds its write in less than the donor's buffer: an entry reserved for a longer
+    /// reply than this request asks for.
     fn restoredOversized(self: *const KVCache, entry: *const KVCacheEntry, new_len: usize) bool {
         if (!entry.initialized or !entry.shared_view) return false;
         const rows = entry.offset - entry.base;
-        return entry.shared_rows > self.nextCapacityReserved(rows, rows + new_len);
+        if (entry.shared_rows > self.nextCapacityReserved(rows, rows + new_len)) return true;
+        return self.reserve_tokens >= rows + new_len and self.nextCapacityReserved(0, rows + new_len) < bufferCapacity(entry.keys);
+    }
+
+    /// The capacity a restored share regrows to: its reservation when that holds the write, else the policy from
+    /// the live rows.
+    fn restoredRegrowCapacity(self: *const KVCache, entry: *const KVCacheEntry, new_len: usize) usize {
+        const rows = entry.offset - entry.base;
+        return self.nextCapacityReserved(if (self.reserve_tokens >= rows + new_len) 0 else rows, rows + new_len);
     }
 
     fn cowAffineBuffers(s: mlx.mlx_stream, entry: *KVCacheEntry) !void {

@@ -263,3 +263,48 @@ test "inkling2 served: a 140-row tail's checkpoint cut at 109 rows from one capt
         try testing.expect(dv <= 0.15 * mv);
     }
 }
+
+test "inkling2 served: a request's reservation covers its reply, serial and on two batched slots; KV never grows" {
+    // Bar: zero KV grows past the prompt pass over the whole reply, on the stacked arm (under 1024 keys) as well.
+    const p = (try Served.open()) orelse return error.SkipZigTest;
+    defer p.close();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
+    const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
+    const reserved = @import("../../engines/mlx/generate/prefill_chunk.zig").reservedPrefillTokens;
+    const verify_rows = @import("../../engines/mlx/generate/init.zig").verify_rows_max;
+    const n: usize = 700;
+    const reply: u32 = 24;
+    const chunk: usize = 256;
+    var prompt: [n]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + (37 * (i % 47)) % 20000);
+    {
+        try p.xfm.resetCache();
+        var tok: Tokenizer = undefined; // never read by the Generator
+        var gen = try Generator.initWithOptions(io, a, &p.xfm, &tok, &prompt, reply, .{ .temperature = 0.0 }, &.{}, .{ .pinned_prefill_chunk = @intCast(chunk) });
+        defer gen.deinit(a);
+        try testing.expectEqual(n + reply + verify_rows, gen.ctx.cache.reserve_tokens);
+        const grows = KVCache.kv_cap_buf_grows;
+        var got: usize = 0;
+        while (try gen.next(a)) |_| got += 1;
+        try testing.expectEqual(@as(usize, reply), got);
+        try testing.expectEqual(grows, KVCache.kv_cap_buf_grows);
+    }
+    var lanes: [2]Lane = undefined;
+    for (&lanes) |*l| try l.init(&p.xfm);
+    defer for (&lanes) |*l| l.deinit();
+    for (&lanes, 0..) |*l, i| {
+        l.kv.reserve(@intCast(reserved(&p.cfg, n, reply, chunk)));
+        try l.prefill(n, @intCast(100 + i));
+    }
+    const grows = KVCache.kv_cap_buf_grows;
+    const ptrs = [_]*Lane{ &lanes[0], &lanes[1] };
+    var outs: [2]Array = undefined;
+    for (0..reply) |it| {
+        var g = ops.Graph.init(a, mlx.gpuStream());
+        defer g.deinit();
+        try tick(&g, &p.xfm, &ptrs, &.{ @intCast(1000 + it), @intCast(2000 + it) }, &outs);
+    }
+    try testing.expectEqual(grows, KVCache.kv_cap_buf_grows);
+}

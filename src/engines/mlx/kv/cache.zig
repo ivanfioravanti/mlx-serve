@@ -677,6 +677,66 @@ test "KVCache: an append after a short restore sizes its copy from the prefix, n
     }
 }
 
+test "KVCache: a shared restore's first append copies no more than this request asks, nor than the donor holds" {
+    // Bar: a donor reserved for a long reply is regrown to the next, shorter ask; a donor reserved for a short reply
+    // is copied at its own capacity as before (the longer ask grows once, later); the rows read back are the donor's.
+    const s = mlx.gpuStream();
+    const mk = struct {
+        fn f(str: mlx.mlx_stream, len: c_int, v: f32) !mlx.mlx_array {
+            const shape = [_]c_int{ 1, 2, len, 64 };
+            const val = mlx.mlx_array_new_float(v);
+            defer _ = mlx.mlx_array_free(val);
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_full(&a, &shape, 4, val, .bfloat16, str));
+            return a;
+        }
+    }.f;
+    const rows = 3000;
+    for ([_]kv_quant.KVQuantConfig{ kv_quant.KVQuantConfig.dense, kv_quant.KVQuantConfig.affine(8) }) |cfg| {
+        for ([_][2]usize{ .{ rows + 8192, rows + 300 }, .{ rows + 100, rows + 2000 } }) |asks| {
+            var donor = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+            defer donor.deinit();
+            donor.reserve(asks[0]);
+            {
+                const k = try mk(s, rows, 0.5);
+                defer _ = mlx.mlx_array_free(k);
+                _ = try donor.update(0, k, k, s, 0);
+            }
+            var snap = try donor.snapshot();
+            defer snap.deinit();
+            const donor_cap = KVCache.bufferCapacity(snap.entries[0].keys);
+
+            var cache = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+            defer cache.deinit();
+            try cache.restore(&snap);
+            cache.reserve(asks[1]);
+            const grows = KVCache.kv_cap_buf_grows;
+            const k = try mk(s, 4, 0.25);
+            defer _ = mlx.mlx_array_free(k);
+            _ = try cache.update(0, k, k, s, 0);
+            const ask_cap = (asks[1] + 255) / 256 * 256;
+            try testing.expectEqual(@min(ask_cap, donor_cap), KVCache.bufferCapacity(cache.entries[0].keys));
+            const one = try mk(s, 1, 0.75);
+            defer _ = mlx.mlx_array_free(one);
+            while (cache.entries[0].offset < asks[1]) _ = try cache.update(0, one, one, s, 0);
+            try testing.expectEqual(grows + 1, KVCache.kv_cap_buf_grows);
+            var view = try cache.denseView(0, s);
+            defer view.deinit();
+            var head = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(head);
+            try mlx.check(mlx.mlx_slice(&head, view.k, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, 2, rows, 64 }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+            const want = try mk(s, rows, 0.5);
+            defer _ = mlx.mlx_array_free(want);
+            var eq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eq);
+            try mlx.check(mlx.mlx_array_equal(&eq, head, want, false, s));
+            var ok: bool = false;
+            try mlx.check(mlx.mlx_array_item_bool(&ok, eq));
+            try testing.expect(ok);
+        }
+    }
+}
+
 test "KVCache.compactRows: a tree's accepted path lands as serial appends would, dense and quantized" {
     const s = mlx.gpuStream();
     const base: usize = 6;

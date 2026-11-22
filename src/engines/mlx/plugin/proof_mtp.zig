@@ -382,8 +382,8 @@ test "plugin MTP head: a whole-prompt prefill reserves the chunk loop's KV and a
             .pinned_prefill_chunk = 64,
         });
         defer gen.deinit(a);
-        // The fixture's cache starts unreserved: 700 prompt tokens plus one 64-token chunk of slack.
-        if (whole) try testing.expectEqual(@as(usize, 764), gen.ctx.cache.reserve_tokens);
+        // The fixture's cache starts unreserved: 700 prompt tokens plus the 2-token reply and its widest verify round.
+        if (whole) try testing.expectEqual(@as(usize, 700 + 2 + @import("../generate/init.zig").verify_rows_max), gen.ctx.cache.reserve_tokens);
         try testing.expect(History.n <= History.rows.len);
         bufs[k][0] = History.rows;
         bufs[k][1] = History.at;
@@ -499,12 +499,49 @@ test "plugin MTP head: a self-chunking whole-prompt model's KV reservation and M
         try ops.eval(keys[k]);
         try ops.eval(values[k]);
     }
-    // The chunk loop's reservation (`reservedPrefillTokens`: 700 prompt tokens and a 64-token chunk) on both paths.
-    try testing.expectEqual(@as(usize, 764), reserved[0]);
+    // The chunk loop's reservation (`reservedPrefillTokens`: 700 prompt tokens, the 2-token reply and its widest verify
+    // round) on both paths.
+    try testing.expectEqual(@as(usize, 700 + 2 + @import("../generate/init.zig").verify_rows_max), reserved[0]);
     try testing.expectEqual(reserved[0], reserved[1]);
     // The history holds the prompt's 699 pairs (the last row's pair is the first round's), the same words on both.
     try testing.expectEqual(@as(usize, 699), rows[0]);
     try testing.expectEqual(rows[0], rows[1]);
     try ops.expectBitEqual(keys[1], keys[0]);
     try ops.expectBitEqual(values[1], values[0]);
+}
+
+// Bar: a multi-chunk prompt reserves its reply and the widest verify round, so a request that writes its whole
+// `max_tokens` never reallocates its KV, serial or through PLD verify rounds 16 rows wide.
+test "a request's KV reservation covers its whole reply and every verify round: no grow past the prompt pass" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const KVCache = @import("../../../sdk/kv/cache.zig").KVCache;
+    const verify_rows = @import("../generate/init.zig").verify_rows_max;
+    var b: proof.Served = undefined;
+    try b.open(.{ .quantized = true }, 0x51e7);
+    defer b.close();
+    // A 30-id cycle: PLD finds its key on every step and drafts its full length.
+    var prompt: [300]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(4 + (i % 30) * 7);
+    const reply: u32 = 40;
+    for ([_]bool{ false, true }) |pld| {
+        try b.xfm.resetCache();
+        var tok: Tokenizer = undefined; // never read by the Generator
+        var gen = try Generator.initWithOptions(io, a, &b.xfm, &tok, &prompt, reply, .{ .temperature = 0.0 }, &.{}, .{
+            .pld_enabled = pld,
+            .pinned_prefill_chunk = 64,
+        });
+        defer gen.deinit(a);
+        try testing.expectEqual(prompt.len + reply + verify_rows, gen.ctx.cache.reserve_tokens);
+        const grows = KVCache.kv_cap_buf_grows;
+        var n: usize = 0;
+        while (n < reply) {
+            const r = (try gen.nextPld(a, 15, 2)) orelse break;
+            defer a.free(r.tokens);
+            n += r.tokens.len;
+        }
+        try testing.expect(n >= reply);
+        try testing.expectEqual(grows, KVCache.kv_cap_buf_grows);
+    }
 }

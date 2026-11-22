@@ -363,8 +363,9 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
 }
 
 /// Tokens of KV capacity this prefill reserves up front (#353). A multi-chunk prompt reserves
-/// itself plus one chunk of slack on every arch, since each chunk-by-chunk grow copies the whole
-/// cache; generation headroom is pre-bought only under `longCtxGated`. A request whose bill reserves it
+/// itself plus what its reply can write (the widest verify round past the last token), at most one
+/// chunk, since each chunk-by-chunk grow copies the whole cache; generation headroom is pre-bought
+/// only under `longCtxGated`. A request whose bill reserves it
 /// (`glm5_bill.reservesRequest`) reserves it all, so its decode never grows.
 pub fn reservedPrefillTokens(
     config: *const model_mod.ModelConfig,
@@ -373,9 +374,9 @@ pub fn reservedPrefillTokens(
     chunk: u64,
 ) u64 {
     if (glm5_bill.reservesRequest(config)) return wholeRequestTokens(seq, max_tokens, getEffectiveContextLength(config));
-    const prompt = if (seq > chunk) seq +| chunk else 0;
-    if (!config.longCtxGated()) return prompt;
-    return @max(prompt, transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, config.max_position_embeddings));
+    if (seq <= chunk) return if (config.longCtxGated()) transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, config.max_position_embeddings) else 0;
+    if (!config.longCtxGated()) return seq +| @min(chunk, max_tokens +| verify_rows_max);
+    return @max(seq +| chunk, transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, config.max_position_embeddings));
 }
 
 /// PURE: the rows a whole request writes: the prompt, its reply held to the context `ctx` (none past it), and the rows
@@ -1149,7 +1150,7 @@ test "reservedPrefillTokens: every arch reserves its prompt; only qwen4_exp pre-
 
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama", "mimo_v2" }) |mt| {
         var cfg = model_mod.ModelConfig{ .model_type = mt, .max_position_embeddings = 262_144 };
-        try t.expectEqual(seq + chunk, reservedPrefillTokens(&cfg, seq, max_tokens, chunk));
+        try t.expectEqual(seq + @min(chunk, max_tokens + verify_rows_max), reservedPrefillTokens(&cfg, seq, max_tokens, chunk));
         // One chunk never grows mid-prefill: nothing to reserve.
         try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, chunk, max_tokens, chunk));
     }
@@ -1158,6 +1159,27 @@ test "reservedPrefillTokens: every arch reserves its prompt; only qwen4_exp pre-
     defer cache.deinit();
     cache.reserve(0);
     try t.expectEqual(@as(usize, 0), cache.reserve_tokens);
+}
+
+test "reservedPrefillTokens: the headroom is what the reply can write, at most a chunk; long_ctx keeps its own" {
+    const t = std.testing;
+    const chunk: u64 = 8192;
+    const seq: u64 = 11_760;
+    const omitted: u64 = std.math.maxInt(u32) / 4;
+    for ([_][]const u8{ "inkling2_loop", "qwen3", "gemma4_text", "llama" }) |mt| {
+        var cfg = model_mod.ModelConfig{ .model_type = mt, .max_position_embeddings = 262_144 };
+        try t.expectEqual(seq + chunk, reservedPrefillTokens(&cfg, seq, omitted, chunk));
+        try t.expectEqual(seq + 64 + verify_rows_max, reservedPrefillTokens(&cfg, seq, 64, chunk));
+        try t.expectEqual(seq + 1024 + verify_rows_max, reservedPrefillTokens(&cfg, seq, 1024, chunk));
+        try t.expectEqual(seq + chunk, reservedPrefillTokens(&cfg, seq, 8192, chunk));
+        try t.expectEqual(seq + chunk, reservedPrefillTokens(&cfg, seq, chunk + 1, chunk));
+        try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, chunk, 64, chunk));
+    }
+    var qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .max_position_embeddings = 1_048_576 };
+    for ([_]u64{ 64, 1024, omitted }) |mx| {
+        const old = @max(seq + chunk, transformer_mod.KVCache.reservedTokens(seq, mx, chunk, 1_048_576));
+        try t.expectEqual(old, reservedPrefillTokens(&qwen4, seq, mx, chunk));
+    }
 }
 
 test "explicitPrefillChunkU32: unset is 0, a flag past u32 clamps instead of overflowing" {
