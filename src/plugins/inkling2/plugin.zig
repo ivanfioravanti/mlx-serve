@@ -21,6 +21,7 @@ const blocks = @import("blocks.zig");
 const compiled = @import("compiled.zig");
 const moe = @import("moe.zig");
 const vision = @import("vision.zig");
+const host_abi = @import("../../abi/host.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -44,6 +45,7 @@ pub const table = abi.ModelTable{
     .media = &.{ .tower = &vision.tower, .prepare = &vision.prepare },
     .weights = &.{},
     .spec = &.{ .trunk_weight = &trunkWeight },
+    .dist = &.{ .expert_share = &expertShare },
 };
 
 /// Every term is the engine's default arithmetic over the shell and the layout.
@@ -70,7 +72,20 @@ pub const Layer = struct {
     gates: ?[4]blocks.MessageGate = null,
     /// `[4, hidden]` f32: a looped layer's q, k, v and mlp message queries.
     message_query: Array = .{},
+    /// This rank's share of every expert (`--dist tensor`); null = a single node.
+    share: ?moe.Half = null,
 };
+
+/// A tensor-parallel pair's state on rank 0: the host whose `expert_exchange` reaches the worker, and whether this
+/// request still uses it (a failed exchange finishes the request on this node).
+pub const Tp = struct {
+    host: *const host_abi.Host,
+    live: bool = true,
+};
+
+/// Prefill chunks from this many rows split their experts with the worker; decode, verify rounds and short spans
+/// never cross the wire.
+pub const TP_ROWS = 512;
 
 pub const Head = struct {
     pub const kind: block.Kind = .head;
@@ -98,6 +113,8 @@ pub const Model = struct {
         core_end: u32,
         passes: u32,
         eps: f32,
+        /// Rank 0 of a tensor-parallel pair; null = a single node.
+        tp: ?*Tp = null,
     };
 
     const Trunk = struct {
@@ -128,6 +145,37 @@ pub const Model = struct {
         /// The residual in f32, in `g`.
         fn wide(t: *const Trunk, g: *Graph) !Array {
             return if (t.h32.ctx != null) t.h32 else blocks.f32Of(g, t.h);
+        }
+
+        /// The MLP of a prefill chunk on a tensor-parallel pair: this rank's share of every expert, plus the worker's,
+        /// sent before this share's graph so the return overlaps it; null = the single-node MLP (a short chunk, no
+        /// pair, or the worker gone, which ends the pair for the request and is logged).
+        fn pairMlp(t: *Trunk, L: *const Layer, li: usize, x: Array, x32: Array) !?Array {
+            const tp = t.w.tp orelse return null;
+            const share = L.share orelse return null;
+            if (t.c.offset() == 0) tp.live = true;
+            if (!tp.live or t.c.rows < TP_ROWS) return null;
+            const h = tp.host;
+            const exchange = host_abi.expertExchangeOf(h) orelse return null;
+            const g = t.c.g;
+            const sh = ops.shape(x);
+            const flat = try g.reshape(x, &.{ sh[0] * sh[1], sh[2] });
+            const r = try moe.routed(&L.mlp, g, flat, try g.reshape(x32, &.{ sh[0] * sh[1], sh[2] }));
+            var theirs: host_abi.Array = .{};
+            const v = exchange(h.ctx, @intCast(li), .{ .ctx = flat.ctx }, .{ .ctx = r.idx.ctx }, .{ .ctx = r.weights.ctx }, &theirs);
+            if (!v.isOk()) {
+                // No worker at all is the single-node server, not news.
+                tp.live = false;
+                if (v.code != .unsupported and h.log_enabled(h.ctx, .warn)) {
+                    var buf: [160]u8 = undefined;
+                    const line = std.fmt.bufPrint(&buf, "[inkling2] tensor-parallel worker lost at layer {d}: this request finishes on one node\n", .{li}) catch "";
+                    h.log(h.ctx, .warn, host_abi.Str.of(line));
+                }
+                return null;
+            }
+            const mine = try moe.partial(&L.mlp, g, &share, flat, r);
+            const sum = try g.add(mine, try g.adopt(.{ .ctx = theirs.ctx }));
+            return try g.reshape(try g.astype(sum, ops.dtype(x)), sh);
         }
 
         /// Layer `li` on the residual; `messages` `[1, L, 4, hidden]` in a pass after the first.
@@ -186,11 +234,13 @@ pub const Model = struct {
             var x = try blocks.depthOne(g, t.bank[0..t.blocks], try blocks.rms(g, res, 1e-6), L.mlp_query);
             if (messages) |m| x = try L.gates.?[3].onRow(g, x, m, 3);
             const mlp_in = try blocks.rmsCast(g, x, L.post_norm, eps, dt, true);
-            const parts = try moe.parts(&L.mlp, g, mlp_in.out, mlp_in.twin);
-            // The experts' weighted sum rides the conv kernel where it serves; that kernel reads its rows as one
-            // sequence, so a batched tick's slots take the sum and a conv each.
-            const fused = if (ns == 1) try blocks.sconvSum(g, parts.out, parts.weights, L.mlp_conv, prev[3]) else null;
-            const mc = fused orelse try blocks.bySeq(g, try blocks.sconv(g, try blocks.bySlot(g, try moe.sum(g, parts, ops.shape(mlp_in.out)), ns), L.mlp_conv, prev[3]), ns);
+            const mc = if (try t.pairMlp(L, li, mlp_in.out, mlp_in.twin.?)) |y| try blocks.sconv(g, y, L.mlp_conv, prev[3]) else blk: {
+                const parts = try moe.parts(&L.mlp, g, mlp_in.out, mlp_in.twin);
+                // The experts' weighted sum rides the conv kernel where it serves; that kernel reads its rows as one
+                // sequence, so a batched tick's slots take the sum and a conv each.
+                const fused = if (ns == 1) try blocks.sconvSum(g, parts.out, parts.weights, L.mlp_conv, prev[3]) else null;
+                break :blk fused orelse try blocks.bySeq(g, try blocks.sconv(g, try blocks.bySlot(g, try moe.sum(g, parts, ops.shape(mlp_in.out)), ns), L.mlp_conv, prev[3]), ns);
+            };
             // One copy joins the four windows' last `K - 1` rows (views of the conv kernels' windows).
             try state.put(c, .conv, try g.concat(&.{ a.k.state, a.v.state, ac.state, mc.state }, 2));
             // A verify forward's rejected rows are rolled back from the conv inputs.
@@ -260,6 +310,7 @@ pub const Loaded = struct {
     owned: loader.Owned = .{},
     /// Null on a pack shipped without its tower.
     tower: ?vision.Tower = null,
+    tp: Tp = undefined,
 
     fn release(m: *Loaded) void {
         if (m.tower) |*t| t.deinit();
@@ -276,6 +327,20 @@ fn trunkWeight(mp: *anyopaque, which: abi.TrunkWeight, out: *@import("../../abi/
         .embed => &m.base.weights.embed.table,
         .head => &m.base.weights.head.lin,
     }, out);
+    return .ok;
+}
+
+/// The worker's share of layer `layer`'s experts for rank 0's routes.
+fn expertShare(mp: *anyopaque, layer: u32, x: abi.Array, idx: abi.Array, weights: abi.Array, out: *abi.Array) callconv(.c) abi.Verdict {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    if (layer >= m.layers.len) return .{ .code = .failed, .why = abi.Str.of("expert share past the last layer") };
+    const L = &m.layers[layer];
+    const share = L.share orelse return .{ .code = .unsupported, .why = abi.Str.of("loaded without a tensor-parallel rank") };
+    var g = Graph.init(gpa, m.base.s);
+    defer g.deinit();
+    const y = moe.partial(&L.mlp, &g, &share, .{ .ctx = x.ctx }, .{ .idx = .{ .ctx = idx.ctx }, .weights = .{ .ctx = weights.ctx } }) catch |e|
+        return .{ .code = .failed, .why = abi.Str.of(@errorName(e)) };
+    out.* = .{ .ctx = g.escape(y).ctx };
     return .ok;
 }
 
@@ -415,6 +480,20 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         .passes = c.passes,
         .eps = c.rms_norm_eps,
     };
+    if (ctx.tp_size > 0) {
+        // Each rank cuts its own share; rank 0 keeps the full banks for decode and a request the worker left.
+        var g = Graph.init(gpa, r.s);
+        defer g.deinit();
+        for (m.layers) |*L| {
+            const s = try moe.half(&L.mlp, &g, @intCast(ctx.tp_rank), @intCast(ctx.tp_size));
+            for ([_]Array{ s.gate_up.w, s.gate_up.s, s.gate_up.b, s.down.w, s.down.s, s.down.b }) |a| if (a.ctx != null) try m.owned.own(a);
+            L.share = s;
+        }
+        if (ctx.tp_rank == 0) if (ctx.host) |hp| {
+            m.tp = .{ .host = hp };
+            m.base.weights.tp = &m.tp;
+        };
+    }
     return m;
 }
 
@@ -610,4 +689,79 @@ test {
     _ = @import("rms_cast.zig");
     _ = @import("experts.zig");
     _ = moe;
+}
+
+const conformance = @import("../../sdk/testing/conformance.zig");
+const fake_host = @import("../../sdk/testing/fake_host.zig");
+const test_cache = @import("../../sdk/testing/cache_ops.zig");
+
+/// The worker on the same process: its share of a layer, or a link that fails at `fail_at`.
+const Pair = struct {
+    var worker: *anyopaque = undefined;
+    var fail_at: ?u32 = null;
+    var present: bool = true;
+    var calls: u32 = 0;
+
+    fn exchange(_: ?*anyopaque, layer: u32, x: abi.Array, idx: abi.Array, w: abi.Array, out: *abi.Array) callconv(.c) abi.Verdict {
+        if (!present) return .{ .code = .unsupported, .why = abi.Str.of("no tensor-parallel worker") };
+        calls += 1;
+        if (fail_at == layer) return .{ .code = .failed, .why = abi.Str.of("link down") };
+        return table.dist.?.expert_share.?(worker, layer, x, idx, w, out);
+    }
+
+    fn prefill(a: std.mem.Allocator, pack: *conformance.Loaded, tokens: []const u32) ![]f32 {
+        var cache = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+        defer cache.deinit();
+        const h = [_]abi.Handle{cache.handle()};
+        var out: abi.ForwardOut = .{};
+        const v = table.forward(pack.model, &.{ .mode = .prefill, .logits = .all_rows, .rows = @intCast(tokens.len), .tokens = .of(tokens), .slots = .of(&[_]u32{0}), .positions = .of(&[_]u32{0}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out);
+        if (!v.isOk()) return error.ForwardRefused;
+        if (out.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.hidden.ctx });
+        return conformance.consumeF32(a, out.logits);
+    }
+};
+
+test "inkling2 pair: rank 0's split plus the worker's share is one node's prefill; no worker is its bytes; a lost one falls back and logs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var fh: fake_host.FakeHost = undefined;
+    fh.init(.{ .allocator = a, .level = .warn });
+    fh.table.expert_exchange = &Pair.exchange;
+    var whole = try conformance.Loaded.open(io, a, plugin.name, &table, try conformanceFixture(a));
+    defer whole.close();
+    var worker = try conformance.Loaded.openWith(io, a, plugin.name, &table, try conformanceFixture(a), .{ .tp_rank = 1, .tp_size = 2 });
+    defer worker.close();
+    var rank0 = try conformance.Loaded.openWith(io, a, plugin.name, &table, try conformanceFixture(a), .{ .host = fh.host(), .tp_rank = 0, .tp_size = 2 });
+    defer rank0.close();
+    Pair.worker = worker.model;
+
+    const tokens = try a.alloc(u32, TP_ROWS);
+    for (tokens, 0..) |*t, i| t.* = @intCast((i * 7 + 1) % 60);
+    const want = try Pair.prefill(a, &whole, tokens);
+    // Bar: f32 partial sums in another order, through eight visits.
+    const near = struct {
+        fn check(x: []const f32, y: []const f32) !void {
+            for (x, y) |p, q| try std.testing.expectApproxEqAbs(p, q, 2e-3);
+        }
+    };
+
+    Pair.calls = 0;
+    try near.check(want, try Pair.prefill(a, &rank0, tokens));
+    try std.testing.expectEqual(@as(u32, 8), Pair.calls);
+    // A chunk under the threshold never crosses the wire.
+    Pair.calls = 0;
+    _ = try Pair.prefill(a, &rank0, tokens[0 .. TP_ROWS - 1]);
+    try std.testing.expectEqual(@as(u32, 0), Pair.calls);
+
+    Pair.present = false;
+    try std.testing.expectEqualSlices(f32, want, try Pair.prefill(a, &rank0, tokens));
+    try std.testing.expectEqual(@as(usize, 0), fh.lines);
+    Pair.present = true;
+
+    Pair.fail_at = 3;
+    try near.check(want, try Pair.prefill(a, &rank0, tokens));
+    try std.testing.expect(std.mem.indexOf(u8, fh.last(), "worker lost at layer 3") != null);
+    Pair.fail_at = null;
 }

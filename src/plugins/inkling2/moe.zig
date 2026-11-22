@@ -95,21 +95,25 @@ pub const Half = struct { gate_up: Bank, down: Bank };
 /// `w`'s banks cut to `rank`'s share of `size`, as new evaluated arrays (owned by the caller). Refused where a share
 /// would split a quant group or a gate/up pair.
 pub fn half(w: *const Weights, g: *Graph, rank: c_int, size: c_int) !Half {
-    const rows = ops.shape(w.gate_up.w)[1];
+    // A dense bank is stored `[E, in, out]`, a quantized one `[E, out, in]`.
+    const dense = w.down.s.ctx == null;
+    const rows = ops.shape(w.gate_up.w)[if (dense) 2 else 1];
     if (@rem(rows, 2 * size) != 0) return error.ExpertShareOffPair;
     const inner = @divExact(rows, 2);
     const part = @divExact(inner, size);
-    if (@rem(part, @as(c_int, @intCast(w.down.qp.group_size))) != 0 or @rem(part * @as(c_int, @intCast(w.down.qp.bits)), 32) != 0) return error.ExpertShareOffGroup;
+    const bits: c_int = @intCast(w.down.qp.bits);
+    const gs: c_int = @intCast(w.down.qp.group_size);
+    if (!dense and (@rem(part, gs) != 0 or @rem(part * bits, 32) != 0)) return error.ExpertShareOffGroup;
     const gu_rows = [2]c_int{ 2 * part * rank, 2 * part * (rank + 1) };
-    // Down's packed words and group scales along its input axis.
-    const words = @divExact(part * @as(c_int, @intCast(w.down.qp.bits)), 32);
-    const groups = @divExact(part, @as(c_int, @intCast(w.down.qp.group_size)));
+    // Down's packed words (a dense bank's columns) and group scales along its input axis.
+    const words = if (dense) part else @divExact(part * bits, 32);
+    const groups = if (dense) 0 else @divExact(part, gs);
     var out: Half = .{ .gate_up = w.gate_up, .down = w.down };
-    out.gate_up.w = try cut(g, w.gate_up.w, 1, gu_rows[0], gu_rows[1]);
-    out.gate_up.s = try cut(g, w.gate_up.s, 1, gu_rows[0], gu_rows[1]);
+    out.gate_up.w = try cut(g, w.gate_up.w, if (dense) 2 else 1, gu_rows[0], gu_rows[1]);
+    out.gate_up.s = if (w.gate_up.s.ctx != null) try cut(g, w.gate_up.s, 1, gu_rows[0], gu_rows[1]) else .{};
     out.gate_up.b = if (w.gate_up.b.ctx != null) try cut(g, w.gate_up.b, 1, gu_rows[0], gu_rows[1]) else .{};
-    out.down.w = try cut(g, w.down.w, 2, words * rank, words * (rank + 1));
-    out.down.s = try cut(g, w.down.s, 2, groups * rank, groups * (rank + 1));
+    out.down.w = try cut(g, w.down.w, if (dense) 1 else 2, words * rank, words * (rank + 1));
+    out.down.s = if (!dense) try cut(g, w.down.s, 2, groups * rank, groups * (rank + 1)) else .{};
     out.down.b = if (w.down.b.ctx != null) try cut(g, w.down.b, 2, groups * rank, groups * (rank + 1)) else .{};
     return out;
 }
