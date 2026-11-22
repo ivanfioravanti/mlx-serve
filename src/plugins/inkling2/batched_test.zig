@@ -384,7 +384,7 @@ test "inkling2 stacked: a padded span settles to its own rows, whatever its neig
             left[i] = try g.astype(.{ .ctx = e.conv_state.ctx }, .float32);
             try ops.eval(left[i]);
         };
-        var cp = (try stacked.settleSpan(testing.allocator, &lanes[0].kv, lanes[0].ssm, span, @intCast(width), true, p.xfm.s)).?;
+        var cp = (try stacked.settleSpan(testing.allocator, &lanes[0].kv, lanes[0].ssm, span, @intCast(width), span - 30, p.xfm.s)).?;
         if (width == span) for (lanes[0].ssm, 0..) |e, i| if (e.conv_state.ctx != null) {
             try ops.expectBitEqual(left[i], try g.astype(.{ .ctx = e.conv_state.ctx }, .float32));
         };
