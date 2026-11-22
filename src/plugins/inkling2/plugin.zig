@@ -206,15 +206,16 @@ pub const Model = struct {
 
     /// One forward of `ids` (`[1, rows]` int32). Results are owned by `g`.
     pub fn forward(w: *const Weights, shared: *const block.Shared, g: *Graph, ids: Array, run: run_mod.Run) !run_mod.Out {
-        if (run.mode == .batched_rows and run.rows != 1) return error.BatchedRowsUnsupported;
         var c = run.ctx(g, shared);
         const n_slots = attention.slots(&c);
+        // A batched forward's slots each bring `rows` rows (one on a decode tick, a prompt span when prefilling).
+        const per_slot: c_int = if (run.mode == .batched_rows) @intCast(run.rows) else 1;
         const embedded = try g.rmsNorm(try b.embed.TableEmbed.forward(&w.embed, &c, ids), w.embed_norm, w.eps);
         const n: u32 = @intCast(w.layers.len);
         const core = w.core_end - w.core_start;
         // A batched tick's slots ride the sequence axis: every row-wise block reads them as one chunk's rows.
         const input = try run.input(g, embedded, ids);
-        const h0 = if (n_slots > 1) try g.reshape(input, &.{ 1, n_slots, ops.shape(input)[2] }) else input;
+        const h0 = if (n_slots > 1) try g.reshape(input, &.{ 1, n_slots * per_slot, ops.shape(input)[2] }) else input;
         var t: Trunk = .{ .w = w, .c = &c, .g = g, .run = &run, .h = h0, .visits = n + core * (w.passes - 1) };
 
         for (0..w.core_start) |i| try t.apply(i, null);
@@ -247,7 +248,7 @@ pub const Model = struct {
         const normed = try blocks.rms(g, try t.wide(g), 1e-6);
         const mixed = try blocks.depthOne(g, t.bank[0..t.blocks], normed, w.final_query);
         const normed_final = try g.astype(try g.rmsNorm(mixed, w.final_norm, w.eps), ops.dtype(t.h));
-        const final = if (n_slots > 1) try g.reshape(normed_final, &.{ n_slots, 1, ops.shape(normed_final)[2] }) else normed_final;
+        const final = if (n_slots > 1) try g.reshape(normed_final, &.{ n_slots, per_slot, ops.shape(normed_final)[2] }) else normed_final;
         // A drafter's last tap: the final-normed output, published one past the last visit.
         try run.capture(g, t.visits, final);
         return run.finish(g, &c, final, Head, &w.head);

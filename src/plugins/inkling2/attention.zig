@@ -112,7 +112,7 @@ pub fn forward(w: *const Weights, c: *Ctx, qs: Array, ks: Array, vs: Array, k_pr
     const v4 = try g.reshape(vc.out, &.{ 1, l, w.kv_heads, hd });
     const v = if (vc.post) v4 else (try blocks.rmsCast(g, v4, null, w.eps, ops.dtype(v4), false)).out;
     var rel = try blocks.l2Clip(g, try g.reshape(qo[1], &.{ 1, l, w.heads, w.d_rel }), w.rel_clip, w.rel_clip_at);
-    const tau: ?Array = if (w.window > 0) null else if (n == 1) (if (total > @as(c_int, @intCast(w.log_floor))) try logScale(g, offset, l, w.log_floor, w.log_alpha) else null) else try logScaleRows(g, c.positions[0..@intCast(n)], w.log_floor, w.log_alpha);
+    const tau: ?Array = if (w.window > 0) null else if (n == 1) (if (total > @as(c_int, @intCast(w.log_floor))) try logScale(g, offset, l, w.log_floor, w.log_alpha) else null) else try logScaleRows(g, c.positions[0..@intCast(n)], @divExact(l, n), w.log_floor, w.log_alpha);
     if (tau) |t| {
         q = try g.astype(try g.mul(try blocks.f32Of(g, q), t), ops.dtype(q));
         rel = try g.astype(try g.mul(try blocks.f32Of(g, rel), t), ops.dtype(rel));
@@ -155,38 +155,43 @@ pub fn slots(c: *const Ctx) c_int {
     return if (c.mode == .batched_rows) @intCast(c.caches.len) else 1;
 }
 
-/// `logScale` of a batched tick's rows, each at its slot's position: `[1, N, 1, 1]` f32 (1 below the floor).
-fn logScaleRows(g: *Graph, positions: []const u32, floor: u32, alpha: f32) !Array {
-    var at: [64]f32 = undefined;
-    for (positions, 0..) |p, i| at[i] = @floatFromInt(p + 1);
-    const n = try g.fromSlice(f32, at[0..positions.len], &.{@intCast(positions.len)});
+/// `logScale` of a batched forward's rows, `per_slot` a slot from its position: `[1, N * per_slot, 1, 1]` f32.
+fn logScaleRows(g: *Graph, positions: []const u32, per_slot: c_int, floor: u32, alpha: f32) !Array {
+    const rows = try g.a.alloc(f32, positions.len * @as(usize, @intCast(per_slot)));
+    defer g.a.free(rows);
+    for (positions, 0..) |p, i| for (0..@intCast(per_slot)) |j| {
+        rows[i * @as(usize, @intCast(per_slot)) + j] = @floatFromInt(p + 1 + j);
+    };
+    const n = try g.fromSlice(f32, rows, &.{@intCast(rows.len)});
     const ratio = try g.maximum(try g.mulScalar(n, 1.0 / @as(f32, @floatFromInt(floor))), try g.scalar(1, .float32));
-    return g.reshape(try g.addScalar(try g.mulScalar(try g.log(ratio), alpha), 1), &.{ 1, @intCast(positions.len), 1, 1 });
+    return g.reshape(try g.addScalar(try g.mulScalar(try g.log(ratio), alpha), 1), &.{ 1, @intCast(rows.len), 1, 1 });
 }
 
-/// A batched tick's attention: each slot's k/v row appended to its own cache, and its query row read against its own
-/// keys (its window on a sliding layer), as its solo decode step reads them. `q` `[1, Hq, N, D]`; `[1, N, Hq, D]`.
+/// A batched forward's attention: each slot's `w` k/v rows appended to its own cache, and its `w` query rows read
+/// causally against its own keys (its window on a sliding layer), as its solo forward reads them. `q` `[1, Hq, N*w, D]`;
+/// `[1, N*w, Hq, D]`.
 fn attendSlots(w: *const Weights, c: *Ctx, n: c_int, q: Array, k: Array, v: Array, bias: Array, sinks: Array) !Array {
     const g = c.g;
     const hd = w.head_dim;
     const perm = [_]c_int{ 0, 2, 1, 3 };
-    const rows = [_]c_int{ n, 1, w.kv_heads, hd };
+    const per: c_int = @divExact(ops.shape(q)[2], n);
+    const rows = [_]c_int{ n, per, w.kv_heads, hd };
     try kv.appendRows(c, try g.transpose(try g.reshape(k, &rows), &perm), try g.transpose(try g.reshape(v, &rows), &perm), 0);
     var outs: [64]Array = undefined;
     for (0..@intCast(n)) |i| {
-        const at: c_int = @intCast(i);
+        const at: c_int = @as(c_int, @intCast(i)) * per;
         var view = try kv.view(c, c.caches[i], c.layer);
         defer kv.release(c, &view);
         const dv = kv.dense(view);
         const keys = ops.shape(dv.k)[2];
-        const span: c_int = @intCast(band.view(w.window, hd, @intCast(c.positions[i] + 1), 1).span);
+        const span: c_int = @intCast(band.view(w.window, hd, @intCast(c.positions[i] + @as(u32, @intCast(per))), @intCast(per)).span);
         const from = if (span > 0 and keys > span) keys - span else 0;
         outs[i] = try attend(g, .{
-            .q = try g.sliceAxis(q, 2, at, at + 1),
+            .q = try g.sliceAxis(q, 2, at, at + per),
             .k = try g.sliceAxis(dv.k, 2, from, keys),
             .v = try g.sliceAxis(dv.v, 2, from, keys),
-            .rel = try g.sliceAxis(bias, 1, at, at + 1),
-            .sinks = try g.sliceAxis(sinks, 1, at, at + 1),
+            .rel = try g.sliceAxis(bias, 1, at, at + per),
+            .sinks = try g.sliceAxis(sinks, 1, at, at + per),
             .key_start = try g.zeros(&.{1}, .int32),
             .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd))),
             .window = w.window,
