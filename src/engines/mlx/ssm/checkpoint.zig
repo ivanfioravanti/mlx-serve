@@ -88,10 +88,12 @@ pub fn captureSsmCheckpointAt(
             if (src.conv_state.ctx != null) return error.CaptureMissing;
         } else {
             dst.conv_state = mlx.mlx_array_new();
+            cut += 1;
             const sh = mlx.getShape(src.spec_conv_input); // [B, (k-1)+T, C]
             const km1 = sh[1] - @as(c_int, @intCast(verify_len));
             const r: c_int = @intCast(rows);
             try mlx.check(mlx.mlx_slice(&dst.conv_state, src.spec_conv_input, &[_]c_int{ 0, r, 0 }, 3, &[_]c_int{ sh[0], r + km1, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            continue;
         }
         cut += 1;
     }
