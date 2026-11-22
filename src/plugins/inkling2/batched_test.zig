@@ -326,15 +326,6 @@ test "inkling2 batched: slots' prompt spans in one forward give each span's solo
     try testing.expect(worst <= 0.75);
 }
 
-/// Every visit's conv window of `a` within `bound` of `b`'s largest value.
-fn expectWindowsClose(g: *ops.Graph, a: []const SSMCacheEntry, b: []const SSMCacheEntry, bound: f32) !void {
-    for (a, b) |x, y| {
-        try testing.expectEqual(x.conv_state.ctx == null, y.conv_state.ctx == null);
-        if (x.conv_state.ctx == null) continue;
-        try expectClose(g, .{ .ctx = x.conv_state.ctx }, .{ .ctx = y.conv_state.ctx }, bound);
-    }
-}
-
 fn expectClose(g: *ops.Graph, x: Array, y: Array, bound: f32) !void {
     const xf = try g.astype(x, .float32);
     const d = try g.call(mlx.mlx_max, .{ try g.abs(try g.sub(xf, try g.astype(y, .float32))), false });
@@ -373,6 +364,8 @@ test "inkling2 stacked: a padded span settles to its own rows, whatever its neig
     try ops.eval(try g.adopt(try p.xfm.forwardWith(&head.ctx, try g.fromSlice(i32, prompt[0 .. span - 30], &.{ 1, span - 30 }))));
     var solo_cp = try @import("../../engines/mlx/ssm/checkpoint.zig").captureSsmCheckpoint(testing.allocator, head.ssm, span - 30, p.xfm.s);
     defer solo_cp.deinit(testing.allocator);
+    var solo_at = try @import("../../engines/mlx/ssm/checkpoint.zig").captureSsmCheckpoint(testing.allocator, solo.ssm, span, p.xfm.s);
+    defer solo_at.deinit(testing.allocator);
     const solo_next = try hostRow(&g, try solo.step(&g, prompt[span]), 0);
     for ([_]usize{ 40, 60, 90 }) |other| {
         const width = @max(span, other);
@@ -398,7 +391,7 @@ test "inkling2 stacked: a padded span settles to its own rows, whatever its neig
         defer cp.deinit(testing.allocator);
         lanes[0].off = span;
         try testing.expectEqual(@as(usize, span), lanes[0].kv.step);
-        try expectWindowsClose(&g, solo.ssm, lanes[0].ssm, 0.15);
+        for (solo_at.layers, lanes[0].ssm) |x, y| if (x.conv_state.ctx != null) try expectClose(&g, x.conv_state, .{ .ctx = y.conv_state.ctx }, 0.15);
         for (solo_cp.layers, cp.layers) |x, y| if (x.conv_state.ctx != null) try expectClose(&g, x.conv_state, y.conv_state, 0.15);
         const got = try hostRow(&g, try lanes[0].step(&g, prompt[span]), 0);
         try testing.expectEqual(argmax(solo_next), argmax(got));
