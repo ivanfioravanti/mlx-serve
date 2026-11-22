@@ -80,6 +80,8 @@ pub const Slot = struct {
     stacked_rows: u32 = 0,
     /// The snapshot-backoff checkpoint the stacked pass cut for this prompt; the prefill files it (ownership moves).
     stacked_checkpoint: ?transformer_mod.SSMCheckpoint = null,
+    /// The pass's checkpoint one row short of the prompt's end (`Caps.end_snapshot`), filed after `stacked_checkpoint`.
+    stacked_end_checkpoint: ?transformer_mod.SSMCheckpoint = null,
     /// The stacked pass's logits at the prompt's last row `[1, 1, vocab]`: the prefill samples from them (moves).
     stacked_logits: ?mlx.mlx_array = null,
     skip_prefix_cache: bool = false,
@@ -420,6 +422,7 @@ pub const Slot = struct {
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
         if (self.stacked_checkpoint) |*cp| cp.deinit(self.allocator);
+        if (self.stacked_end_checkpoint) |*cp| cp.deinit(self.allocator);
         if (self.stacked_logits) |lg| _ = mlx.mlx_array_free(lg);
         // A slot freed before its terminator (a cancel pulled into cleanup) still tells its stream it is done.
         if (self.sink != null) self.emitFinished(.cancelled, null);

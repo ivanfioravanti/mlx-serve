@@ -554,6 +554,8 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // The stacked pass's checkpoint moves into the Generator, which owns it from here on every path.
     const stacked_cp = slot.stacked_checkpoint;
     slot.stacked_checkpoint = null;
+    const stacked_end_cp = slot.stacked_end_checkpoint;
+    slot.stacked_end_checkpoint = null;
     const stacked_logits = slot.stacked_logits;
     slot.stacked_logits = null;
     var gen = Generator.initWithOptions(
@@ -602,6 +604,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_low_anchors = if (xfm_ptr.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0,
             .ssm_checkpoint_pos_offset = hot_matched,
             .stacked_checkpoint = stacked_cp,
+            .stacked_end_checkpoint = stacked_end_cp,
             .prefilled_logits = stacked_logits,
             // A restored prefix already holds its image rows: the splice
             // resumes at the placeholder count inside the matched prefix.

@@ -174,6 +174,8 @@ pub const InitOptions = struct {
     ssm_checkpoint_pos_offset: usize = 0,
     /// A checkpoint already cut for this prompt (a stacked prefill's backoff snapshot), filed first. Ownership moves.
     stacked_checkpoint: ?SSMCheckpoint = null,
+    /// The pass's checkpoint one row short of the prompt's end, filed after `stacked_checkpoint`.
+    stacked_end_checkpoint: ?SSMCheckpoint = null,
     /// The prompt's last row's logits `[1, 1, vocab]` when its rows are already forwarded (a stacked prefill): the final
     /// forward is skipped and the first token sampled from these. Ownership moves.
     prefilled_logits: ?@import("../../../mlx/ffi.zig").mlx_array = null,

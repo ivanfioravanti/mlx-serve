@@ -241,7 +241,7 @@ pub fn initWithOptions(
         for (ssm_checkpoints.items) |*cp| cp.deinit(allocator);
         ssm_checkpoints.deinit(allocator);
     }
-    if (options.stacked_checkpoint) |cp| ssm_checkpoints.append(allocator, cp) catch |e| {
+    for ([_]?SSMCheckpoint{ options.stacked_checkpoint, options.stacked_end_checkpoint }) |maybe| if (maybe) |cp| ssm_checkpoints.append(allocator, cp) catch |e| {
         var doomed = cp;
         doomed.deinit(allocator);
         return e;
