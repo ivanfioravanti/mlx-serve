@@ -38,8 +38,9 @@ def post(path, body):
     req = urllib.request.Request(base + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
     return json.load(urllib.request.urlopen(req, timeout=300))
 def call(prompt, lp=True):
-    # A logprobs request never stacks (it decodes serial): only the alone runs carry them, for the acquittal.
-    body = {"prompt": prompt, "max_tokens": 24, "temperature": 0, "stream": False}
+    # A logprobs request never stacks (it decodes serial): only the alone runs carry them, for the acquittal. The others
+    # decode plain too (a stacked slot's drafter is off, and a failed pass's slots must compare like for like).
+    body = {"prompt": prompt, "max_tokens": 24, "temperature": 0, "stream": False, "enable_drafter": False}
     if lp: body["logprobs"] = 2
     c = post("/v1/completions", body)["choices"][0]
     return c["logprobs"] if lp else {"tokens": [str(t) for t in post("/tokenize", {"content": c["text"]})["tokens"]]}
