@@ -55,6 +55,7 @@ const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
 const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpointSsmPrefill;
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
 const oneForwardTailRows = @import("prefill_chunk.zig").oneForwardTailRows;
+const endSnapshotRows = @import("prefill_chunk.zig").endSnapshotRows;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
 const WholePromptPlan = @import("prefill_chunk.zig").WholePromptPlan;
 const wholePromptPlan = @import("prefill_chunk.zig").wholePromptPlan;
@@ -366,11 +367,14 @@ pub fn initWithOptions(
     // A restored tail of at most one chunk on a conv-only hybrid: one forward, its checkpoint cut from the per-row
     // capture at this many rows instead of a chunk forward ending there (0 = the chunk loop's split).
     var one_forward_cp: usize = 0;
+    // The final span's forward can leave its conv inputs to cut checkpoints from (`captureSsmCheckpointAt`).
+    var cut_capture = false;
     if (final_start > 0) {
         const prefix_len = prompt_ids.len - 1;
         const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
         const conv_capture = if (xfm.config.plugin) |pb| pb.parsed.caps.captures_conv_input else false;
-        if (want_ssm_cp and conv_capture and !mtp_active and !has_vision and convOnlyState(ctx.ssm_entries.?))
+        cut_capture = want_ssm_cp and conv_capture and !mtp_active and !has_vision and convOnlyState(ctx.ssm_entries.?);
+        if (cut_capture)
             one_forward_cp = oneForwardTailRows(ssm_cp_offset, prefix_len, snapshot_backoff, PREFILL_CHUNK, ssm_cp_stride, dense_low_grid);
         if (one_forward_cp > 0) log.debug("[prefill] restored tail of {d} rows in one forward; checkpoint at {d} cut from its capture\n", .{ prompt_ids.len, ssm_cp_offset + one_forward_cp });
         const loop_end = if (one_forward_cp > 0) 0 else prefix_len - snapshot_backoff;
@@ -801,7 +805,8 @@ pub fn initWithOptions(
             ctx.cp_sink = &prompt_cp_sink;
         }
     }
-    if (one_forward_cp > 0) ctx.capture_ssm_seq = true;
+    const end_cp = endSnapshotRows(cut_capture, tail_len, one_forward_cp);
+    if (one_forward_cp > 0 or end_cp > 0) ctx.capture_ssm_seq = true;
     const raw_logits = if (options.prefilled_logits) |lg| lg else if (tail_mtp_capture) blk: {
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
@@ -809,15 +814,19 @@ pub fn initWithOptions(
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
     } else try xfm.forwardWith(&ctx, last_input);
-    if (one_forward_cp > 0) {
+    if (one_forward_cp > 0 or end_cp > 0) {
         ctx.capture_ssm_seq = false;
         defer for (ctx.ssm_entries.?) |*e| transformer_mod.ssmFreeSpecCapture(e);
-        const cp = try transformer_mod.captureSsmCheckpointAt(allocator, ctx.ssm_entries.?, one_forward_cp + ssm_cp_offset, @intCast(one_forward_cp), @intCast(tail_len), xfm.s);
-        fileCheckpoint(allocator, &ssm_checkpoints, cp, options.ssm_checkpoint_max, cp_thin, options.ssm_low_anchors) catch |e| {
-            var doomed = cp;
-            doomed.deinit(allocator);
-            return e;
-        };
+        // In position order: the one-forward tail's backoff cut, then the one a row short of the prompt's end.
+        for ([_]usize{ one_forward_cp, end_cp }) |rows| {
+            if (rows == 0) continue;
+            const cp = try transformer_mod.captureSsmCheckpointAt(allocator, ctx.ssm_entries.?, ssm_cp_offset + final_start + rows, @intCast(rows), @intCast(tail_len), xfm.s);
+            fileCheckpoint(allocator, &ssm_checkpoints, cp, options.ssm_checkpoint_max, cp_thin, options.ssm_low_anchors) catch |e| {
+                var doomed = cp;
+                doomed.deinit(allocator);
+                return e;
+            };
+        }
     }
     // The plan, the sink and the last-row read are the prompt's: the generator below keeps a copy of `ctx`.
     ctx.prompt_spans = &.{};

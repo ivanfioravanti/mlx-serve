@@ -325,6 +325,15 @@ pub fn oneForwardTailRows(offset: usize, prefix_len: usize, backoff: usize, chun
     return rows;
 }
 
+/// PURE: the rows of a final span of `tail_len` after which it also checkpoints, one row short of the prompt's end
+/// (an exact repeat of the prompt then re-forwards its last token, not the backoff): cut from the span's own capture
+/// where the forward can capture (`eligible`), 0 otherwise or where the one-forward tail's cut (`one_forward_cp`) is it.
+pub fn endSnapshotRows(eligible: bool, tail_len: usize, one_forward_cp: usize) usize {
+    if (!eligible or tail_len < 2) return 0;
+    const rows = tail_len - 1;
+    return if (rows == one_forward_cp) 0 else rows;
+}
+
 /// PURE: end the chunk at the first dense low anchor strictly inside
 /// `(pos, end)` (relatives to `prompt_ids[0]`, i.e. what `nextChunkEnd`
 /// returns). 0 when there is none or the stride is already dense — chunk
@@ -1308,6 +1317,18 @@ test "reservedPrefillTokens: a reserving model reserves its whole request to the
     var toy = ling;
     toy.model_type = "toy_hybrid";
     try t.expectEqual(@as(u64, 33_591 + 512), reservedPrefillTokens(&toy, 33_591, 11_198, 512));
+}
+
+test "endSnapshotRows: an eligible final span of two rows or more also checkpoints one row short of the prompt's end" {
+    const t = std.testing;
+    // The cold final span (backoff + the last token) and a restored one-forward tail.
+    try t.expectEqual(@as(usize, 30), endSnapshotRows(true, 31, 0));
+    try t.expectEqual(@as(usize, 108), endSnapshotRows(true, 109, 78));
+    // One row has nothing to cut; the cut the one-forward tail already makes is not made twice.
+    try t.expectEqual(@as(usize, 0), endSnapshotRows(true, 1, 0));
+    try t.expectEqual(@as(usize, 0), endSnapshotRows(true, 31, 30));
+    // No capture (an arch that captures no conv inputs, MTP, vision, a scan state): none.
+    try t.expectEqual(@as(usize, 0), endSnapshotRows(false, 31, 0));
 }
 
 test "oneForwardTailRows: a restored tail of one chunk past the backoff runs whole; cold, long or stride-crossing tails split" {
