@@ -42,6 +42,8 @@ const drainSideQueues = @import("runtime/loop.zig").drainSideQueues;
 fn resetStacked(s: *Slot) void {
     emptySlotCache(s);
     s.stacked_rows = 0;
+    if (s.stacked_checkpoint) |*cp| cp.deinit(s.allocator);
+    s.stacked_checkpoint = null;
 }
 
 fn waitForDiskRetryLocked(sch: *Scheduler, ms: u32) void {
@@ -246,7 +248,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     if (n_prefill > 1) {
         var stack: [8]*Slot = undefined;
         const pk = prefill_stacked.pick(to_prefill[0..n_prefill], &stack);
-        if (pk.n >= 2) prefill_stacked.run(stack[0..pk.n], pk.span) catch |err| {
+        if (pk.n >= 2) prefill_stacked.run(stack[0..pk.n], pk.width, pk.left_out, pk.longest_left) catch |err| {
             log.warn("[prefill] stacked pass failed ({s}): each prompt prefills alone\n", .{@errorName(err)});
             for (stack[0..pk.n]) |s| resetStacked(s);
         };

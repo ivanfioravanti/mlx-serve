@@ -172,6 +172,8 @@ pub const InitOptions = struct {
     /// absolute positions usable by future warm-path lookups against
     /// the full prompt.
     ssm_checkpoint_pos_offset: usize = 0,
+    /// A checkpoint already cut for this prompt (a stacked prefill's backoff snapshot), filed first. Ownership moves.
+    stacked_checkpoint: ?SSMCheckpoint = null,
     /// Placeholder rows inside a restored prefix (prefix-cache hit on an
     /// image prompt): the vision splice starts here, not at row 0.
     vision_rows_before: usize = 0,
