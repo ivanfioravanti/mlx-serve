@@ -551,6 +551,9 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     if (slot.prefix_cache) |hc| hc.donateCheckout(@intFromPtr(slot));
     const graphs_were = mlx.setCudaGraphs(mlx.prefillKeepsCudaGraphs());
     defer _ = mlx.setCudaGraphs(graphs_were);
+    // The stacked pass's checkpoint moves into the Generator, which owns it from here on every path.
+    const stacked_cp = slot.stacked_checkpoint;
+    slot.stacked_checkpoint = null;
     var gen = Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -596,6 +599,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_max = cp_max,
             .ssm_low_anchors = if (xfm_ptr.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0,
             .ssm_checkpoint_pos_offset = hot_matched,
+            .stacked_checkpoint = stacked_cp,
             // A restored prefix already holds its image rows: the splice
             // resumes at the placeholder count inside the matched prefix.
             .vision_rows_before = if (slot.vision_embeddings != null and hot_matched > 0)

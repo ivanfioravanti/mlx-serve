@@ -325,3 +325,68 @@ test "inkling2 batched: slots' prompt spans in one forward give each span's solo
     std.debug.print("[inkling2 batched] stacked prompt spans, worst gap over the solo top 10: {d:.3}\n", .{worst});
     try testing.expect(worst <= 0.75);
 }
+
+/// Every visit's conv window of `a` within `bound` of `b`'s largest value.
+fn expectWindowsClose(g: *ops.Graph, a: []const SSMCacheEntry, b: []const SSMCacheEntry, bound: f32) !void {
+    for (a, b) |x, y| {
+        try testing.expectEqual(x.conv_state.ctx == null, y.conv_state.ctx == null);
+        if (x.conv_state.ctx == null) continue;
+        try expectClose(g, .{ .ctx = x.conv_state.ctx }, .{ .ctx = y.conv_state.ctx }, bound);
+    }
+}
+
+fn expectClose(g: *ops.Graph, x: Array, y: Array, bound: f32) !void {
+    const xf = try g.astype(x, .float32);
+    const d = try g.call(mlx.mlx_max, .{ try g.abs(try g.sub(xf, try g.astype(y, .float32))), false });
+    const m = try g.call(mlx.mlx_max, .{ try g.abs(xf), false });
+    try ops.evalMany(&.{ d, m });
+    var dv: f32 = 0;
+    var mv: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&dv, d));
+    try mlx.check(mlx.mlx_array_item_float32(&mv, m));
+    try testing.expect(dv <= bound * mv);
+}
+
+// Bar: a slot's span stacked beside shorter, equal or longer neighbours (padded to the longest with its last real token)
+// keeps exactly its own rows in its cache, conv windows and backoff checkpoint within the width class of its solo
+// prefill, and the next step's top token. Pads come after a slot's real rows and every block is causal over rows.
+test "inkling2 stacked: a padded span settles to its own rows, whatever its neighbours" {
+    const p = (try Served.open()) orelse return error.SkipZigTest;
+    defer p.close();
+    const stacked = @import("../../engines/mlx/prefill_stacked.zig");
+    const span = 60;
+    var prompt: [span + 1]i32 = undefined;
+    for (&prompt, 0..) |*v, i| v.* = @intCast(1000 + (77 * 7919 + 41 * @as(u32, @intCast(i))) % 20000);
+    var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    // The solo reference, split at the backoff as the chunk loop splits a prompt.
+    var solo: Lane = undefined;
+    try solo.init(&p.xfm);
+    defer solo.deinit();
+    solo.ctx.prefill = true;
+    try ops.eval(try g.adopt(try p.xfm.forwardWith(&solo.ctx, try g.fromSlice(i32, prompt[0 .. span - 30], &.{ 1, span - 30 }))));
+    var solo_cp = try @import("../../engines/mlx/ssm/checkpoint.zig").captureSsmCheckpoint(testing.allocator, solo.ssm, span - 30, p.xfm.s);
+    defer solo_cp.deinit(testing.allocator);
+    try ops.eval(try g.adopt(try p.xfm.forwardWith(&solo.ctx, try g.fromSlice(i32, prompt[span - 30 .. span], &.{ 1, 30 }))));
+    const solo_next = try hostRow(&g, try solo.step(&g, prompt[span]), 0);
+    for ([_]usize{ 40, 60, 90 }) |other| {
+        const width = @max(span, other);
+        var lanes: [2]Lane = undefined;
+        for (&lanes) |*l| try l.init(&p.xfm);
+        defer for (&lanes) |*l| l.deinit();
+        var ids: [2 * 90]i32 = undefined;
+        for (0..width) |k| {
+            ids[k] = prompt[@min(k, span - 1)];
+            ids[width + k] = @intCast(1000 + (13 * 7919 + 29 * @as(u32, @intCast(@min(k, other - 1)))) % 20000);
+        }
+        _ = try stackedPrefill(&g, &p.xfm, &.{ &lanes[0], &lanes[1] }, ids[0 .. 2 * width], width);
+        var cp = (try stacked.settleSpan(testing.allocator, &lanes[0].kv, lanes[0].ssm, span, @intCast(width), true, p.xfm.s)).?;
+        defer cp.deinit(testing.allocator);
+        lanes[0].off = span;
+        try testing.expectEqual(@as(usize, span), lanes[0].kv.step);
+        try expectWindowsClose(&g, solo.ssm, lanes[0].ssm, 0.15);
+        for (solo_cp.layers, cp.layers) |x, y| if (x.conv_state.ctx != null) try expectClose(&g, x.conv_state, y.conv_state, 0.15);
+        const got = try hostRow(&g, try lanes[0].step(&g, prompt[span]), 0);
+        try testing.expectEqual(argmax(solo_next), argmax(got));
+    }
+}
