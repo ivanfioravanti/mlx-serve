@@ -118,16 +118,16 @@ if [ "${NEXT_TURN_PROMPTS:-0}" -gt 0 ]; then
             -d "$(jq -nc --arg p "$2" '{messages:[{role:"user",content:$p}],max_tokens:40,temperature:0,stream:false}')"
     }
     for i in $(seq 1 "$NEXT_TURN_PROMPTS"); do
-        read -r BASE_P EXT_P < <(python3 - "$i" <<'PY'
+        PAIR=$(python3 - "$i" <<'PY'
 import json, sys
 i = int(sys.argv[1])
 words = "river lantern harbor ledger meadow canyon glacier thunder cabin orchard signal copper marble ribbon".split()
 base = f"Session {i}. " + " ".join(f"{words[(i * 7 + k) % len(words)]}-{k}" for k in range(220 + 40 * i)) + "."
 ext = base + " Then: " + " ".join(f"{words[(i * 3 + k) % len(words)]}{k % 9}" for k in range(60 + 25 * i)) + ". Continue."
-print(json.dumps(base), json.dumps(ext))
+print(json.dumps({"base": base, "ext": ext}))
 PY
 )
-        BASE_P=$(echo "$BASE_P" | jq -r .); EXT_P=$(echo "$EXT_P" | jq -r .)
+        BASE_P=$(echo "$PAIR" | jq -r .base); EXT_P=$(echo "$PAIR" | jq -r .ext)
         ask "$BASE" "$BASE_P" > /dev/null
         W=$(ask "$BASE" "$EXT_P"); C=$(ask "$CBASE" "$EXT_P")
         WT=$(echo "$W" | jq -r "$TEXT"); CT=$(echo "$C" | jq -r "$TEXT")
