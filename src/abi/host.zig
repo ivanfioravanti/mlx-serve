@@ -349,10 +349,10 @@ test "abi host: the table layouts are pinned (size first, offsets fixed, growth 
         .{ "latch_pending", 64 },    .{ "latch_check", 72 },     .{ "latch_drop_unless", 80 },
         .{ "gpu_context_lost", 88 }, .{ "kernel", 96 },          .{ "lever", 104 },
         .{ "counter", 112 },         .{ "memory_ceiling", 120 }, .{ "gpu", 128 },
-        .{ "ane", 136 },             .{ "quant_claimant", 144 },
+        .{ "ane", 136 },             .{ "quant_claimant", 144 }, .{ "expert_exchange", 152 },
     };
     inline for (host_fields) |f| try t.expectEqual(f[1], @offsetOf(Host, f[0]));
-    try t.expectEqual(@as(usize, 152), @sizeOf(Host));
+    try t.expectEqual(@as(usize, 160), @sizeOf(Host));
     try t.expectEqual(host_fields.len, @typeInfo(Host).@"struct".field_names.len);
 
     const gpu_fields = [_]struct { []const u8, usize }{
@@ -360,7 +360,7 @@ test "abi host: the table layouts are pinned (size first, offsets fixed, growth 
         .{ "event_metal", 16 },      .{ "event_host", 24 },   .{ "wait", 32 },
         .{ "signal", 40 },           .{ "event_set", 48 },    .{ "event_value", 56 },
         .{ "event_stats", 64 },      .{ "alloc_uninit", 72 }, .{ "launch", 80 },
-        .{ "buffer_addresses", 88 }, .{ "alias", 96 },       .{ "command_buffer_limits", 104 },
+        .{ "buffer_addresses", 88 }, .{ "alias", 96 },        .{ "command_buffer_limits", 104 },
     };
     inline for (gpu_fields) |f| try t.expectEqual(f[1], @offsetOf(HostGpu, f[0]));
     try t.expectEqual(@as(usize, 112), @sizeOf(HostGpu));
@@ -368,13 +368,13 @@ test "abi host: the table layouts are pinned (size first, offsets fixed, growth 
     try t.expectEqual(gpu_fields.len, @typeInfo(HostGpu).@"struct".field_names.len);
 
     const ane_fields = [_][]const u8{
-        "size",                    "version",                      "ctx",                    "program_create",
-        "program_free",            "program_procedure",            "program_io_count",       "program_io",
-        "program_compile_seconds", "program_cache_hit",            "surface_create",         "surface_release",
-        "request_create",          "request_eval",                 "request_free",           "plane_create",
-        "plane_free",              "plane_base",                   "bank_create",            "bank_free",
-        "bank_add_swiglu",         "bank_add_gdn",                 "bank_finish",            "bank_program_free",
-        "bank_program_input",      "bank_program_output",          "bank_program_eval",      "bank_program_compile_seconds",
+        "size",                    "version",             "ctx",               "program_create",
+        "program_free",            "program_procedure",   "program_io_count",  "program_io",
+        "program_compile_seconds", "program_cache_hit",   "surface_create",    "surface_release",
+        "request_create",          "request_eval",        "request_free",      "plane_create",
+        "plane_free",              "plane_base",          "bank_create",       "bank_free",
+        "bank_add_swiglu",         "bank_add_gdn",        "bank_finish",       "bank_program_free",
+        "bank_program_input",      "bank_program_output", "bank_program_eval", "bank_program_compile_seconds",
         "bank_program_cache_hit",  "resident",
     };
     inline for (ane_fields, 0..) |f, i| try t.expectEqual(if (i < 2) i * 4 else (i - 1) * 8, @offsetOf(HostAne, f));
