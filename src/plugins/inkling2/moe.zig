@@ -31,9 +31,7 @@ pub const Weights = struct {
 
 fn gather(g: *Graph, x: Array, bank: *const Bank, rhs: Array, sorted: bool) !Array {
     var y = mlx.mlx_array_new();
-    // A dense bank is stored `[E, out, in]`; MLX's dense gather multiplies by `[E, in, out]`.
-    const w = if (bank.s.ctx == null) try g.transpose(bank.w, &.{ 0, 2, 1 }) else bank.w;
-    gatherExpertMm(&y, x, w, bank.s, bank.b, .{ .ctx = null }, rhs, bank.qp.bits, bank.qp.group_size, bank.qp.mode, sorted, g.s) catch |e| {
+    gatherExpertMm(&y, x, bank.w, bank.s, bank.b, .{ .ctx = null }, rhs, bank.qp.bits, bank.qp.group_size, bank.qp.mode, sorted, g.s) catch |e| {
         _ = mlx.mlx_array_free(y);
         return e;
     };
