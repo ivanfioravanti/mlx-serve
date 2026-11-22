@@ -214,7 +214,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         c.vision = v;
     };
 
-    var p: abi.Parsed = .{ .caps = .{ .images = c.vision != null, .dflash_capture = true, .batches_decode = true, .moe = true } };
+    var p: abi.Parsed = .{ .caps = .{ .images = c.vision != null, .dflash_capture = true, .batches_decode = true, .moe = true, .stacks_prompts = true } };
     if (c.vision != null) p.placeholder_ids.image = if (field(root, "image_token_id")) |x| int(x) orelse return unsupported("image_token_id") else 200054;
     const s = &p.shell;
     s.* = .{
@@ -326,7 +326,7 @@ test "inkling2 config: the Mini pack's loop gives 48 visits, each with its own c
     try testing.expectEqual(@as(u32, 200058), p.shell.vocab_size);
     try testing.expect(p.caps.images and p.placeholder_ids.image == 200054 and c.vision.?.block() == 40);
     // A routed-expert trunk to every MoE-keyed policy (`isMoe`: drafter yield, its runtime floor, bills).
-    try testing.expect(p.caps.moe and p.caps.batches_decode);
+    try testing.expect(p.caps.moe and p.caps.batches_decode and p.caps.stacks_prompts);
     // Prelude, three passes over 6..17, coda.
     const want = [_]u32{ 0, 5, 6, 17, 6, 17, 6, 17, 18, 23 };
     for ([_]u32{ 0, 5, 6, 17, 18, 29, 30, 41, 42, 47 }, want) |v, layer| try testing.expectEqual(layer, c.layerOf(v));
