@@ -998,9 +998,10 @@ pub fn visit(c: *block.Ctx, L: *const Layer, w: *const Body, h: Array, blocks: ?
     const read = if (batch) try attendSlots(c, L, cfg, &p, f.proj[3]) else try attend(c, L, cfg, &p, f.proj[3], open, fuse);
     const m = try mid(g, L, w, read, if (fuse) p.gate else null, h, f.normed, blocks, st, f.messages);
     const t = try experts(g, L, cfg, &m, f.proj[4], f.proj[5], st, open);
-    if (batch) try slot_state.put(c, .conv, t.state) else if (open == null) try kv.setState(c, .conv, t.state);
-    // Every path through `experts` meets here: a capture keeps the rows' conv inputs behind the old state.
+    // Every path through `experts` meets here: a capture keeps the rows' conv inputs behind the old state, written
+    // before the state is replaced (`st` is the cache's own array).
     if (c.capture_spec and !batch and open == null) try kv.setState(c, .conv_input, try g.concat(&.{ st, try g.astype(try g.concat(&.{ f.proj[4], f.proj[5], m.op, t.xm }, 2), .float32) }, 1));
+    if (batch) try slot_state.put(c, .conv, t.state) else if (open == null) try kv.setState(c, .conv, t.state);
     return .{ .h = t.h, .blocks = m.blocks };
 }
 
