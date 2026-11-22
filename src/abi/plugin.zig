@@ -436,8 +436,8 @@ pub const LoadCtx = extern struct {
     pair_remote: LayerSpan = .{},
     /// The host's wired-limit margin (`--wired-margin-gib`): the GPU ceiling's stop a streamed bank leaves unplanned.
     wired_margin_bytes: u64 = 8 << 30,
-    /// Tensor parallel (DeepSeek-V4.1): this rank's slice of every expert and attention head, the weights already sliced;
-    /// `tp_size` 0 = whole.
+    /// Tensor parallel: this rank's slice of every expert (DeepSeek-V4.1: and attention head, the weights already sliced;
+    /// Inkling 2 cuts its own); `tp_size` 0 = whole.
     tp_rank: u32 = 0,
     tp_size: u32 = 0,
     /// GPU bytes a streamed bank may fill in the decode phase: the GPU ceiling less the decode phase's bill at 16K + 1K
@@ -1037,9 +1037,13 @@ pub const EmbedHooks = extern struct {
 pub const DistHooks = extern struct {
     size: u32 = @sizeOf(DistHooks),
     /// Splits the model across `hosts` machines: one span per host into `out`; returns the count.
-    plan: *const fn (p: *const Parsed, hosts: u32, out: [*]LayerSpan, cap: u32) callconv(.c) u32,
+    plan: ?*const fn (p: *const Parsed, hosts: u32, out: [*]LayerSpan, cap: u32) callconv(.c) u32 = null,
     /// This machine's part of a forward.
-    serve: *const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict,
+    serve: ?*const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict = null,
+    /// A tensor-parallel worker's share of one MoE layer (`--dist tensor`, the model loaded at `LoadCtx.tp_rank`):
+    /// rows `x` `[t, d]` through the routes `idx` `[t, k]` u32 with weights `[t, k]` f32, the result `[t, d]` f32, the
+    /// share's weighted sum that rank 0 adds to its own (`Host.expert_exchange`). Null = the model splits no experts.
+    expert_share: ?*const fn (m: *anyopaque, layer: u32, x: Array, idx: Array, weights: Array, out: *Array) callconv(.c) Verdict = null,
 };
 
 /// A layer projection the engine reads beside the forward (`WeightHooks.layer_weight`).
