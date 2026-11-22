@@ -546,11 +546,17 @@ fn roundSlots(m: *Loaded, f: *const abi.Forward, rounds: [*]abi.Round) !void {
     var drafting: [max_group]bool = @splat(false);
     var pending: [2 * max_group]ops.Array = undefined;
     var n_pending: usize = 0;
+    const gate = &m.batch_gate;
+    // A group whose recent rounds verified nothing waits out its backoff as plain ticks.
+    const resting = gate.skip_left > 0;
+    if (resting) gate.skip_left -= 1;
     for (0..n) |i| {
         const t1 = f.tokens.slice()[i];
         ids[i][0] = t1;
         sp.select(slots[i]);
-        if (cap == 0 or sp.rows(positions[i]) == 0) continue;
+        const key = slots[i] % gate.sure.len;
+        gate.rounds[key] +%= 1;
+        if (resting or cap == 0 or sp.rows(positions[i]) == 0 or skipsDraft(gate.sure[key] * gate.kept[key], gate.rounds[key])) continue;
         const pos = [_]u32{positions[i]};
         const r: run_mod.Run = .{ .mode = .verify, .rows = 1, .positions = &pos, .caches = caches[i .. i + 1], .cache_ops = co };
         var c = r.ctx(g, &m.base.shared);
@@ -566,13 +572,28 @@ fn roundSlots(m: *Loaded, f: *const abi.Forward, rounds: [*]abi.Round) !void {
         n_pending += 2;
     }
     if (n_pending > 0) try ops.evalMany(pending[0..n_pending]);
+    var gain: f32 = 0;
     for (0..n) |i| if (drafting[i]) {
         const sure = mlx.mlx_array_data_float32(out_sure[i]) orelse return error.Inkling2DraftRound;
         const tokens = mlx.mlx_array_data_int32(out_tokens[i]) orelse return error.Inkling2DraftRound;
         drafts[i] = draftsToVerify(sure[0..cap], tokens[0..cap], min_sure, f.stop_ids.slice());
         for (0..drafts[i]) |k| ids[i][1 + k] = @intCast(tokens[k]);
         width = @max(width, 1 + drafts[i]);
+        const key = slots[i] % gate.sure.len;
+        gain += gate.kept[key] * @as(f32, @floatFromInt(drafts[i]));
+        gate.sure[key] += 0.3 * (@as(f32, @floatFromInt(drafts[i])) - gate.sure[key]);
     };
+    // The drafts the group expects to keep must pay for its verify's extra rows, else the round is the plain tick.
+    if (width > 1 and !engageVerify(n, n * width, gain, gate.slope, BatchGate.known(&gate.plain[n]))) {
+        width = 1;
+        @memset(drafts[0..n], 0);
+    }
+    // Only a round that drafted and verified nothing counts against the group: one with no context yet (a stream's
+    // first rounds) is not evidence.
+    if (!resting and n_pending > 0) {
+        gate.idle = if (width > 1) 0 else gate.idle +| 1;
+        gate.skip_left = backoffRounds(gate.idle);
+    }
     var flat: [max_group * abi.max_round_tokens]u32 = undefined;
     for (0..n) |i| for (0..width) |k| {
         flat[i * width + k] = ids[i][@min(k, drafts[i])];
@@ -588,17 +609,23 @@ fn roundSlots(m: *Loaded, f: *const abi.Forward, rounds: [*]abi.Round) !void {
     defer for ([_]abi.Array{ fo.logits, fo.hidden }) |x| if (x.ctx != null) {
         _ = mlx.mlx_array_free(.{ .ctx = x.ctx });
     };
+    const started = nowUs();
     const v = run_mod.tableForward(Model, &m.base, &.{ .mode = .batched_rows, .logits = .all_rows, .rows = width, .tokens = .of(flat[0 .. n * width]), .slots = f.slots, .positions = f.positions, .caches = f.caches, .cache_ops = co }, &fo);
     if (!v.isOk()) return error.Inkling2DraftRound;
     const picked = try picks(g, .{ .ctx = fo.logits.ctx }, f.suppress_mask);
     try ops.eval(picked);
     const want = mlx.mlx_array_data_int32(picked) orelse return error.Inkling2DraftRound;
+    if (width == 1) gate.plain[n].add(msSince(started)) else gate.addVerify(n, n * width, msSince(started));
     const mine = try gpa.alloc(kernels.Open, cfg.visits());
     defer gpa.free(mine);
     for (0..n) |i| {
         const row = want[i * width ..][0..width];
         var accepted: u32 = 0;
         while (accepted < drafts[i] and row[accepted] == @as(i32, @intCast(ids[i][1 + accepted]))) accepted += 1;
+        if (drafts[i] > 0) {
+            const key = slots[i] % gate.kept.len;
+            gate.kept[key] += 0.3 * (@as(f32, @floatFromInt(accepted)) / @as(f32, @floatFromInt(drafts[i])) - gate.kept[key]);
+        }
         const kept: u32 = 1 + accepted;
         // A plain step's row was appended by the forward; a verify's kept rows are committed from its windows.
         if (width > 1) {
@@ -618,6 +645,55 @@ fn roundSlots(m: *Loaded, f: *const abi.Forward, rounds: [*]abi.Round) !void {
 
 /// Slots a batched round takes: the engine's DSpark group.
 const max_group = 16;
+
+/// What a batched round costs and earns, measured as it runs: the plain batched tick by slot count, what a verified
+/// row past each slot's first adds to it, and each engine slot's recent sure drafts and the share of them kept.
+const BatchGate = struct {
+    plain: [max_group + 1]RowCost.Cost = @splat(.{}),
+    slope: ?f32 = null,
+    sure: [64]f32 = @splat(1.0),
+    kept: [64]f32 = @splat(0.75),
+    rounds: [64]u32 = @splat(0),
+    /// Rounds in a row that verified nothing, and the rounds left before the next one drafts (`backoffRounds`).
+    idle: u32 = 0,
+    skip_left: u32 = 0,
+
+    fn known(c: *const RowCost.Cost) ?f32 {
+        return if (c.seen >= c.seeds) c.ms else null;
+    }
+
+    /// A verify of `rows` for `n` slots took `ms`: the slope of its extra rows over the plain tick.
+    fn addVerify(gate: *BatchGate, n: usize, rows: usize, ms: f32) void {
+        const p = known(&gate.plain[n]) orelse return;
+        if (rows <= n or !std.math.isFinite(ms)) return;
+        const x = (ms - p) / @as(f32, @floatFromInt(rows - n));
+        if (x <= 0) return;
+        gate.slope = if (gate.slope) |s| s + 0.2 * (std.math.clamp(x, 0.5 * s, 2.0 * s) - s) else x;
+    }
+};
+
+/// PURE: whether `n` slots' batched verify of `rows` rows, `gain` drafts among them expected to stand, earns more tokens a
+/// millisecond than their plain tick: the extra rows cost `slope_ms` each over the tick's `plain_ms`. With no plain tick
+/// measured the tick runs first; with no slope yet the verify runs, so it is measured.
+pub fn engageVerify(n: usize, rows: usize, gain: f32, slope_ms: ?f32, plain_ms: ?f32) bool {
+    const p = plain_ms orelse return false;
+    const s = slope_ms orelse return true;
+    const nf: f32 = @floatFromInt(n);
+    const extra: f32 = @floatFromInt(rows -| n);
+    return gain >= nf * s * extra / p;
+}
+
+/// PURE: after `idle` rounds in a row that verified nothing, how many rounds skip drafting before one drafts again: plain
+/// chat stops paying the draft step (each try costs every slot's), and a turn back to predictable text is seen within 32.
+pub fn backoffRounds(idle: u32) u32 {
+    return (@as(u32, 1) << @intCast(@min(idle, 5))) - 1;
+}
+
+/// PURE: whether a slot expecting `expected` of its drafts to stand (its recent sure drafts times its kept share) skips
+/// this round's draft (plain chat: the draft step would cost every round for nothing); every eighth round it drafts.
+pub fn skipsDraft(expected: f32, nth: u32) bool {
+    return expected < 0.5 and nth % 8 != 0;
+}
 
 /// The first half of a sampled round (`NativeDrafter.verify`): the open verify's rows' ids and logits `[rows, vocab]`
 /// f32 for the engine to accept, the verify kept open until `finishVerify` (a new one discards it).
@@ -675,6 +751,7 @@ pub const Loaded = struct {
     drafter: ?*draft.Drafter = null,
     /// The cost a verified row adds here, which sets how sure a draft must be to be verified.
     row_cost: RowCost = .{},
+    batch_gate: BatchGate = .{},
     /// A sampled round's verify, open until its finish.
     opened: ?*Opened = null,
     spec: Spec = .{ .visits = &.{}, .keep = 0 },
@@ -1163,6 +1240,36 @@ test {
 
 // Bar: two slots that take turns each keep the taps of their own sequence; with every place taken a new slot
 // replaces the ring parked longest.
+test "engageVerify: a batched verify runs only when its expected kept drafts pay for its extra rows" {
+    const t = std.testing;
+    // Four slots, a plain tick 23 ms, 2.6 ms a verified row past one a slot. 32 rows (28 extra): 15 kept drafts pay
+    // (4 slots x 72.8 ms / 23 = 12.7 needed); 2 do not.
+    try t.expect(engageVerify(4, 32, 15, 2.6, 23));
+    try t.expect(!engageVerify(4, 32, 2, 2.6, 23));
+    // 8 rows (4 extra) need 4 x 10.4 / 23 = 1.8: 2 pays.
+    try t.expect(engageVerify(4, 8, 2, 2.6, 23));
+    // The plain tick not measured yet: it is run first (cheap); the slope not yet: the verify runs, so it is.
+    try t.expect(!engageVerify(4, 32, 15, 2.6, null));
+    try t.expect(engageVerify(4, 32, 15, null, 23));
+}
+
+test "backoffRounds: a group whose rounds keep not verifying drafts ever less often, a verify resets it" {
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 0), backoffRounds(0));
+    try t.expectEqual(@as(u32, 1), backoffRounds(1));
+    try t.expectEqual(@as(u32, 3), backoffRounds(2));
+    try t.expectEqual(@as(u32, 15), backoffRounds(4));
+    try t.expectEqual(@as(u32, 31), backoffRounds(5));
+    try t.expectEqual(@as(u32, 31), backoffRounds(40));
+}
+
+test "skipsDraft: a slot expecting no kept draft skips drafting, and re-probes every eighth round" {
+    const t = std.testing;
+    try t.expect(!skipsDraft(1.2, 3));
+    try t.expect(skipsDraft(0.3, 3));
+    try t.expect(!skipsDraft(0.3, 8));
+}
+
 test "inkling2 draft taps: a ring past the slot's position serves its rows before it, and a push there continues them" {
     // Bar: a stacked pass taps its padding past a slot's end; the slot's drafter still reads its real rows.
     const a = std.testing.allocator;
