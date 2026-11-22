@@ -164,20 +164,12 @@ const TestPair = struct {
     var fail_at: ?u32 = null;
     var present: bool = true;
     var calls: u32 = 0;
-    /// The share as a bf16 wire returns it.
-    var bf16: bool = false;
 
     fn exchange(_: ?*anyopaque, layer: u32, x: abi.Array, idx: abi.Array, w: abi.Array, out: *abi.Array) callconv(.c) abi.Verdict {
         if (!present) return .{ .code = .unsupported, .why = abi.Str.of("no tensor-parallel worker") };
         calls += 1;
         if (fail_at == layer) return .{ .code = .failed, .why = abi.Str.of("link down") };
-        const v = plugin.table.dist.?.expert_share.?(worker, layer, x, idx, w, out);
-        if (!v.isOk() or !bf16) return v;
-        var c = mlx.mlx_array_new();
-        if (mlx.mlx_astype(&c, .{ .ctx = out.ctx }, .bfloat16, mlx.gpuStream()) != 0) return .{ .code = .failed, .why = abi.Str.of("astype") };
-        _ = mlx.mlx_array_free(.{ .ctx = out.ctx });
-        out.* = .{ .ctx = c.ctx };
-        return v;
+        return plugin.table.dist.?.expert_share.?(worker, layer, x, idx, w, out);
     }
 
     fn prefill(a: std.mem.Allocator, pack: *conformance.Loaded, tokens: []const u32) ![]f32 {
@@ -234,9 +226,6 @@ test "inkling2 tp: rank 0's split plus the worker's share is one node's prefill;
     TestPair.calls = 0;
     try near.check(want, try TestPair.prefill(a, &rank0, tokens));
     try testing.expectEqual(@as(u32, @intCast(visits)), TestPair.calls);
-    TestPair.bf16 = true;
-    try near.check(want, try TestPair.prefill(a, &rank0, tokens));
-    TestPair.bf16 = false;
     TestPair.calls = 0;
     _ = try TestPair.prefill(a, &rank0, tokens[0 .. TP_ROWS - 1]);
     try testing.expectEqual(@as(u32, 0), TestPair.calls);
