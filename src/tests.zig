@@ -49,6 +49,7 @@ test {
     _ = @import("plugins/kolibri1/proof_test.zig");
     _ = @import("plugins/gpt_oss/proof_test.zig");
     _ = @import("plugins/qwen3_next/proof_test.zig");
+    _ = @import("plugins/inkling2/batched_test.zig");
     _ = @import("plugins/hy_v3/proof_test.zig");
     _ = @import("plugins/hy_v3/mtp_head_test.zig");
     _ = @import("plugins/gemma3/proof_test.zig");

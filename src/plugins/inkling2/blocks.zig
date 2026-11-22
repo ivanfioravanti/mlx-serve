@@ -124,6 +124,23 @@ fn fromKernel(g: *Graph, out: Array, win: Array, k: c_int, post: bool) !Conv {
 pub const Conv = struct { out: Array, state: Array, input: Array, post: bool = false };
 pub const Post = sconv_kernel.Post;
 
+/// A batched tick's slot rows `[1, N, C]` as N one-row sequences `[N, 1, C]`, so each conv reads its slot's window
+/// (`slots` 1: as it is).
+pub fn bySlot(g: *Graph, x: Array, slots: c_int) !Array {
+    if (slots == 1) return x;
+    const sh = ops.shape(x);
+    return g.reshape(x, &.{ slots, @divExact(sh[1], slots), sh[2] });
+}
+
+/// `c` with its output back on the sequence axis `[1, N, C]`; its window and state stay a row a slot.
+pub fn bySeq(g: *Graph, c: Conv, slots: c_int) !Conv {
+    if (slots == 1) return c;
+    var out = c;
+    const sh = ops.shape(c.out);
+    out.out = try g.reshape(c.out, &.{ 1, sh[0] * sh[1], sh[2] });
+    return out;
+}
+
 /// Depthwise causal conv `w` `[C, K, 1]` in the weight's dtype plus the input, over `sqrt(K + 1)`.
 pub fn sconv(g: *Graph, x: Array, w: Array, prev: ?Array) !Conv {
     return sconvPost(g, x, w, prev, .none);
@@ -214,6 +231,47 @@ test "inkling2 blocks: a short conv fed row by row with its state equals the who
         for (try host(step_dyn.out), (try host(whole_dyn.out))[t * 4 ..][0..4]) |a, b| try testing.expectApproxEqAbs(b, a, 1e-5);
     }
     try testing.expectEqualSlices(f32, try host(whole.state), try host(st.?));
+}
+
+test "inkling2 blocks: slots on the batch axis convolve their own windows only; the fused kernel declines them" {
+    // Bar: slot i of a batched conv is slot i convolved alone (out and next window), and no kernel reads the batch as
+    // one sequence.
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    const n = 3;
+    const c = 64;
+    const k = 4;
+    const ke = 8;
+    var prng = std.Random.DefaultPrng.init(17);
+    const r = prng.random();
+    const draw = struct {
+        fn f(gr: *Graph, rr: std.Random, sh: []const c_int) !Array {
+            var len: usize = 1;
+            for (sh) |d| len *= @intCast(d);
+            const buf = try testing.allocator.alloc(f32, len);
+            defer testing.allocator.free(buf);
+            for (buf) |*v| v.* = rr.float(f32) * 2 - 1;
+            const a = try gr.fromSlice(f32, buf, sh);
+            try ops.eval(a);
+            return a;
+        }
+    }.f;
+    const x = try draw(&g, r, &.{ n, 1, c });
+    const prev = try draw(&g, r, &.{ n, k - 1, c });
+    const w = try draw(&g, r, &.{ c, k, 1 });
+    const parts = try draw(&g, r, &.{ n, ke, c });
+    const weights = try draw(&g, r, &.{ n, ke });
+    try testing.expect(try sconv_kernel.fusedSum(&g, x, null, w, prev, null, 0.5, .none) == null);
+    try testing.expect(try sconvSum(&g, parts, weights, w, prev) == null);
+
+    const both = try sconv(&g, x, w, prev);
+    for (0..n) |i| {
+        const at: c_int = @intCast(i);
+        const one = try sconv(&g, try g.sliceAxis(x, 0, at, at + 1), w, try g.sliceAxis(prev, 0, at, at + 1));
+        for (try host(one.out), try host(try g.sliceAxis(both.out, 0, at, at + 1))) |a, b| try testing.expectApproxEqAbs(a, b, 1e-5);
+        for (try host(one.state), try host(try g.sliceAxis(both.state, 0, at, at + 1))) |a, b| try testing.expectApproxEqAbs(a, b, 1e-6);
+    }
 }
 
 test "inkling2 blocks: depth attention of a zero query averages the sources; the clip caps the norm" {

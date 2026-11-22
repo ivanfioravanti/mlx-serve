@@ -12,7 +12,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const bases = @import("../../sdk/bases/bases.zig");
 const block = @import("../../sdk/bases/block.zig");
-const kv = @import("../../sdk/bases/kv.zig");
+const state = @import("../../sdk/bases/blocks/state.zig");
 const run_mod = @import("../../sdk/bases/run.zig");
 const head_block = @import("../../sdk/bases/blocks/head.zig");
 const loader = @import("../llama/load.zig");
@@ -74,7 +74,7 @@ pub const Layer = struct {
 
 pub const Head = struct {
     pub const kind: block.Kind = .head;
-    pub const supports_batched_rows = false;
+    pub const supports_batched_rows = true;
     pub const Weights = struct { lin: Linear, vocab: c_int, softcap: f32 };
 
     /// The padded vocab's real rows, softcapped in f32.
@@ -85,7 +85,7 @@ pub const Head = struct {
 };
 
 pub const Model = struct {
-    pub const batches_decode = false;
+    pub const batches_decode = true;
 
     pub const Weights = struct {
         embed: b.embed.TableEmbed.Weights,
@@ -147,7 +147,8 @@ pub const Model = struct {
             const normed_in = try blocks.rms(g, try t.wide(g), 1e-6);
 
             // The visit's conv windows: k | v | attention output | MLP output.
-            const st = try kv.state(c, .conv);
+            const ns = attention.slots(c);
+            const st = try state.get(c, .conv);
             var prev: [4]?Array = @splat(null);
             if (st) |a| {
                 var at: c_int = 0;
@@ -173,7 +174,7 @@ pub const Model = struct {
                 n.* = if (j > 0 and s.ctx == qkv[0].ctx and L.in_norm[j].ctx == L.in_norm[0].ctx) normed[0] else if (ops.dtype(s) == .float32 and ops.dtype(L.in_norm[j]) == .float32) (try blocks.rmsCast(g, s, L.in_norm[j], eps, dt, false)).out else try g.astype(try g.rmsNorm(s, L.in_norm[j], eps), dt);
             }
             const a = try attention.forward(&L.attn, c, normed[0], normed[1], normed[2], prev[0], prev[1]);
-            const ac = try blocks.sconv(g, a.out, L.attn_conv, prev[2]);
+            const ac = try blocks.bySeq(g, try blocks.sconv(g, try blocks.bySlot(g, a.out, ns), L.attn_conv, prev[2]), ns);
 
             var res: Array = undefined;
             if (L.boundary) {
@@ -186,13 +187,14 @@ pub const Model = struct {
             if (messages) |m| x = try L.gates.?[3].onRow(g, x, m, 3);
             const mlp_in = try blocks.rmsCast(g, x, L.post_norm, eps, dt, true);
             const parts = try moe.parts(&L.mlp, g, mlp_in.out, mlp_in.twin);
-            // The experts' weighted sum rides the conv kernel where it serves.
-            const mc = (try blocks.sconvSum(g, parts.out, parts.weights, L.mlp_conv, prev[3])) orelse
-                try blocks.sconv(g, try moe.sum(g, parts, ops.shape(mlp_in.out)), L.mlp_conv, prev[3]);
+            // The experts' weighted sum rides the conv kernel where it serves; that kernel reads its rows as one
+            // sequence, so a batched tick's slots take the sum and a conv each.
+            const fused = if (ns == 1) try blocks.sconvSum(g, parts.out, parts.weights, L.mlp_conv, prev[3]) else null;
+            const mc = fused orelse try blocks.bySeq(g, try blocks.sconv(g, try blocks.bySlot(g, try moe.sum(g, parts, ops.shape(mlp_in.out)), ns), L.mlp_conv, prev[3]), ns);
             // One copy joins the four windows' last `K - 1` rows (views of the conv kernels' windows).
-            try kv.setState(c, .conv, try g.concat(&.{ a.k.state, a.v.state, ac.state, mc.state }, 2));
+            try state.put(c, .conv, try g.concat(&.{ a.k.state, a.v.state, ac.state, mc.state }, 2));
             // A verify forward's rejected rows are rolled back from the conv inputs.
-            if (c.capture_spec) try kv.setState(c, .conv_input, try g.concat(&.{ a.k.input, a.v.input, ac.input, mc.input }, 2));
+            if (c.capture_spec) try state.put(c, .conv_input, try g.concat(&.{ a.k.input, a.v.input, ac.input, mc.input }, 2));
 
             const next = try compiled.sumBoth(g, res, mc.out);
             try t.move(next[0], next[1]);
@@ -204,12 +206,16 @@ pub const Model = struct {
 
     /// One forward of `ids` (`[1, rows]` int32). Results are owned by `g`.
     pub fn forward(w: *const Weights, shared: *const block.Shared, g: *Graph, ids: Array, run: run_mod.Run) !run_mod.Out {
-        if (run.mode == .batched_rows) return error.BatchedRowsUnsupported;
+        if (run.mode == .batched_rows and run.rows != 1) return error.BatchedRowsUnsupported;
         var c = run.ctx(g, shared);
+        const n_slots = attention.slots(&c);
         const embedded = try g.rmsNorm(try b.embed.TableEmbed.forward(&w.embed, &c, ids), w.embed_norm, w.eps);
         const n: u32 = @intCast(w.layers.len);
         const core = w.core_end - w.core_start;
-        var t: Trunk = .{ .w = w, .c = &c, .g = g, .run = &run, .h = try run.input(g, embedded, ids), .visits = n + core * (w.passes - 1) };
+        // A batched tick's slots ride the sequence axis: every row-wise block reads them as one chunk's rows.
+        const input = try run.input(g, embedded, ids);
+        const h0 = if (n_slots > 1) try g.reshape(input, &.{ 1, n_slots, ops.shape(input)[2] }) else input;
+        var t: Trunk = .{ .w = w, .c = &c, .g = g, .run = &run, .h = h0, .visits = n + core * (w.passes - 1) };
 
         for (0..w.core_start) |i| try t.apply(i, null);
         t.pinned = t.h;
@@ -240,7 +246,8 @@ pub const Model = struct {
 
         const normed = try blocks.rms(g, try t.wide(g), 1e-6);
         const mixed = try blocks.depthOne(g, t.bank[0..t.blocks], normed, w.final_query);
-        const final = try g.astype(try g.rmsNorm(mixed, w.final_norm, w.eps), ops.dtype(t.h));
+        const normed_final = try g.astype(try g.rmsNorm(mixed, w.final_norm, w.eps), ops.dtype(t.h));
+        const final = if (n_slots > 1) try g.reshape(normed_final, &.{ n_slots, 1, ops.shape(normed_final)[2] }) else normed_final;
         // A drafter's last tap: the final-normed output, published one past the last visit.
         try run.capture(g, t.visits, final);
         return run.finish(g, &c, final, Head, &w.head);

@@ -73,7 +73,9 @@ fn split(j: *const Joined, g: *Graph, x: Array, comptime n: usize) ![n]Array {
 /// The layer's attention over its normed q, k and v inputs `[1, L, hidden]`; `k_prev`/`v_prev` are the conv windows.
 pub fn forward(w: *const Weights, c: *Ctx, qs: Array, ks: Array, vs: Array, k_prev: ?Array, v_prev: ?Array) !Out {
     const g = c.g;
-    const l = c.rows;
+    const n = slots(c);
+    // Every slot's rows on the sequence axis: a batched tick's row i is slot i's.
+    const l = ops.shape(qs)[1];
     const hd = w.head_dim;
     const offset: c_int = @intCast(c.offset());
     const total = offset + l;
@@ -86,14 +88,17 @@ pub fn forward(w: *const Weights, c: *Ctx, qs: Array, ks: Array, vs: Array, k_pr
             if (w.join_kv.built() and ks.ctx == vs.ctx) {
                 kv_lin = try split(&w.join_kv, g, ks, 2);
             } else kv_lin = .{ try w.k.forward(g, ks), try w.v.forward(g, vs) };
-            break :blk .{ try blocks.sconvPost(g, kv_lin[0], s.k, k_prev, kpost), try blocks.sconvPost(g, kv_lin[1], s.v, v_prev, vpost) };
+            break :blk .{
+                try blocks.bySeq(g, try blocks.sconvPost(g, try blocks.bySlot(g, kv_lin[0], n), s.k, k_prev, kpost), n),
+                try blocks.bySeq(g, try blocks.sconvPost(g, try blocks.bySlot(g, kv_lin[1], n), s.v, v_prev, vpost), n),
+            };
         },
         .dynamic => |d| blk: {
             const kk = if (w.join_k.built()) try split(&w.join_k, g, ks, 2) else [2]Array{ try w.k.forward(g, ks), try d.k_proj.forward(g, ks) };
             const vv = if (w.join_v.built()) try split(&w.join_v, g, vs, 2) else [2]Array{ try w.v.forward(g, vs), try d.v_proj.forward(g, vs) };
             break :blk .{
-                try blocks.dynamicSconv(g, kk[0], kk[1], d.k, w.kv_heads, k_prev, kpost),
-                try blocks.dynamicSconv(g, vv[0], vv[1], d.v, w.kv_heads, v_prev, vpost),
+                try blocks.bySeq(g, try blocks.dynamicSconv(g, try blocks.bySlot(g, kk[0], n), try blocks.bySlot(g, kk[1], n), d.k, w.kv_heads, k_prev, kpost), n),
+                try blocks.bySeq(g, try blocks.dynamicSconv(g, try blocks.bySlot(g, vv[0], n), try blocks.bySlot(g, vv[1], n), d.v, w.kv_heads, v_prev, vpost), n),
             };
         },
     };
@@ -107,14 +112,19 @@ pub fn forward(w: *const Weights, c: *Ctx, qs: Array, ks: Array, vs: Array, k_pr
     const v4 = try g.reshape(vc.out, &.{ 1, l, w.kv_heads, hd });
     const v = if (vc.post) v4 else (try blocks.rmsCast(g, v4, null, w.eps, ops.dtype(v4), false)).out;
     var rel = try blocks.l2Clip(g, try g.reshape(qo[1], &.{ 1, l, w.heads, w.d_rel }), w.rel_clip, w.rel_clip_at);
-    if (w.window == 0 and total > @as(c_int, @intCast(w.log_floor))) {
-        const tau = try logScale(g, offset, l, w.log_floor, w.log_alpha);
-        q = try g.astype(try g.mul(try blocks.f32Of(g, q), tau), ops.dtype(q));
-        rel = try g.astype(try g.mul(try blocks.f32Of(g, rel), tau), ops.dtype(rel));
+    const tau: ?Array = if (w.window > 0) null else if (n == 1) (if (total > @as(c_int, @intCast(w.log_floor))) try logScale(g, offset, l, w.log_floor, w.log_alpha) else null) else try logScaleRows(g, c.positions[0..@intCast(n)], w.log_floor, w.log_alpha);
+    if (tau) |t| {
+        q = try g.astype(try g.mul(try blocks.f32Of(g, q), t), ops.dtype(q));
+        rel = try g.astype(try g.mul(try blocks.f32Of(g, rel), t), ops.dtype(rel));
     }
     const bias = try g.matmul(rel, try g.astype(w.rel_proj, ops.dtype(rel)));
 
     const perm = [_]c_int{ 0, 2, 1, 3 };
+    if (n > 1) {
+        const out = try attendSlots(w, c, n, try g.transpose(q, &perm), k, v, bias, sinks);
+        const gated = try @import("compiled.zig").sigmoidGate(g, try g.reshape(out, &.{ 1, l, w.heads * hd }), gate);
+        return .{ .out = try w.o.forward(g, gated), .k = kc, .v = vc };
+    }
     const sv = band.view(w.window, hd, total, l);
     var view = try kv.append(c, try g.transpose(k, &perm), try g.transpose(v, &perm), if (w.window > 0) sv.span else 0);
     defer kv.release(c, &view);
@@ -138,6 +148,51 @@ fn logScale(g: *Graph, offset: c_int, l: c_int, floor: u32, alpha: f32) !Array {
     const n = try g.arange(@floatFromInt(offset + 1), @floatFromInt(offset + l + 1), 1, .float32);
     const ratio = try g.maximum(try g.mulScalar(n, 1.0 / @as(f32, @floatFromInt(floor))), try g.scalar(1, .float32));
     return g.reshape(try g.addScalar(try g.mulScalar(try g.log(ratio), alpha), 1), &.{ 1, l, 1, 1 });
+}
+
+/// Slots of a batched tick (one row each); 1 otherwise.
+pub fn slots(c: *const Ctx) c_int {
+    return if (c.mode == .batched_rows) @intCast(c.caches.len) else 1;
+}
+
+/// `logScale` of a batched tick's rows, each at its slot's position: `[1, N, 1, 1]` f32 (1 below the floor).
+fn logScaleRows(g: *Graph, positions: []const u32, floor: u32, alpha: f32) !Array {
+    var at: [64]f32 = undefined;
+    for (positions, 0..) |p, i| at[i] = @floatFromInt(p + 1);
+    const n = try g.fromSlice(f32, at[0..positions.len], &.{@intCast(positions.len)});
+    const ratio = try g.maximum(try g.mulScalar(n, 1.0 / @as(f32, @floatFromInt(floor))), try g.scalar(1, .float32));
+    return g.reshape(try g.addScalar(try g.mulScalar(try g.log(ratio), alpha), 1), &.{ 1, @intCast(positions.len), 1, 1 });
+}
+
+/// A batched tick's attention: each slot's k/v row appended to its own cache, and its query row read against its own
+/// keys (its window on a sliding layer), as its solo decode step reads them. `q` `[1, Hq, N, D]`; `[1, N, Hq, D]`.
+fn attendSlots(w: *const Weights, c: *Ctx, n: c_int, q: Array, k: Array, v: Array, bias: Array, sinks: Array) !Array {
+    const g = c.g;
+    const hd = w.head_dim;
+    const perm = [_]c_int{ 0, 2, 1, 3 };
+    const rows = [_]c_int{ n, 1, w.kv_heads, hd };
+    try kv.appendRows(c, try g.transpose(try g.reshape(k, &rows), &perm), try g.transpose(try g.reshape(v, &rows), &perm), 0);
+    var outs: [64]Array = undefined;
+    for (0..@intCast(n)) |i| {
+        const at: c_int = @intCast(i);
+        var view = try kv.view(c, c.caches[i], c.layer);
+        defer kv.release(c, &view);
+        const dv = kv.dense(view);
+        const keys = ops.shape(dv.k)[2];
+        const span: c_int = @intCast(band.view(w.window, hd, @intCast(c.positions[i] + 1), 1).span);
+        const from = if (span > 0 and keys > span) keys - span else 0;
+        outs[i] = try attend(g, .{
+            .q = try g.sliceAxis(q, 2, at, at + 1),
+            .k = try g.sliceAxis(dv.k, 2, from, keys),
+            .v = try g.sliceAxis(dv.v, 2, from, keys),
+            .rel = try g.sliceAxis(bias, 1, at, at + 1),
+            .sinks = try g.sliceAxis(sinks, 1, at, at + 1),
+            .key_start = try g.zeros(&.{1}, .int32),
+            .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd))),
+            .window = w.window,
+        });
+    }
+    return g.concat(outs[0..@intCast(n)], 1);
 }
 
 /// Keys from which a window is read over key chunks; under it, row by row is as quick. A single row stays on
