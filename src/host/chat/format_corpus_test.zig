@@ -1579,6 +1579,14 @@ const corpus = [_]Expect{
         .reasoning_contains = "answer 10 only",
     },
     .{
+        // Live capture: a one-token budget (max_tokens=1) ends on the message head, before any channel marker.
+        .family = "inkling",
+        .name = "a reply cut at its message head is empty content",
+        .raw = "<|message_model|>",
+        .thinking = true,
+        .content_exact = "",
+    },
+    .{
         // Length-truncated mid-thought (live fibonacci raw run shape):
         // reasoning, never content.
         .family = "inkling",
