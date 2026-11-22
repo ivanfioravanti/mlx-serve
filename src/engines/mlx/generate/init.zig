@@ -364,7 +364,8 @@ pub fn initWithOptions(
     if (final_start > 0) {
         const prefix_len = prompt_ids.len - 1;
         const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
-        if (want_ssm_cp and !mtp_active and !has_vision and convOnlyState(ctx.ssm_entries.?))
+        const conv_capture = if (xfm.config.plugin) |pb| pb.parsed.caps.captures_conv_input else false;
+        if (want_ssm_cp and conv_capture and !mtp_active and !has_vision and convOnlyState(ctx.ssm_entries.?))
             one_forward_cp = oneForwardTailRows(ssm_cp_offset, prefix_len, snapshot_backoff, PREFILL_CHUNK, ssm_cp_stride, dense_low_grid);
         if (one_forward_cp > 0) log.debug("[prefill] restored tail of {d} rows in one forward; checkpoint at {d} cut from its capture\n", .{ prompt_ids.len, ssm_cp_offset + one_forward_cp });
         const loop_end = if (one_forward_cp > 0) 0 else prefix_len - snapshot_backoff;

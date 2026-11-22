@@ -104,7 +104,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         error.Invalid => invalid("a config value out of range"),
     };
 
-    var p: abi.Parsed = .{ .caps = .{ .batches_decode = batches_decode, .moe = c.moe != null, .exact_resumed = true, .dflash_capture = true, .images = vision, .experts_stream = c.moe != null } };
+    var p: abi.Parsed = .{ .caps = .{ .batches_decode = batches_decode, .moe = c.moe != null, .exact_resumed = true, .dflash_capture = true, .images = vision, .experts_stream = c.moe != null, .captures_conv_input = true } };
     p.placeholder_ids.image = image_id;
     const s = &p.shell;
     s.* = .{
@@ -254,7 +254,7 @@ test "lfm2 config: an LFM2.5 pack parses into the shell, its conv layers and its
     try testing.expectEqual(LayerKind.attention, c.layers[2]);
     try testing.expectEqual(LayerKind.conv, c.layers[15]);
     try testing.expectEqualSlices(u32, &.{7}, p.shell.eos[0..p.shell.eos_count]);
-    try testing.expect(p.caps.exact_resumed and !p.caps.batches_decode and !p.caps.moe);
+    try testing.expect(p.caps.exact_resumed and !p.caps.batches_decode and !p.caps.moe and p.caps.captures_conv_input);
     var lay: [17]abi.LayerCache = undefined;
     try testing.expectEqual(@as(u32, 16), layout(&p, null, &lay, lay.len));
     try testing.expectEqual(abi.LayerKind.conv, lay[0].kind);
