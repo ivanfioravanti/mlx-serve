@@ -626,6 +626,7 @@ const ClusterState = struct {
     /// Round trips since the last timing line, and their totals (µs): the whole exchange and the
     /// worker's share of it.
     timing: struct { n: u32 = 0, round_us: u64 = 0, worker_us: u64 = 0 } = .{},
+    experts_timing: ExpertsTiming = .{},
     /// DeepSeek-V4.1 tensor: the link the forward's sums run over (either rank), and the sums built since the last step
     /// began, which every rank must match step by step.
     tp_link: ?*const Link = null,
@@ -940,8 +941,28 @@ const expert_exchange = @import("../../../host/plugin_host_impl.zig").expert_exc
 fn expertExchange(layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, weights: mlx.mlx_array) anyerror!mlx.mlx_array {
     const p = peer() orelse return error.DistWorkerNotJoined;
     if (p.failed or !p.planned) return error.DistWorkerLeft;
+    const io = cluster().group.?.io;
+    const t0 = io_util.nowUsMonotonic(io);
     try p.sendExperts(x, idx, weights, layer);
-    return queuedRecv(&p.link, &.{ mlx.getShape(x)[0], mlx.getShape(x)[1] }, .float32, 1);
+    const r = try queuedRecv(&p.link, &.{ mlx.getShape(x)[0], mlx.getShape(x)[1] }, .float32, 1);
+    noteExperts(&cluster().experts_timing, "rank 0", .{ io_util.nowUsMonotonic(io) - t0, 0, 0 }, mlx.getShape(x)[0]);
+    return r;
+}
+
+/// Per `EXPERT_LINE` exchanges, one line of where their time went (µs summed): rank 0 its wait from the send
+/// to the share's arrival; the worker its wait for rows, its compute, its send back.
+const EXPERT_LINE = 48;
+const ExpertsTiming = struct { n: u32 = 0, us: [3]i64 = .{ 0, 0, 0 } };
+
+fn noteExperts(t: *ExpertsTiming, who: []const u8, us: [3]i64, rows: c_int) void {
+    for (&t.us, us) |*sum, x| sum.* += x;
+    t.n += 1;
+    if (t.n < EXPERT_LINE) return;
+    const args = .{ who, t.n, rows, @divTrunc(t.us[0], 1000), @divTrunc(t.us[1], 1000), @divTrunc(t.us[2], 1000) };
+    const fmt = "[dist] experts {s}: {d} exchanges of {d} rows, wait {d} ms, compute {d} ms, send {d} ms\n";
+    // The worker has no debug level of its own.
+    if (who[0] == 'w') log.info(fmt, args) else log.debug(fmt, args);
+    t.* = .{};
 }
 
 /// DeepSeek-V4.1: the worker takes a run of layers its share of the memory holds, cut where
@@ -1643,7 +1664,9 @@ fn servePluginExperts(io: std.Io, allocator: std.mem.Allocator, link: *const Lin
     try sendMsg(link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
     log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
     var shares: u64 = 0;
+    var timing: ExpertsTiming = .{};
     while (true) {
+        const t0 = io_util.nowUsMonotonic(io);
         const m = try recvMsg(link, 0);
         switch (m[0]) {
             OP_STOP => break,
@@ -1655,6 +1678,7 @@ fn servePluginExperts(io: std.Io, allocator: std.mem.Allocator, link: *const Lin
                 defer _ = mlx.mlx_array_free(idx);
                 const w = try queuedRecv(link, &.{ m[1], m[3] }, .float32, 0);
                 defer _ = mlx.mlx_array_free(w);
+                const t1 = io_util.nowUsMonotonic(io);
                 var out: @import("../../../abi/common.zig").Array = .{};
                 const v = share(bound.model, @intCast(m[5]), .{ .ctx = x.ctx }, .{ .ctx = idx.ctx }, .{ .ctx = w.ctx }, &out);
                 if (!v.isOk()) {
@@ -1663,9 +1687,12 @@ fn servePluginExperts(io: std.Io, allocator: std.mem.Allocator, link: *const Lin
                 }
                 const y: mlx.mlx_array = .{ .ctx = out.ctx };
                 defer _ = mlx.mlx_array_free(y);
+                try evalOne(y);
+                const t2 = io_util.nowUsMonotonic(io);
                 const sent = try link.send(y, 0);
                 defer _ = mlx.mlx_array_free(sent);
                 try evalOne(sent);
+                noteExperts(&timing, "worker", .{ t1 - t0, t2 - t1, io_util.nowUsMonotonic(io) - t2 }, m[1]);
                 shares += 1;
             },
             else => return error.DistBadMessage,
