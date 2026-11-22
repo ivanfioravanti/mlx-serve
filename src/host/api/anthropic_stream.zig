@@ -37,6 +37,7 @@ const emitConstrainedAnthropic = @import("chat_completions.zig").emitConstrained
 const StreamingTokenStream = @import("chat_stream.zig").StreamingTokenStream;
 const requestHasCompany = @import("request_options.zig").requestHasCompany;
 const pickStreamMode = @import("request_options.zig").pickStreamMode;
+const streamPld = @import("request_options.zig").streamPld;
 const SSE_ALLOW_HEADERS_ANTHROPIC = @import("../http/respond.zig").SSE_ALLOW_HEADERS_ANTHROPIC;
 const sendSseHeaders = @import("../http/respond.zig").sendSseHeaders;
 const utf8TrailingIncomplete = @import("format.zig").utf8TrailingIncomplete;
@@ -118,7 +119,7 @@ pub fn handleAnthropicStreaming(
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
         .timeout_ns = getTimeoutNs(),
-        .enable_pld = stream_mode == .pld,
+        .enable_pld = streamPld(stream_mode, enable_pld, lm.dflash != null),
         .enable_drafter = stream_mode == .drafter,
         .drafter = if (stream_mode == .drafter) lm.drafter else null,
         .dflash = if (stream_mode == .drafter) lm.dflash else null,

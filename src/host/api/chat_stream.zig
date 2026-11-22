@@ -40,6 +40,7 @@ const StopStream = @import("../chat/stops.zig").StopStream;
 const emitConstrainedChat = @import("chat_completions.zig").emitConstrainedChat;
 const requestHasCompany = @import("request_options.zig").requestHasCompany;
 const pickStreamMode = @import("request_options.zig").pickStreamMode;
+const streamPld = @import("request_options.zig").streamPld;
 const StreamLogprobs = @import("logprobs.zig").StreamLogprobs;
 const sendSSEChunk = @import("../http/sse.zig").sendSSEChunk;
 const sendSSEUsageChunk = @import("../http/sse.zig").sendSSEUsageChunk;
@@ -238,7 +239,7 @@ pub fn handleStreamingGeneration(
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
         .timeout_ns = getTimeoutNs(),
-        .enable_pld = stream_mode == .pld,
+        .enable_pld = streamPld(stream_mode, enable_pld, lm.dflash != null),
         .enable_drafter = stream_mode == .drafter,
         .drafter = if (stream_mode == .drafter) lm.drafter else null,
         .dflash = if (stream_mode == .drafter) lm.dflash else null,

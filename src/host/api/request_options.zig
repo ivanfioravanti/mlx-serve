@@ -241,7 +241,8 @@ pub fn requestHasCompany() bool {
 /// `has_company` (another request live at admission) hands a DFlash round to
 /// a loaded MTP head: only MTP slots batch.
 /// `enable_drafter` arrives with the hybrid veto (`archBlocksAssistantSidecar`)
-/// already applied at every surface's parse site.
+/// already applied at every surface's parse site. PLD is armed beside DFlash for the rest of a request DFlash's
+/// runtime gate stops; the gemma drafter and MTP keep it off.
 pub fn requestSpecModes(
     enable_pld: bool,
     enable_drafter: bool,
@@ -263,8 +264,14 @@ pub fn requestSpecModes(
     return .{
         .use_mtp = use_mtp,
         .use_drafter = use_drafter,
-        .use_pld = !use_mtp and !use_drafter and spec_ok and enable_pld,
+        .use_pld = !use_mtp and (use_dflash or !use_drafter) and spec_ok and enable_pld,
     };
+}
+
+/// A streamed request's PLD flag from its mode, as `requestSpecModes` arms it (a `.drafter` stream on a DFlash
+/// model keeps PLD for the hand-off).
+pub fn streamPld(mode: StreamMode, enable_pld: bool, dflash_loaded: bool) bool {
+    return mode == .pld or (mode == .drafter and dflash_loaded and enable_pld);
 }
 
 pub fn pickStreamMode(
@@ -374,9 +381,15 @@ test "drafter admission: present non-boolean overrides disable either sidecar" {
 
 test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP head; the gemma drafter does not" {
     // dflash + mtp both loaded and enabled -> dflash rides the drafter arm.
+    // PLD stays armed beside DFlash for the rest of a request its runtime gate stops.
     var r = requestSpecModes(true, true, true, false, true, true, false, 0, false);
-    try std.testing.expect(r.use_drafter and !r.use_mtp and !r.use_pld);
+    try std.testing.expect(r.use_drafter and !r.use_mtp and r.use_pld);
     try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, true, true, false, 0, false));
+    try std.testing.expect(streamPld(.drafter, true, true) and !streamPld(.drafter, false, true));
+    // The gemma drafter keeps PLD off.
+    r = requestSpecModes(true, true, false, true, false, false, false, 0, false);
+    try std.testing.expect(r.use_drafter and !r.use_pld);
+    try std.testing.expect(!streamPld(.drafter, true, false));
     // gemma drafter + mtp -> MTP keeps its rank.
     r = requestSpecModes(true, true, true, true, false, true, false, 0, false);
     try std.testing.expect(r.use_mtp and !r.use_drafter);

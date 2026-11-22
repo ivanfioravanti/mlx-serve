@@ -55,6 +55,7 @@ const requestEnableDrafter = @import("request_options.zig").requestEnableDrafter
 const requestHasCompany = @import("request_options.zig").requestHasCompany;
 const requestSpecModes = @import("request_options.zig").requestSpecModes;
 const pickStreamMode = @import("request_options.zig").pickStreamMode;
+const streamPld = @import("request_options.zig").streamPld;
 const StreamLogprobs = @import("logprobs.zig").StreamLogprobs;
 const sendResponse = @import("../http/respond.zig").sendResponse;
 const SSE_ALLOW_HEADERS_DEFAULT = @import("../http/respond.zig").SSE_ALLOW_HEADERS_DEFAULT;
@@ -289,7 +290,7 @@ pub fn handleCompletions(
     var enable_pld: bool = requestPld(root, lm);
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
     var enable_drafter = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
-    if (enable_drafter and enable_pld) enable_pld = false;
+    if (enable_drafter and enable_pld and lm.dflash == null) enable_pld = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
@@ -543,7 +544,7 @@ fn handleStreamingCompletion(
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
         .timeout_ns = getTimeoutNs(),
-        .enable_pld = stream_mode == .pld,
+        .enable_pld = streamPld(stream_mode, enable_pld, lm.dflash != null),
         .enable_drafter = stream_mode == .drafter,
         .drafter = if (stream_mode == .drafter) lm.drafter else null,
         .dflash = if (stream_mode == .drafter) lm.dflash else null,

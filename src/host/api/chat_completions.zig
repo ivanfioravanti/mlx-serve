@@ -663,7 +663,7 @@ pub fn handleChatCompletions(
         enable_mtp = false;
     }
     if (enable_drafter) {
-        if (enable_pld) {
+        if (enable_pld and lm.dflash == null) {
             log.info("  pld=disabled (drafter takes priority for this request)\n", .{});
             enable_pld = false;
         }
