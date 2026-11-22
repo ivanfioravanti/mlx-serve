@@ -146,7 +146,10 @@ pub const Caps = packed struct(u64) {
     /// A capturing forward (`capture_spec`) leaves every visit's conv inputs (`StateSlot.conv_input`): the engine may cut
     /// a recurrent checkpoint at any of its rows (`captureSsmCheckpointAt`).
     captures_conv_input: bool = false,
-    _: u30 = 0,
+    /// A batched forward takes each slot's prompt span (`Forward.rows` rows a slot), attended on its own keys: the
+    /// engine may prefill admitted prompts stacked in one forward.
+    stacks_prompts: bool = false,
+    _: u29 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };

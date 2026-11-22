@@ -75,6 +75,9 @@ pub const Slot = struct {
     request_id: u64 = 0,
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
     restored_entry: u64 = 0,
+    /// Prompt rows a stacked pass forwarded with other admitted prompts (`prefill_stacked.zig`): the prefill takes
+    /// them as restored.
+    stacked_rows: u32 = 0,
     skip_prefix_cache: bool = false,
     /// What the request changes about the model's state (`ModuleBinding.variant`; a directional ablation's key): a
     /// module-owned cache keys its entries by it, the KV prefix cache is neither read nor written.
