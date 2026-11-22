@@ -21,7 +21,6 @@ const wire = @import("../../../sdk/util/wire.zig");
 const lan = @import("../../../host/lan/lan.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
 const plugin_driver = @import("../plugin/driver.zig");
-const sushi_pack = @import("../../../sdk/quant/exl3/sushi_pack.zig");
 
 pub const Mode = enum {
     /// Each rank owns a contiguous range of layers; the hidden stream hops at the seams.
@@ -511,14 +510,14 @@ pub const Peer = struct {
         try self.sendOrdered(.{ OP_MOE, xs[0], xs[1], xs[2], ls[ls.len - 1], @backingInt(mlx.mlx_array_dtype(x)), @intCast(layer), @backingInt(mlx.mlx_array_dtype(logits)) }, &.{ x, logits });
     }
 
-    /// Tensor mode, a plugin's experts: rows `x` `[t, d]`, routes `idx` `[t, k]` u32 and weights `[t, k]` f32; the
-    /// share comes back in `back` (header slot 6, 0 = f32: a worker that predates it sends f32).
+    /// Tensor mode, a plugin's experts: rows `x` `[t, d]`, the worker's pairs `idx` `[p, 2]` u32 and their weights
+    /// `[p]` f32; the share comes back in `back` (header slot 6, 0 = f32).
     pub fn sendExperts(self: *Peer, x: mlx.mlx_array, idx: mlx.mlx_array, weights: mlx.mlx_array, layer: u32, back: mlx.mlx_dtype) !void {
         if (!self.ready) try self.awaitReady();
         const xs = mlx.getShape(x);
         self.exchanges += 1;
         const code: i32 = if (back == .float32) 0 else @intCast(@backingInt(back));
-        try self.sendOrdered(.{ OP_EXPERTS, xs[0], xs[1], mlx.getShape(idx)[1], @backingInt(mlx.mlx_array_dtype(x)), @intCast(layer), code, 0 }, &.{ x, idx, weights });
+        try self.sendOrdered(.{ OP_EXPERTS, xs[0], xs[1], mlx.getShape(idx)[0], @backingInt(mlx.mlx_array_dtype(x)), @intCast(layer), code, 0 }, &.{ x, idx, weights });
     }
 
     /// The worker's partial for the layer input `x`: its shape and dtype.
@@ -766,22 +765,12 @@ pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Pa
 pub fn hostShare(model_dir: []const u8, config: *const model_mod.ModelConfig, whole: u64) u64 {
     if (!holds(model_dir)) return whole;
     const g = cluster().group.?;
-    // Rank 0 keeps its full banks beside its share of them.
-    if (g.mode == .tensor and config.sharesPluginExperts()) return whole + expertBytes(g.io, g.allocator, model_dir, whole) / 2;
+    // Both ranks hold the whole pack: rank 0 splits each chunk's pairs.
+    if (g.mode == .tensor and config.sharesPluginExperts()) return whole;
     const n: u64 = config.num_hidden_layers;
     if (n == 0) return whole;
     if (peer()) |p| if (p.planned) return if (p.mode == .tensor) whole / 2 + whole / 10 else whole * p.span.len() / n;
     return shareFor(g, config, whole, status.getAvailableMemBytes() >> 20, worker_free_mib.load(.acquire));
-}
-
-/// The routed experts' bytes of the pack at `model_dir` (`.mlp.experts.` tensors); `whole` where its headers cannot be read.
-fn expertBytes(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, whole: u64) u64 {
-    const Experts = struct {
-        pub fn bill(_: @This(), t: sushi_pack.Stored) !u64 {
-            return if (std.mem.indexOf(u8, t.key, ".mlp.experts.") != null) t.bytes else 0;
-        }
-    };
-    return sushi_pack.residentBytes(io, a, model_dir, Experts{}) catch whole;
 }
 
 fn shareFor(g: Group, config: *const model_mod.ModelConfig, whole: u64, mine: u64, theirs: u64) u64 {
@@ -1689,9 +1678,9 @@ fn servePluginExperts(io: std.Io, allocator: std.mem.Allocator, link: *const Lin
             OP_EXPERTS => {
                 const x = try queuedRecv(link, &.{ m[1], m[2] }, @fromBackingInt(@intCast(m[4])), 0);
                 defer _ = mlx.mlx_array_free(x);
-                const idx = try queuedRecv(link, &.{ m[1], m[3] }, .uint32, 0);
+                const idx = try queuedRecv(link, &.{ m[3], 2 }, .uint32, 0);
                 defer _ = mlx.mlx_array_free(idx);
-                const w = try queuedRecv(link, &.{ m[1], m[3] }, .float32, 0);
+                const w = try queuedRecv(link, &.{m[3]}, .float32, 0);
                 defer _ = mlx.mlx_array_free(w);
                 const t1 = io_util.nowUsMonotonic(io);
                 var out: @import("../../../abi/common.zig").Array = .{};
@@ -2302,32 +2291,6 @@ test "after the stop message rank 0 sends the worker nothing more" {
     try std.testing.expect(!peer().?.ready); // the model's unload at teardown must not message a stopped worker
 }
 
-test "hostShare: rank 0 of a plugin that splits its own experts holds the pack and half its experts again" {
-    if (comptime builtin.os.tag != .macos) return error.SkipZigTest; // a cluster exists only on macOS
-    const io = std.testing.io;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const zeros = try a.alloc(f32, 32);
-    @memset(zeros, 0);
-    const fx = @import("../../../sdk/testing/fixture.zig");
-    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = try fx.safetensors(a, &.{
-        .{ .name = "m.layers.0.mlp.experts.gate_up_proj.weight", .shape = &.{ 4, 8 }, .data = zeros },
-        .{ .name = "m.layers.0.self_attn.q_proj.weight", .shape = &.{ 2, 8 }, .data = zeros[0..16] },
-    }) });
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
-    cluster().group = .{ .io = io, .allocator = a, .mode = .tensor, .model = dir, .split = null };
-    defer cluster().group = null;
-    cluster().joined.store(true, .release);
-    defer cluster().joined.store(false, .release);
-    var binding: @import("../plugin/config.zig").Binding = .{ .table = &@import("../../../plugins/inkling2/plugin.zig").table };
-    var c: model_mod.ModelConfig = .{ .model_type = "inkling2_loop", .plugin = &binding, .num_hidden_layers = 1 };
-    // 128 bytes of experts: 64 more than the pack.
-    try std.testing.expectEqual(@as(u64, 1064), hostShare(dir, &c, 1000));
-}
 
 test "a load waits for a worker whose link is still opening, and not for one whose link failed" {
     if (comptime builtin.os.tag != .macos) return error.SkipZigTest; // a cluster exists only on macOS

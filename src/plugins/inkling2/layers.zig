@@ -86,8 +86,8 @@ pub const Layer = struct {
     /// Set on a looped layer, with its q, k, v and mlp message queries `[hidden, 4]`, held as a depth query.
     gates: ?Gates = null,
     message_query: Array = .{},
-    /// This rank's share of every expert (`--dist tensor`); null = a single node.
-    share: ?@import("tp.zig").Share = null,
+    /// Rank 0 of a tensor-parallel pair (`--dist tensor`); null = a single node or the worker.
+    tp: ?@import("tp.zig").Tp = null,
 };
 
 pub const Body = struct {
