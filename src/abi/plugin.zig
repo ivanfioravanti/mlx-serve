@@ -1129,6 +1129,14 @@ test "abi plugin: caps fit one word with the generic defaults" {
     try testing.expect(c.prefix_cache and c.batch_per_slot_attn and c.batch_pads_kv and !c.batches_decode);
 }
 
+test "abi plugin: a caps word built before stacks_prompts (its bit was padding, zero) reads it unset" {
+    const old: Caps = .{ .batches_decode = true, .experts_stream = true };
+    var word: u64 = @bitCast(old);
+    word &= ~(@as(u64, 1) << @bitOffsetOf(Caps, "stacks_prompts"));
+    const read: Caps = @bitCast(word);
+    try std.testing.expect(!read.stacks_prompts and read.batches_decode and read.experts_stream);
+}
+
 test "abi plugin: an older plugin's caps word ends before prompt_last_row, which it reads unset" {
     try testing.expectEqual(@bitOffsetOf(Caps, "ablation") + 1, @bitOffsetOf(Caps, "prompt_last_row"));
     const older: Caps = @bitCast((@as(u64, 1) << @bitOffsetOf(Caps, "prompt_last_row")) - 1);

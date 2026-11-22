@@ -2,7 +2,9 @@
 # test_stacked_prefill.sh — admitted cold prompts prefilled stacked (`prefill_stacked.zig`, a model declaring
 # Caps.stacks_prompts): [1] four cold prompts sent at once each decode what they decode alone after (raw completions,
 # greedy; a first divergence at the alone run's near-tie is acquitted, as the batched rows round apart); [2] the pass
-# engaged for them (its log line); [3] a lone request never stacks.
+# engaged for them (its log line); [3] a lone request never stacks, and one after the stack is no restore.
+#   With MLX_SERVE_DIAG=stacked-prefill-fail the pass fails after its first slot: [2] becomes its failure line and [1]
+#   must still hold (every slot reset and prefilled alone).
 #
 #   MLX_STACK_MODEL=<dir> ./tests/test_stacked_prefill.sh   # default Inkling-2-Mini-4bit; PORT (19078)
 
@@ -43,8 +45,11 @@ def call(prompt, lp=True):
     return c["logprobs"] if lp else {"tokens": [str(t) for t in post("/tokenize", {"content": c["text"]})["tokens"]]}
 def prompt(i, tag):
     return f"[{tag} {i}] " + " ".join(f"{words[(i * 5 + k) % len(words)]}{k % 7}" for k in range(60 + 9 * i)) + ". Next:"
+import os
+fail = "stacked-prefill-fail" in os.environ.get("MLX_SERVE_DIAG", "")
+needle = "[prefill] stacked pass failed" if fail else "[prefill] stacked "
 def lines():
-    try: return sum("[prefill] stacked" in l for l in open(slog))
+    try: return sum(needle in l for l in open(slog))
     except OSError: return 0
 ec = 0
 before = lines()
@@ -62,9 +67,14 @@ alone = [call(prompt(i, "stack")) for i in range(4)]
 for a in alone:
     a["ids"] = [str(t) for t in post("/tokenize", {"content": "".join(a["tokens"])})["tokens"]]
 if lines() == before:
-    print("❌ FAIL: four prompts at once never stacked (no '[prefill] stacked' line)"); ec = 1
+    print(f"❌ FAIL: four prompts at once never logged {needle!r}"); ec = 1
 else:
-    print("✅ the stacked pass engaged")
+    print("✅ the stacked pass " + ("failed and reset" if fail else "engaged"))
+after = post("/v1/completions", {"prompt": prompt(11, "after"), "max_tokens": 4, "temperature": 0})
+if (after.get("usage", {}).get("prompt_tokens_details") or {}).get("cached_tokens", 0) != 0:
+    print("❌ FAIL: a fresh prompt after the stack was taken as restored"); ec = 1
+else:
+    print("✅ a fresh prompt after the stack prefills cold")
 for i in range(4):
     a, b = alone[i], got[i]
     for k in range(min(len(a["ids"]), len(b["tokens"]))):
