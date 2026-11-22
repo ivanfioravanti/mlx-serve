@@ -618,6 +618,9 @@ pub const Forward = extern struct {
     /// the conversation's, and a state that kept it is one the prefix cache cannot restore. Read it only when `size`
     /// reaches it.
     stop_ids: Span(u32) = .{},
+    /// A prompt forward that also leaves each recurrent row's state as a verify does (`Ctx.capture_spec`), for the
+    /// engine to cut checkpoints from; still a prefill otherwise. Read it only when `size` reaches it.
+    capture: bool = false,
 };
 
 /// Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its

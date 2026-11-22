@@ -210,7 +210,7 @@ fn run(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.Fo
         .captured = captured,
         .eval_every = if (f.rows > 1) f.eval_every else 0,
         // Verify rows roll back on a partial accept; a batched decode step (one row) never does.
-        .capture_spec = f.mode == .verify or (f.mode == .batched_rows and f.rows > 1),
+        .capture_spec = f.mode == .verify or (f.mode == .batched_rows and f.rows > 1) or (f.size > @offsetOf(abi.Forward, "capture") and f.capture),
         .mrope = if (f.mrope.ctx != null) .{ try mropeHalf(&g, .{ .ctx = f.mrope.ctx }, 0), try mropeHalf(&g, .{ .ctx = f.mrope.ctx }, 1) } else null,
         .media = .{ .ctx = f.media.ctx },
         .mask = if (f.key_mask.ctx != null) try g.reshape(.{ .ctx = f.key_mask.ctx }, &.{ @intCast(slots), 1, 1, @intCast(f.rows) }) else .{},
