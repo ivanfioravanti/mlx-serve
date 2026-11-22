@@ -16,9 +16,9 @@ const Config = @import("config.zig").Config;
 const Graph = ops.Graph;
 const Array = ops.Array;
 
-/// Prefill chunks from this many rows split their experts with the worker; decode, verify rounds and short spans
-/// never cross the wire.
-pub const TP_ROWS = 1024;
+/// Prefill chunks from this many rows split their experts with the worker: past where the split overtakes one node.
+/// Decode, verify rounds and short spans never cross the wire.
+pub const TP_ROWS = 2048;
 
 /// Rank 0's link to the worker: the host whose `expert_exchange` reaches it, and whether it still answers (a failed
 /// exchange leaves the rest on this node; the server restarts to pair again).
