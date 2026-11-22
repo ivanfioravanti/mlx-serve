@@ -535,7 +535,7 @@ pub const Loaded = struct {
     tap_visits: [config.max_taps]u32 = @splat(0),
     /// The host's command-buffer split, moved per forward (`BufferSplit`).
     split: BufferSplit = .{},
-    /// Rank 0 of a tensor-parallel pair (`Layer.share.pair` points here).
+    /// Rank 0 of a tensor-parallel pair (`Layer.tp.pair` points here).
     pair: tp.Pair = undefined,
 
     fn release(m: *Loaded) void {
@@ -846,7 +846,15 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     };
     // The parse's quant block is freed with it; the forward reads none of it.
     m.base.weights.body.cfg.block_json = "{}";
-    if (ctx.tp_size > 0) try cutShares(m, ctx);
+    // Rank 0 of a tensor-parallel pair: every layer reaches the worker (both ranks hold every bank whole).
+    if (ctx.tp_size > 0 and ctx.tp_rank == 0) if (ctx.host) |h| {
+        m.pair = .{ .host = h };
+        for (m.layers, 0..) |*L, i| L.tp = .{ .pair = &m.pair, .layer = @intCast(i) };
+        if (h.log_enabled(h.ctx, .info)) {
+            var buf: [128]u8 = undefined;
+            h.log(h.ctx, .info, @import("../../abi/host.zig").Str.of(std.fmt.bufPrint(&buf, "[inkling2] tensor parallel: prefill chunks from {d} rows split their experts with the worker\n", .{tp.TP_ROWS}) catch ""));
+        }
+    };
     m.split = BufferSplit.of(ctx.host);
     return m;
 }
@@ -881,38 +889,6 @@ const BufferSplit = struct {
         if (g.command_buffer_limits(g.ctx, 0, if (step) command_buffer_mb else sp.prev_mb, &ops_now, &mb_now).isOk()) sp.lifted = step;
     }
 };
-
-/// Each rank's share of every expert; rank 0 keeps its full banks beside it, the worker only its share.
-fn cutShares(m: *Loaded, ctx: *const abi.LoadCtx) !void {
-    var g = ops.Graph.init(gpa, m.base.s);
-    defer g.deinit();
-    if (ctx.tp_rank == 0) if (ctx.host) |h| {
-        m.pair = .{ .host = h };
-    };
-    for (m.layers, 0..) |*L, i| {
-        var s = try tp.cut(L, &g, @intCast(ctx.tp_rank), @intCast(ctx.tp_size), @intCast(i));
-        for ([_]Array{ s.gate_up.w, s.gate_up.s, s.gate_up.b, s.down.w, s.down.s, s.down.b }) |a| try m.owned.own(a);
-        if (ctx.tp_rank != 0) {
-            for ([_]Array{ L.gate_up.w, L.gate_up.s, L.gate_up.b, L.down.w, L.down.s, L.down.b }) |a| disown(&m.owned, a);
-            L.gate_up = s.gate_up;
-            L.down = s.down;
-        } else if (ctx.host != null) s.pair = &m.pair;
-        L.share = s;
-    }
-    if (ctx.tp_rank == 0) if (ctx.host) |h| if (h.log_enabled(h.ctx, .info)) {
-        var buf: [128]u8 = undefined;
-        h.log(h.ctx, .info, @import("../../abi/host.zig").Str.of(std.fmt.bufPrint(&buf, "[inkling2] tensor parallel: prefill chunks from {d} rows split every expert with the worker\n", .{tp.TP_ROWS}) catch return));
-    };
-}
-
-/// Frees `a` and drops it from `o`.
-fn disown(o: *loader.Owned, a: Array) void {
-    if (a.ctx == null) return;
-    for (o.list.items, 0..) |x, i| if (x.ctx == a.ctx) {
-        _ = mlx.mlx_array_free(o.list.swapRemove(i));
-        return;
-    };
-}
 
 fn expertShare(mp: *anyopaque, layer: u32, x: abi.Array, idx: abi.Array, weights: abi.Array, out: *abi.Array) callconv(.c) abi.Verdict {
     const m: *Loaded = @ptrCast(@alignCast(mp));
