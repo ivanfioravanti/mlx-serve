@@ -160,7 +160,8 @@ fn convState(g: *Graph, window: Array, kernel: c_int) !Array {
     return g.take(window, try g.arange(@floatFromInt(n - (kernel - 1)), @floatFromInt(n), 1, .int32), 1);
 }
 
-const Conved = struct { out: Array, state: Array };
+/// A conv's output, its next state and the f32 window it read (the old state then the rows' inputs).
+const Conved = struct { out: Array, state: Array, window: Array };
 
 /// A causal depthwise conv plus the input, over sqrt(K + 1); the conv runs in the weight's dtype, as the reference.
 fn shortConv(g: *Graph, x: Array, w: Array, prev: ?Array) !Conved {
@@ -172,6 +173,7 @@ fn shortConv(g: *Graph, x: Array, w: Array, prev: ?Array) !Conved {
     return .{
         .out = try g.astype(try g.mulScalar(sum, 1.0 / @sqrt(@as(f32, @floatFromInt(kernel + 1)))), ops.dtype(x)),
         .state = try convState(g, win, kernel),
+        .window = win,
     };
 }
 
@@ -196,6 +198,7 @@ fn dynamicConv(g: *Graph, x: Array, taps_proj: Array, static: Array, prev: ?Arra
     return .{
         .out = try g.astype(try g.mulScalar(try g.add(y, x32), 1.0 / @sqrt(@as(f32, @floatFromInt(2 * kernel + 1)))), ops.dtype(x)),
         .state = try convState(g, window, kernel),
+        .window = window,
     };
 }
 
@@ -225,6 +228,9 @@ pub const Pre = struct {
     sinks: Array,
     k_state: Array,
     v_state: Array,
+    /// The k and v convs' windows, read for a capture.
+    k_window: Array = .{},
+    v_window: Array = .{},
     /// The visit's input stream in f32, and its unweighted norm.
     stream: Array,
     normed: Array,
@@ -311,6 +317,8 @@ pub fn prepare(g: *Graph, L: *const Layer, w: *const Body, p: *const Projected, 
         .sinks = p.proj[3],
         .k_state = ks.state,
         .v_state = vs.state,
+        .k_window = ks.window,
+        .v_window = vs.window,
         .stream = p.stream,
         .normed = p.normed,
     };
@@ -493,7 +501,7 @@ fn expertSum(g: *Graph, L: *const Layer, cfg: *const Config, x: Array, r: Route)
 
 /// A visit between its attention and its experts: the MLP's input `x` and the router's picks for it, the f32
 /// residual the MLP's output joins, the block stack when the layer opened a block, and the attention conv's window.
-pub const Mid = struct { x: Array, idx: Array, weights: Array, residual: Array, blocks: ?Array, attn_state: Array };
+pub const Mid = struct { x: Array, idx: Array, weights: Array, residual: Array, blocks: ?Array, attn_state: Array, attn_window: Array = .{} };
 
 /// The gated attention rows to the MLP's input: the output projection and its conv, the block boundary or the
 /// residual, depth attention, the loop's message gate, the norm and the router. Pure: no cache call.
@@ -517,11 +525,11 @@ pub fn mid(g: *Graph, L: *const Layer, w: *const Body, attn: Array, stream: Arra
     if (messages) |msg| m = try messageGate(g, w, &(L.gates orelse return error.Inkling2NoMessageGate), 3, m, try row(g, msg, 3));
     const x = try g.astype(try g.rmsNorm(m, L.post_norm, cfg.rms_norm_eps), dt);
     const r = try route(g, L, cfg, x);
-    return .{ .x = x, .idx = r.idx, .weights = r.weights, .residual = residual, .blocks = opened, .attn_state = ac.state };
+    return .{ .x = x, .idx = r.idx, .weights = r.weights, .residual = residual, .blocks = opened, .attn_state = ac.state, .attn_window = ac.window };
 }
 
 /// A visit's output stream and its MLP conv's window.
-pub const Tail = struct { h: Array, mlp_state: Array };
+pub const Tail = struct { h: Array, mlp_state: Array, mlp_window: Array = .{} };
 
 /// The experts, the MLP's conv and the final add. Pure: no cache call.
 pub fn tail(g: *Graph, L: *const Layer, w: *const Body, m: *const Mid, st: ?Array) !Tail {
@@ -530,7 +538,7 @@ pub fn tail(g: *Graph, L: *const Layer, w: *const Body, m: *const Mid, st: ?Arra
     const hidden: c_int = @intCast(cfg.hidden_size);
     const y = try expertSum(g, L, cfg, m.x, .{ .idx = m.idx, .weights = m.weights });
     const mc = try shortConv(g, y, L.mlp_conv, try stateColumns(g, st, 2 * kv_dim + hidden, hidden));
-    return .{ .h = try g.astype(try g.add(m.residual, try g.astype(mc.out, .float32)), ops.dtype(m.x)), .mlp_state = mc.state };
+    return .{ .h = try g.astype(try g.add(m.residual, try g.astype(mc.out, .float32)), ops.dtype(m.x)), .mlp_state = mc.state, .mlp_window = mc.window };
 }
 
 /// A visit's output stream, and the block stack after it when the layer opened a block.
@@ -545,6 +553,8 @@ pub fn layerForward(L: *const Layer, w: *const Body, c: *Ctx, h: Array, blocks: 
     const m = try mid(g, L, w, try attend(c, L, w, &p), p.stream, p.normed, blocks, st, messages);
     const t = try tail(g, L, w, &m, st);
     try kv.setState(c, .conv, try g.concat(&.{ p.k_state, p.v_state, m.attn_state, t.mlp_state }, 2));
+    // A capture keeps every row's conv inputs behind the old state, the layout the engine cuts a checkpoint from.
+    if (c.capture_spec) try kv.setState(c, .conv_input, try g.concat(&.{ p.k_window, p.v_window, m.attn_window, t.mlp_window }, 2));
     return .{ .h = t.h, .blocks = m.blocks };
 }
 

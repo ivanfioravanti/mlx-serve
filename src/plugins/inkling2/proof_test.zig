@@ -93,6 +93,59 @@ test "inkling2 proof: a prompt in chunks and then token by token serves the rows
     }
 }
 
+// Bar: a capturing prompt forward (the engine's `.verify` mode, `capture_ssm_seq`) leaves every visit's conv inputs
+// behind its old state, and the window cut at any row is the conv state a forward of the rows up to it leaves; over
+// 600 rows (past 512, where a chunk may take another expert path) and 2200 (past a sliding visit's ring), on each stream.
+test "inkling2 proof: a capturing forward's conv inputs cut at any row to the state that row leaves" {
+    for (streams()) |gpu| try captureCuts(gpu);
+}
+
+fn captureCuts(gpu: bool) !void {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var pack = try conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, try plugin.conformanceFixture(arena.allocator()), .{ .gpu = gpu });
+    defer pack.close();
+    try testing.expect(pack.parsed.caps.captures_conv_input);
+    const visits = pack.parsed.shell.num_hidden_layers;
+    var long: [2200]u32 = undefined;
+    for (&long, 0..) |*t, i| t.* = @intCast(1 + (i * 37 + i / 7) % (VOCAB - 1));
+    const Case = struct { ids: []const u32, cuts: []const usize };
+    for ([_]Case{ .{ .ids = &prompt, .cuts = &.{ 1, 7, 12, prompt.len } }, .{ .ids = long[0..600], .cuts = &.{ 520, 600 } }, .{ .ids = &long, .cuts = &.{2170} } }) |cs| {
+        var whole = try test_cache.TestCache.init(a, visits);
+        defer whole.deinit();
+        a.free(try stepMode(a, &pack, &whole, cs.ids, 0, .last_row, .verify));
+        for (cs.cuts) |r| {
+            var part = try test_cache.TestCache.init(a, visits);
+            defer part.deinit();
+            a.free(try stepMode(a, &pack, &part, cs.ids[0..r], 0, .last_row, .prefill));
+            for (whole.layers, part.layers) |w, p| {
+                const win: ops.Array = .{ .ctx = w.conv_input.ctx };
+                const want: ops.Array = .{ .ctx = p.conv.ctx };
+                const km1 = ops.shape(want)[1];
+                try testing.expectEqual(@as(c_int, @intCast(cs.ids.len)) + km1, ops.shape(win)[1]);
+                var g = ops.Graph.init(a, if (gpu) mlx.gpuStream() else mlx.mlx_default_cpu_stream_new());
+                defer g.deinit();
+                const at: c_int = @intCast(r);
+                fx_stream = g.s;
+                try expectClose(try g.sliceAxis(win, 1, at, at + km1), want, if (gpu) 2e-2 else 1e-4, "capture cut");
+            }
+        }
+    }
+}
+
+/// `step` in a given mode.
+fn stepMode(a: std.mem.Allocator, pack: *conformance.Loaded, cache: *test_cache.TestCache, tokens: []const u32, pos: usize, logits: abi.Logits, mode: abi.Mode) ![]f32 {
+    var h = [_]abi.Handle{cache.handle()};
+    const slot = [_]u32{0};
+    const positions = [_]u32{@intCast(pos)};
+    var out: abi.ForwardOut = .{};
+    const v = pack.table.forward(pack.model, &.{ .mode = mode, .logits = logits, .rows = @intCast(tokens.len), .tokens = .of(tokens), .slots = .of(&slot), .positions = .of(&positions), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out);
+    try testing.expect(v.isOk());
+    if (out.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.hidden.ctx });
+    return conformance.consumeF32(a, out.logits);
+}
+
 test "inkling2 proof: a step reads every visit's conv windows and each loop pass's own KV" {
     for (streams()) |gpu| try stateMutations(gpu);
 }
