@@ -268,8 +268,8 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
             // that just started decoding — a single-chunk prefill exposes
             // no chunk-boundary yield, so without this every slot's first
             // token waits for the LAST slot's prefill (the TTFT
-            // staircase collapse).
-            if (pi > 0) _ = interleaveDecodeTick(sch);
+            // staircase collapse). A stacked slot's prefill forwards nothing, so no tick waits on one.
+            if (pi > 0 and slot.stacked_logits == null) _ = interleaveDecodeTick(sch);
             switch (prefillAdmitted(sch, slot)) {
                 .held => {
                     // Back to the head of `pending`, in order; the decode tick below runs first.
