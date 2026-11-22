@@ -219,9 +219,9 @@ test "inkling2 batched: two slots decode what each decodes alone, within the rou
 }
 
 // Bar: a restored tail's checkpoint cut from one capturing forward is the chunk loop's, every visit's windows within
-// 0.15 of the visit's largest value. The joined k/v projection's qmm_splitk halves its K split from 129 rows on (MLX
-// 512 / (ceil(M/32) * ceil(N/32)) threadgroups: 2 at 128 rows, 1 at 129), and 48 visits carry that rounding to ~0.12;
-// today's cold and warm checkpoints of one prompt already differ by 0.13 the same way.
+// 0.15 of the visit's largest value. The joined k/v projection's qmm_splitk halves its K split past 128 rows (MLX
+// 512 / (ceil(M/32) * ceil(N/32)) threadgroups), and the visits carry that rounding on; a prompt's cold and warm
+// checkpoints differ the same way.
 test "inkling2 served: a 140-row tail's checkpoint cut at 109 rows from one capturing forward is the chunk loop's" {
     const p = (try Served.open()) orelse return error.SkipZigTest;
     defer p.close();
