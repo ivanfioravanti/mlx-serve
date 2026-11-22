@@ -17,6 +17,7 @@ const moe_fp4 = @import("../../sdk/blocks/moe/moe_fp4.zig");
 const mxfp8 = @import("../../sdk/blocks/qmm/mxfp8_qmv.zig");
 const rel = @import("../inkling/attention.zig");
 const layers = @import("layers.zig");
+const tp = @import("tp.zig");
 const Config = @import("config.zig").Config;
 
 const Graph = ops.Graph;
@@ -987,6 +988,13 @@ pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle,
     const dn_scaled: TArg = .{ .int = @intFromBool(L.down_scale.ctx != null) };
     const tail_out: [2]Out = .{ .{ .shape = &.{ 1, s, hidden }, .dtype = dt }, .{ .shape = &.{ 1, s, hidden }, .dtype = dt } };
     const sorted = pairs.inverse != null;
+
+    // A long prefill chunk on a tensor-parallel pair: both ranks' shares, then the conv and the add over one pick a row.
+    if (open == null and !few) if (try tp.exchange(g, L, cfg, m.x, picks[0], weights)) |y| {
+        const rows_at = try g.arange(0, @floatFromInt(s), 1, .uint32);
+        const o = try pickSum(g, try g.reshape(y, &.{ s, 1, hidden }), rows_at, rows_at, caps, try g.ones(&.{ 1, s, 1 }, .float32), m.residual, st, L.mlp_conv, conv_scale, 1, false);
+        return .{ .h = o[0], .state = try convState(g, st, kp, vp, m.op, o[1]) };
+    };
 
     const act: [1]Array = if (up) |u| .{u[0]} else if (packed_up) .{(try ups(g, L, cfg, m.x, .{ .picks = sel }))[0]} else blk: {
         const gu = try layers.gather(g, pairs.rows, &L.gate_up, sel, sorted);
