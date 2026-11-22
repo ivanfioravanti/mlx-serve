@@ -48,6 +48,7 @@ pub const Builtin = struct {
             .gpu = &gpu_table,
             .ane = @import("plugin_ane.zig").table(),
             .quant_claimant = quantClaimant,
+            .expert_exchange = expertExchange,
         } };
     }
 
@@ -65,6 +66,21 @@ pub const Builtin = struct {
         return &self.table;
     }
 };
+
+/// The pair's expert exchange, set by the cluster while a `--dist tensor` worker serves this process's model; null =
+/// no worker, and `expert_exchange` refuses.
+pub const ExpertExchange = *const fn (layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, weights: mlx.mlx_array) anyerror!mlx.mlx_array;
+pub const expert_exchange_shared = @import("../sdk/util/shared.zig").Shared(struct { f: ?ExpertExchange = null }, "plugin_expert_exchange", .{});
+
+fn expertExchange(_: ?*anyopaque, layer: u32, x: abi.Array, idx: abi.Array, weights: abi.Array, out: *abi.Array) callconv(.c) abi.Verdict {
+    const f = expert_exchange_shared.get().f orelse return abi.Verdict.refuse(.unsupported, "no tensor-parallel worker");
+    const r = f(layer, .{ .ctx = x.ctx }, .{ .ctx = idx.ctx }, .{ .ctx = weights.ctx }) catch |e| {
+        log.warn("[dist] expert exchange at layer {d} failed: {s}\n", .{ layer, @errorName(e) });
+        return abi.Verdict.refuse(.failed, "the tensor-parallel worker exchange failed");
+    };
+    out.* = .{ .ctx = r.ctx };
+    return .ok;
+}
 
 /// The process's table: one kernel cache, latch and log for every plugin, built at the server's start and kept for the
 /// process.
