@@ -240,9 +240,17 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     if (n_prefill > 1) {
         var stack: [prefill_stacked.MAX_SLOTS]*Slot = undefined;
         const pk = prefill_stacked.pick(to_prefill[0..n_prefill], &stack);
-        if (pk.n >= 2) prefill_stacked.run(stack[0..pk.n], pk.width, pk.left_out, pk.longest_left) catch |err| {
-            log.warn("[prefill] stacked pass failed ({s}): each prompt prefills alone\n", .{@errorName(err)});
-        };
+        if (pk.n >= 2) {
+            if (prefill_stacked.run(stack[0..pk.n], pk.width, pk.left_out, pk.longest_left)) |_| {
+                // The stacked slots' prefills forward nothing: they start decoding first, ahead of any solo prefill.
+                prefill_stacked.stackedFirst(to_prefill[0..n_prefill]);
+                sch.queue_mu.lockUncancelable(sch.io);
+                @memcpy(sch.prefilling[0..n_prefill], to_prefill[0..n_prefill]);
+                sch.queue_mu.unlock(sch.io);
+            } else |err| {
+                log.warn("[prefill] stacked pass failed ({s}): each prompt prefills alone\n", .{@errorName(err)});
+            }
+        }
     }
 
     // 2. Prefill each pending slot (heavy; mlx ops on this thread).
