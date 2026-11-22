@@ -42,7 +42,8 @@ pub fn stridePastStack(chunk: usize) bool {
 fn stackable(slot: *const Slot) bool {
     const cfg = slot.model.config orelse return false;
     const pb = cfg.plugin orelse return false;
-    if (!pb.parsed.caps.stacks_prompts) return false;
+    // The settle cuts each slot's windows from the pass's conv-input capture.
+    if (!pb.parsed.caps.stacks_prompts or !pb.parsed.caps.captures_conv_input) return false;
     if (slot.vision_embeddings != null or slot.media.len > 0 or slot.logprobs_n > 0 or slot.prompt_logprobs) return false;
     if (slot.sampling.constraint != null or slot.sampling.penalized()) return false;
     if (slot.full_prompt.len < MIN_SPAN + 1 or slot.full_prompt.len > STACK_ROWS) return false;
