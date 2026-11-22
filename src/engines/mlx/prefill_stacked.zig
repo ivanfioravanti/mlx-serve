@@ -188,3 +188,16 @@ test "stridePastStack: a stacked span crosses no stride checkpoint unless the pr
     try std.testing.expect(stridePastStack(STACK_ROWS));
     try std.testing.expect(!stridePastStack(512));
 }
+
+test "stackedFirst: the stacked slots lead, each group keeping its order" {
+    var slots: [5]Slot = undefined;
+    const held = [_]bool{ false, true, false, true, true };
+    var order: [5]*Slot = undefined;
+    for (&slots, &order, held) |*s, *o, h| {
+        s.stacked_logits = if (h) .{ .ctx = @ptrFromInt(0x1000) } else null;
+        o.* = s;
+    }
+    stackedFirst(&order);
+    const want = [_]usize{ 1, 3, 4, 0, 2 };
+    for (order, want) |o, w| try std.testing.expectEqual(&slots[w], o);
+}
