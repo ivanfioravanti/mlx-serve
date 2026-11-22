@@ -1337,16 +1337,16 @@ test "dflash: a request the runtime gate stops goes on in PLD, its tokens serial
 
     var serial: [want]u32 = undefined;
     {
-        var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
+        var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
         defer xfm.deinit();
         var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{ .skip_lazy_preforward = true });
         defer gen.deinit(allocator);
         for (&serial) |*t| t.* = (try gen.next(allocator)).?;
     }
 
-    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
+    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
     defer xfm.deinit();
-    var dm = try dflash_mod.loadDflash(io, allocator, s, asst_path);
+    var dm = try dflash_mod.loadDflash(io, allocator, mlx.gpuStream(), asst_path);
     defer dm.deinit();
     try dm.bind(&xfm);
     // A floor no round reaches: the gate stops DFlash after its warmup.
