@@ -144,6 +144,17 @@ pub fn run(slots: []const *Slot, width: u32, left_out: usize, longest_left: usiz
     if (left_out > 0) log.info("[prefill] {d} prompt(s) prefill alone past the stack's bounds (longest {d} rows)\n", .{ left_out, longest_left });
 }
 
+/// `slots` with the stacked ones (their last-row logits held) first, each group in its order.
+pub fn stackedFirst(slots: []*Slot) void {
+    var n: usize = 0;
+    for (0..slots.len) |i| if (slots[i].stacked_logits != null) {
+        const s = slots[i];
+        std.mem.copyBackwards(*Slot, slots[n + 1 .. i + 1], slots[n..i]);
+        slots[n] = s;
+        n += 1;
+    };
+}
+
 /// Slot `i`'s logits at its row `span - 1` of the pass's `[N, width, vocab]`, as its own `[1, 1, vocab]` buffer.
 fn lastRow(logits: mlx.mlx_array, i: usize, span: u32, s: mlx.mlx_stream) !mlx.mlx_array {
     const sh = mlx.getShape(logits);
