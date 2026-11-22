@@ -614,6 +614,8 @@ fn dependsOn(x: mlx.mlx_array, dep: mlx.mlx_array) !mlx.mlx_array {
 const ClusterState = struct {
     group: ?Group = null,
     joined: std.atomic.Value(bool) = .init(false),
+    /// Rank 0's link to the worker is still opening (`waitForWorker`): a load of the group's model waits for it.
+    opening: std.atomic.Value(bool) = .init(false),
     joined_link: Link = undefined,
     last_job_buf: [160]u8 = undefined,
     last_job_len: usize = 0,
@@ -854,10 +856,24 @@ fn planRows(model_dir: []const u8, hidden: i32, blocks: i32) !*Peer {
 }
 
 /// The worker's hello, read once.
+/// How long a load of the group's model waits for a worker whose link is still opening (a server started with
+/// `--model` before the worker).
+const JOIN_WAIT_MS = 300_000;
+
+/// Whether the worker has joined, waiting up to `limit_ms` while rank 0's link to it is still opening.
+fn awaitJoin(model: []const u8, limit_ms: u32) bool {
+    var waited: u32 = 0;
+    while (!cluster().joined.load(.acquire) and cluster().opening.load(.acquire) and waited < limit_ms) : (waited += 100) {
+        if (waited == 0) log.info("[dist] {s} waits for the worker to join\n", .{std.fs.path.basename(model)});
+        crt.sleepMs(100);
+    }
+    return cluster().joined.load(.acquire);
+}
+
 fn join() !*Peer {
     if (cluster().peer_slot == null) {
         const g = cluster().group.?;
-        if (!cluster().joined.load(.acquire)) {
+        if (!awaitJoin(g.model, JOIN_WAIT_MS)) {
             log.err("[dist] {s} is served with a worker: start `mlx-serve worker` on the other Mac first\n", .{std.fs.path.basename(g.model)});
             return error.DistWorkerNotJoined;
         }
@@ -1287,6 +1303,7 @@ pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode
     preferFastSynch();
     cluster().group = .{ .io = io, .allocator = allocator, .mode = mode, .model = try allocator.dupe(u8, model), .split = split };
     h3_split.hooks().* = .{ .serves = &serves, .plan_rows = &rowsPair, .note_job = &noteJob };
+    cluster().opening.store(true, .release);
     const t = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, waitForWorker, .{ io, cfg });
     t.detach();
 }
@@ -1299,6 +1316,7 @@ fn preferFastSynch() void {
 }
 
 fn waitForWorker(io: std.Io, cfg: Config) void {
+    defer cluster().opening.store(false, .release);
     cluster().joined_link = Link.open(io, cfg) catch |err| {
         log.err("[dist] the cluster link did not open: {s}\n", .{@errorName(err)});
         return;
@@ -1310,6 +1328,7 @@ fn waitForWorker(io: std.Io, cfg: Config) void {
     };
     cluster().joined.store(true, .release);
     log.info("[dist] worker joined; it loads its part with {s}\n", .{std.fs.path.basename(cluster().group.?.model)});
+    cluster().opening.store(false, .release);
     watchWorker(&cluster().joined_link);
 }
 
@@ -2260,4 +2279,24 @@ test "hostShare: rank 0 of a plugin that splits its own experts holds the pack a
     var c: model_mod.ModelConfig = .{ .model_type = "inkling2_loop", .plugin = &binding, .num_hidden_layers = 1 };
     // 128 bytes of experts: 64 more than the pack.
     try std.testing.expectEqual(@as(u64, 1064), hostShare(dir, &c, 1000));
+}
+
+test "a load waits for a worker whose link is still opening, and not for one whose link failed" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest; // a cluster exists only on macOS
+    defer cluster().opening.store(false, .release);
+    defer cluster().joined.store(false, .release);
+    const Joiner = struct {
+        fn run() void {
+            crt.sleepMs(300);
+            cluster().joined.store(true, .release);
+        }
+    };
+    cluster().opening.store(true, .release);
+    const t = try std.Thread.spawn(.{}, Joiner.run, .{});
+    try std.testing.expect(awaitJoin("m", 10_000));
+    t.join();
+    cluster().joined.store(false, .release);
+    try std.testing.expect(!awaitJoin("m", 200)); // still opening, never joins: the wait ends
+    cluster().opening.store(false, .release);
+    try std.testing.expect(!awaitJoin("m", 10_000)); // the link failed: no wait
 }
