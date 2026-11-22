@@ -297,7 +297,13 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         _ = s.in_pass.fetchSub(1, .acq_rel);
     };
 
-    specYieldTick(active.items);
+    var joining_buf: [32]usize = undefined;
+    const joining = blk: {
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        break :blk @import("prefill_interleave.zig").joiningModels(sch, &joining_buf);
+    };
+    specYieldTick(active.items, joining);
 
     // 4. Decode tick. Charge the full wall-clock tick time to each
     //    participating slot — for batched ticks this matches the per-slot
