@@ -149,7 +149,10 @@ pub const Caps = packed struct(u64) {
     /// A batched forward takes each slot's prompt span (`Forward.rows` rows a slot), attended on its own keys: the
     /// engine may prefill admitted prompts stacked in one forward.
     stacks_prompts: bool = false,
-    _: u29 = 0,
+    /// A capturing final span may also checkpoint one row short of the prompt's end (`endSnapshotRows`): the model's
+    /// one-row forward of that last token decodes what the span's row does. Off, the span keeps its backoff cut only.
+    end_snapshot: bool = false,
+    _: u28 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
@@ -1135,6 +1138,15 @@ test "abi plugin: a caps word built before stacks_prompts (its bit was padding, 
     word &= ~(@as(u64, 1) << @bitOffsetOf(Caps, "stacks_prompts"));
     const read: Caps = @bitCast(word);
     try std.testing.expect(!read.stacks_prompts and read.batches_decode and read.experts_stream);
+}
+
+test "abi plugin: a caps word built before end_snapshot (its bit was padding, zero) reads it unset" {
+    const old: Caps = .{ .captures_conv_input = true, .stacks_prompts = true };
+    var word: u64 = @bitCast(old);
+    word &= ~(@as(u64, 1) << @bitOffsetOf(Caps, "end_snapshot"));
+    const read: Caps = @bitCast(word);
+    try std.testing.expect(!read.end_snapshot and read.captures_conv_input and read.stacks_prompts);
+    try std.testing.expect(!(Caps{}).end_snapshot);
 }
 
 test "abi plugin: an older plugin's caps word ends before prompt_last_row, which it reads unset" {
