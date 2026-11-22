@@ -143,7 +143,10 @@ pub const Caps = packed struct(u64) {
     /// The load streams an MLX pack's routed experts on the `stream_experts` setting (`sdk/weights/streamed.zig`):
     /// the preflight bills their slot rows, not the experts. Without it the setting is refused by name.
     experts_stream: bool = false,
-    _: u31 = 0,
+    /// A capturing forward (`capture_spec`) leaves every visit's conv inputs (`StateSlot.conv_input`): the engine may cut
+    /// a recurrent checkpoint at any of its rows (`captureSsmCheckpointAt`).
+    captures_conv_input: bool = false,
+    _: u30 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
