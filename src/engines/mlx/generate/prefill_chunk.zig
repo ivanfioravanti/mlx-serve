@@ -315,6 +315,16 @@ pub fn ssmCapturePos(stride: usize, abs_end: usize, dense_low_grid: bool) bool {
     return dense_low_grid and abs_end % SSM_GRID_LOW_DENSE_STRIDE == 0 and abs_end <= SSM_GRID_LOW_DENSE_TOP;
 }
 
+/// PURE: the rows before the snapshot backoff of a restored tail (`offset` > 0) that runs as one forward, its checkpoint
+/// cut from the forward's capture; 0 = the chunk loop's split. Only a tail of at most one chunk, longer than the
+/// backoff, that crosses no position the chunk loop would checkpoint at.
+pub fn oneForwardTailRows(offset: usize, prefix_len: usize, backoff: usize, chunk: usize, stride: usize, dense_low_grid: bool) usize {
+    if (offset == 0 or backoff >= prefix_len or prefix_len + 1 > chunk) return 0;
+    const rows = prefix_len - backoff;
+    for (offset + 1..offset + rows + 1) |p| if (ssmCapturePos(stride, p, dense_low_grid)) return 0;
+    return rows;
+}
+
 /// PURE: end the chunk at the first dense low anchor strictly inside
 /// `(pos, end)` (relatives to `prompt_ids[0]`, i.e. what `nextChunkEnd`
 /// returns). 0 when there is none or the stride is already dense — chunk
@@ -1298,4 +1308,17 @@ test "reservedPrefillTokens: a reserving model reserves its whole request to the
     var toy = ling;
     toy.model_type = "toy_hybrid";
     try t.expectEqual(@as(u64, 33_591 + 512), reservedPrefillTokens(&toy, 33_591, 11_198, 512));
+}
+
+test "oneForwardTailRows: a restored tail of one chunk past the backoff runs whole; cold, long or stride-crossing tails split" {
+    // A restored 140-token tail: 109 rows, then the backoff's 31.
+    try std.testing.expectEqual(@as(usize, 109), oneForwardTailRows(9891, 139, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
+    // A cold prompt, a tail inside the backoff, a tail over one chunk: the chunk loop's split.
+    try std.testing.expectEqual(@as(usize, 0), oneForwardTailRows(0, 139, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
+    try std.testing.expectEqual(@as(usize, 0), oneForwardTailRows(9891, 30, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
+    try std.testing.expectEqual(@as(usize, 0), oneForwardTailRows(9891, 8192, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
+    // A tail across a stride position the chunk loop checkpoints at, or a dense low anchor.
+    try std.testing.expectEqual(@as(usize, 0), oneForwardTailRows(65500, 139, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
+    try std.testing.expectEqual(@as(usize, 0), oneForwardTailRows(8150, 139, SSM_SNAPSHOT_BACKOFF, 8192, 65536, true));
+    try std.testing.expectEqual(@as(usize, 109), oneForwardTailRows(8150, 139, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
 }

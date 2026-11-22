@@ -180,6 +180,8 @@ pub const ssmDetachFromGroup = @import("ssm/group.zig").ssmDetachFromGroup;
 // engines/mlx/ssm/checkpoint.zig
 pub const SSMCheckpoint = @import("ssm/checkpoint.zig").SSMCheckpoint;
 pub const captureSsmCheckpoint = @import("ssm/checkpoint.zig").captureSsmCheckpoint;
+pub const captureSsmCheckpointAt = @import("ssm/checkpoint.zig").captureSsmCheckpointAt;
+pub const convOnlyState = @import("ssm/checkpoint.zig").convOnlyState;
 pub const compactConvStateEnabled = @import("ssm/checkpoint.zig").compactConvStateEnabled;
 pub const shareSsmCheckpoint = @import("ssm/checkpoint.zig").shareSsmCheckpoint;
 pub const restoreSsmCheckpoint = @import("ssm/checkpoint.zig").restoreSsmCheckpoint;

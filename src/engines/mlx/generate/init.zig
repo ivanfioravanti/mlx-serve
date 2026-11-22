@@ -19,6 +19,7 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = transformer_mod.ForwardCtx;
 const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
+const convOnlyState = transformer_mod.convOnlyState;
 const dflash_mod = @import("../spec/dflash/dflash.zig");
 const generate_mod = @import("../generate.zig");
 const AdaptiveWidthState = @import("prefill_chunk.zig").AdaptiveWidthState;
@@ -53,6 +54,7 @@ const resolveMtpDepthCapForProfile = @import("../spec/mtp/ev_plan.zig").resolveM
 const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
 const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpointSsmPrefill;
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
+const oneForwardTailRows = @import("prefill_chunk.zig").oneForwardTailRows;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
 const WholePromptPlan = @import("prefill_chunk.zig").WholePromptPlan;
 const wholePromptPlan = @import("prefill_chunk.zig").wholePromptPlan;
@@ -356,10 +358,16 @@ pub fn initWithOptions(
         .width_max = @intCast(PREFILL_CHUNK),
     };
 
+    // A restored tail of at most one chunk on a conv-only hybrid: one forward, its checkpoint cut from the per-row
+    // capture at this many rows instead of a chunk forward ending there (0 = the chunk loop's split).
+    var one_forward_cp: usize = 0;
     if (final_start > 0) {
         const prefix_len = prompt_ids.len - 1;
         const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
-        const loop_end = prefix_len - snapshot_backoff;
+        if (want_ssm_cp and !mtp_active and !has_vision and convOnlyState(ctx.ssm_entries.?))
+            one_forward_cp = oneForwardTailRows(ssm_cp_offset, prefix_len, snapshot_backoff, PREFILL_CHUNK, ssm_cp_stride, dense_low_grid);
+        if (one_forward_cp > 0) log.debug("[prefill] restored tail of {d} rows in one forward; checkpoint at {d} cut from its capture\n", .{ prompt_ids.len, ssm_cp_offset + one_forward_cp });
+        const loop_end = if (one_forward_cp > 0) 0 else prefix_len - snapshot_backoff;
         final_start = loop_end;
         // Per-chunk adaptive width: the first chunk runs the admitted width; every boundary
         // after it re-asks the same estimator. `cap_adapt` is the widest this arch forwards
@@ -784,6 +792,7 @@ pub fn initWithOptions(
             ctx.cp_sink = &prompt_cp_sink;
         }
     }
+    if (one_forward_cp > 0) ctx.capture_ssm_seq = true;
     const raw_logits = if (tail_mtp_capture) blk: {
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
@@ -791,6 +800,16 @@ pub fn initWithOptions(
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
     } else try xfm.forwardWith(&ctx, last_input);
+    if (one_forward_cp > 0) {
+        ctx.capture_ssm_seq = false;
+        defer for (ctx.ssm_entries.?) |*e| transformer_mod.ssmFreeSpecCapture(e);
+        const cp = try transformer_mod.captureSsmCheckpointAt(allocator, ctx.ssm_entries.?, one_forward_cp + ssm_cp_offset, @intCast(one_forward_cp), @intCast(tail_len), xfm.s);
+        fileCheckpoint(allocator, &ssm_checkpoints, cp, options.ssm_checkpoint_max, cp_thin, options.ssm_low_anchors) catch |e| {
+            var doomed = cp;
+            doomed.deinit(allocator);
+            return e;
+        };
+    }
     // The plan, the sink and the last-row read are the prompt's: the generator below keeps a copy of `ctx`.
     ctx.prompt_spans = &.{};
     ctx.ssm_cp_positions = &.{};
