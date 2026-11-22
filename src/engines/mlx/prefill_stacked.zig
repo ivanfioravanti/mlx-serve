@@ -20,9 +20,9 @@ const prefillCli = @import("generate.zig").prefillCli;
 const emptySlotCache = @import("prefill_interleave.zig").emptySlotCache;
 const SSM_GRID_LOW_DENSE_STRIDE = @import("generate/prefill_chunk.zig").SSM_GRID_LOW_DENSE_STRIDE;
 
-/// Stacked rows past which a pass stops paying: from about a thousand rows a forward's cost per row stops falling, and
+/// Stacked rows past which a pass stops paying: a forward's cost per row has long stopped falling, and
 /// a stack only makes the first prompt wait for the last.
-pub const STACK_ROWS = 1024;
+pub const STACK_ROWS = 2048;
 /// A shorter prompt is not worth a pass.
 const MIN_SPAN = 16;
 pub const MAX_SLOTS = 8;
