@@ -18,7 +18,7 @@ const Array = ops.Array;
 
 /// Prefill chunks from this many rows split their experts with the worker; decode, verify rounds and short spans
 /// never cross the wire.
-pub const TP_ROWS = 512;
+pub const TP_ROWS = 1024;
 
 /// Rank 0's link to the worker: the host whose `expert_exchange` reaches it, and whether it still answers (a failed
 /// exchange leaves the rest on this node; the server restarts to pair again).
