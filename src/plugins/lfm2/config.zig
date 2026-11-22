@@ -255,6 +255,8 @@ test "lfm2 config: an LFM2.5 pack parses into the shell, its conv layers and its
     try testing.expectEqual(LayerKind.conv, c.layers[15]);
     try testing.expectEqualSlices(u32, &.{7}, p.shell.eos[0..p.shell.eos_count]);
     try testing.expect(p.caps.exact_resumed and !p.caps.batches_decode and !p.caps.moe and p.caps.captures_conv_input);
+    // Its one-row forward rounds the last token apart from the span's row: the final span keeps its backoff cut only.
+    try testing.expect(!p.caps.end_snapshot);
     var lay: [17]abi.LayerCache = undefined;
     try testing.expectEqual(@as(u32, 16), layout(&p, null, &lay, lay.len));
     try testing.expectEqual(abi.LayerKind.conv, lay[0].kind);

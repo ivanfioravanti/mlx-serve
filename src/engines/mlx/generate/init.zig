@@ -802,7 +802,8 @@ pub fn initWithOptions(
             ctx.cp_sink = &prompt_cp_sink;
         }
     }
-    const end_cp = endSnapshotRows(cut_capture, tail_len, one_forward_cp);
+    const end_snapshot = if (xfm.config.plugin) |pb| pb.parsed.caps.end_snapshot else false;
+    const end_cp = endSnapshotRows(cut_capture and end_snapshot, tail_len, one_forward_cp);
     if (one_forward_cp > 0 or end_cp > 0) ctx.capture_ssm_seq = true;
     const raw_logits = if (options.prefilled_logits) |lg| lg else if (tail_mtp_capture) blk: {
         has_captured_hidden = true;
