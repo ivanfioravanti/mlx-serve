@@ -29,7 +29,16 @@ pub const WORKER_SHARE: f32 = 0.42;
 pub const Pair = struct {
     host: *const host_abi.Host,
     live: bool = true,
+    /// Per `TIMING_LINE` exchanges, rank 0's host time around each (µs): the routing sync, the split and the sum
+    /// kernel's places, the wait for the worker.
+    timing: struct { n: u32 = 0, sync: i64 = 0, host: i64 = 0, wait: i64 = 0 } = .{},
 };
+
+const TIMING_LINE = 48;
+
+fn nowUs() i64 {
+    return @import("../../sdk/util/io_util.zig").nowUsMonotonic(std.Io.Threaded.global_single_threaded.io());
+}
 
 /// Rank 0's tie from a layer to the pair.
 pub const Tp = struct { pair: *Pair, layer: u32 };
@@ -148,7 +157,9 @@ pub fn exchange(g: *Graph, L: *const layers.Layer, cfg: *const Config, x: Array,
     const routes = try g.contiguous(try g.astype(try g.reshape(idx, &.{-1}), .uint32));
     const w32 = try g.contiguous(try g.astype(try g.reshape(weights, &.{-1}), .float32));
     // The split reads the routing here; the rows are ready to go once it returns.
+    const t0 = nowUs();
     try evalAll(&.{ flat, routes, w32 });
+    const t1 = nowUs();
     const parts = try split(gpa, (mlx.mlx_array_data_uint32(routes) orelse return error.Inkling2TpRoutes)[0..n], (mlx.mlx_array_data_float32(w32) orelse return error.Inkling2TpRoutes)[0..n], cfg.num_experts, WORKER_SHARE);
     defer for (parts) |p| free(gpa, p);
     if (parts[1].sel.len == 0) return null;
@@ -160,15 +171,6 @@ pub fn exchange(g: *Graph, L: *const layers.Layer, cfg: *const Config, x: Array,
     const theirs_w = try g.fromSlice(f32, parts[1].w, &.{p1});
     try evalAll(&.{ theirs_pairs, theirs_w });
     if (mine) |y| try queue(&.{y});
-    var theirs: host_abi.Array = .{};
-    const v = send(h.ctx, tp.layer, .{ .ctx = flat.ctx }, .{ .ctx = theirs_pairs.ctx }, .{ .ctx = theirs_w.ctx }, &theirs);
-    if (!v.isOk()) {
-        pair.live = false;
-        // No worker at all is the single-node server, not news.
-        if (v.code != .unsupported) say(h, .warn, "[inkling2] tensor-parallel worker lost at layer {d}: the rest runs on one node\n", .{tp.layer});
-        return null;
-    }
-    if (tp.layer == 0) say(h, .info, "[dist] inkling2 experts engaged: {d} rows, {d} of {d} pairs on the worker\n", .{ s, p1, n });
     // Rows: rank 0's p0 outputs, the worker's t sums, one zero row; each row's last place is the worker's sum.
     const pl = try places(gpa, parts[0], n, @intCast(p0 + t), downScale(L));
     defer gpa.free(pl.inv);
@@ -182,6 +184,25 @@ pub fn exchange(g: *Graph, L: *const layers.Layer, cfg: *const Config, x: Array,
         @memcpy(wts[r * (k + 1) ..][0..k], pl.w[r * k ..][0..k]);
         inv[r * (k + 1) + k] = @intCast(p0 + r);
         wts[r * (k + 1) + k] = 1;
+    }
+    const t2 = nowUs();
+    var theirs: host_abi.Array = .{};
+    const v = send(h.ctx, tp.layer, .{ .ctx = flat.ctx }, .{ .ctx = theirs_pairs.ctx }, .{ .ctx = theirs_w.ctx }, &theirs);
+    if (!v.isOk()) {
+        pair.live = false;
+        // No worker at all is the single-node server, not news.
+        if (v.code != .unsupported) say(h, .warn, "[inkling2] tensor-parallel worker lost at layer {d}: the rest runs on one node\n", .{tp.layer});
+        return null;
+    }
+    if (tp.layer == 0) say(h, .info, "[dist] inkling2 experts engaged: {d} rows, {d} of {d} pairs on the worker\n", .{ s, p1, n });
+    const tm = &pair.timing;
+    tm.n += 1;
+    tm.sync += t1 - t0;
+    tm.host += t2 - t1;
+    tm.wait += nowUs() - t2;
+    if (tm.n == TIMING_LINE) {
+        say(h, .debug, "[inkling2] tp rank 0: {d} exchanges of {d} rows, routing sync {d} ms, split {d} ms, send+wait {d} ms\n", .{ tm.n, s, @divTrunc(tm.sync, 1000), @divTrunc(tm.host, 1000), @divTrunc(tm.wait, 1000) });
+        tm.* = .{};
     }
     const dt = ops.dtype(x);
     const sums = try g.reshape(try g.astype(try g.adopt(.{ .ctx = theirs.ctx }), dt), &.{ s, 1, d });
