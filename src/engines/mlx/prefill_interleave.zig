@@ -52,6 +52,14 @@ pub fn companyStreak(streak: u8, has_company: bool) u8 {
     return if (has_company) streak +| 1 else 0;
 }
 
+/// `companyStreak` with the slots about to decode beside this one (admitted in the same pass, or pending): such a
+/// burst is steady at once, so its early slots stop drafting serially while the rest prefill. A request still
+/// waiting for a submit slot (`--max-concurrent`) is not in the scheduler and is no company.
+pub fn companyStreakWith(streak: u8, decoding_others: usize, joining_others: usize) u8 {
+    if (joining_others > 0) return @max(streak +| 1, COMPANY_YIELD_TICKS);
+    return companyStreak(streak, decoding_others > 0);
+}
+
 /// Spec modes that give way to the batched group once a slot has company: DSpark unless a slot it can share a
 /// group round with is among it (`dspark_company`), DFlash on a sparse target (its wide verify reads every expert
 /// the block routes to), PLD on CUDA. A dense DFlash slot yields only to a crowd (`crowd` others): below it the
@@ -76,7 +84,7 @@ fn modelCompany(active: anytype, s: anytype, groupable: anytype) Company {
 
 /// The first request of a burst was admitted alone, so it armed speculation and ticks
 /// serial beside the group; once company is steady it yields.
-pub fn specYieldTick(active: []const *Slot) void {
+pub fn specYieldTick(active: []const *Slot, joining: []const usize) void {
     for (active) |s| {
         const gen = if (s.legacy_gen) |*g| g else continue;
         if (gen.spec_disabled_runtime) continue;
@@ -86,14 +94,38 @@ pub fn specYieldTick(active: []const *Slot) void {
             s.company_ticks = 0;
             continue;
         };
-        const company = modelCompany(active, s, dspark_group.slotGroupable);
-        if (!yieldsToCompany(mode, mlx.cudaAvailable(), s.model.config.?.isMoe(), company.others, mtpCrowdThresholdFor(s), company.dspark)) {
+        var company = modelCompany(active, s, dspark_group.slotGroupable);
+        var joined: usize = 0;
+        for (joining) |m| joined += @intFromBool(m == @intFromPtr(s.model));
+        // A joining slot on a DSpark-groupable model arms DSpark beside this one: a group peer, not plain company.
+        if (joined > 0 and mode == .dspark) if (s.model.transformer) |t| if (dspark_group.groupable(t)) {
+            company.dspark = true;
+        };
+        if (!yieldsToCompany(mode, mlx.cudaAvailable(), s.model.config.?.isMoe(), company.others + joined, mtpCrowdThresholdFor(s), company.dspark)) {
             s.company_ticks = 0;
             continue;
         }
-        s.company_ticks = companyStreak(s.company_ticks, company.others > 0);
+        s.company_ticks = companyStreakWith(s.company_ticks, company.others, joined);
         if (s.company_ticks >= COMPANY_YIELD_TICKS) gen.yieldSpecToCompany(@tagName(mode));
     }
+}
+
+/// The models of the slots about to decode (admitted this pass and not yet prefilled, or pending), for
+/// `specYieldTick`; the caller holds `queue_mu`.
+pub fn joiningModels(sch: *const Scheduler, out: []usize) []usize {
+    var n: usize = 0;
+    const from = @min(sch.prefilling_from, sch.n_prefilling);
+    for (sch.prefilling[from..sch.n_prefilling]) |s| {
+        if (n == out.len) break;
+        out[n] = @intFromPtr(s.model);
+        n += 1;
+    }
+    for (sch.pending.items) |s| {
+        if (n == out.len) break;
+        out[n] = @intFromPtr(s.model);
+        n += 1;
+    }
+    return out[0..n];
 }
 
 /// Prefill width while other streams decode: a chunk boundary is their only yield point.
@@ -600,11 +632,15 @@ pub fn interleaveDecodeTick(sch: *Scheduler) u64 {
         _ = s.in_pass.fetchAdd(1, .acq_rel);
         n += 1;
     }
+    var joining_buf: [32]usize = undefined;
+    const joining = joiningModels(sch, &joining_buf);
     sch.queue_mu.unlock(sch.io);
     defer for (buf[0..n]) |s| {
         _ = s.in_pass.fetchSub(1, .acq_rel);
     };
     if (n == 0) return 0;
+    // A burst still prefilling is company: its early slots stop drafting before this tick, not after the burst.
+    specYieldTick(buf[0..n], joining);
     invalidateDecodeClocks(buf[0..n]);
     var sw = io_util.Stopwatch.init(sch.io);
     runDecodeTick(sch, buf[0..n]) catch |err| {
@@ -1001,6 +1037,18 @@ test "writeThroughSpanReached: a sub-chunk warm turn never persists inside the p
 test "companyStreak: only consecutive ticks with company count" {
     try testing.expectEqual(@as(u8, 2), companyStreak(companyStreak(0, true), true));
     try testing.expectEqual(@as(u8, 0), companyStreak(1, false));
+}
+
+test "companyStreakWith: company about to decode is steady at once, decoding company builds up, none never yields" {
+    // A burst: the slots admitted in the same pass, or pending, decode beside this one from the next tick.
+    try testing.expect(companyStreakWith(0, 0, 1) >= COMPANY_YIELD_TICKS);
+    try testing.expect(companyStreakWith(0, 2, 3) >= COMPANY_YIELD_TICKS);
+    // Company that only decodes still takes COMPANY_YIELD_TICKS consecutive ticks.
+    try testing.expectEqual(@as(u8, 1), companyStreakWith(0, 1, 0));
+    try testing.expectEqual(@as(u8, 2), companyStreakWith(companyStreakWith(0, 1, 0), 1, 0));
+    // A lone request, and one whose only company still waits for a submit slot (not yet in the scheduler), never yield.
+    try testing.expectEqual(@as(u8, 0), companyStreakWith(0, 0, 0));
+    try testing.expectEqual(@as(u8, 0), companyStreakWith(1, 0, 0));
 }
 
 test "yieldsToCompany: DSpark and sparse-target DFlash everywhere, PLD only on CUDA" {
