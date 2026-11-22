@@ -511,12 +511,14 @@ pub const Peer = struct {
         try self.sendOrdered(.{ OP_MOE, xs[0], xs[1], xs[2], ls[ls.len - 1], @backingInt(mlx.mlx_array_dtype(x)), @intCast(layer), @backingInt(mlx.mlx_array_dtype(logits)) }, &.{ x, logits });
     }
 
-    /// Tensor mode, a plugin's experts: rows `x` `[t, d]`, routes `idx` `[t, k]` u32 and weights `[t, k]` f32.
-    pub fn sendExperts(self: *Peer, x: mlx.mlx_array, idx: mlx.mlx_array, weights: mlx.mlx_array, layer: u32) !void {
+    /// Tensor mode, a plugin's experts: rows `x` `[t, d]`, routes `idx` `[t, k]` u32 and weights `[t, k]` f32; the
+    /// share comes back in `back` (header slot 6, 0 = f32: a worker that predates it sends f32).
+    pub fn sendExperts(self: *Peer, x: mlx.mlx_array, idx: mlx.mlx_array, weights: mlx.mlx_array, layer: u32, back: mlx.mlx_dtype) !void {
         if (!self.ready) try self.awaitReady();
         const xs = mlx.getShape(x);
         self.exchanges += 1;
-        try self.sendOrdered(.{ OP_EXPERTS, xs[0], xs[1], mlx.getShape(idx)[1], @backingInt(mlx.mlx_array_dtype(x)), @intCast(layer), 0, 0 }, &.{ x, idx, weights });
+        const code: i32 = if (back == .float32) 0 else @intCast(@backingInt(back));
+        try self.sendOrdered(.{ OP_EXPERTS, xs[0], xs[1], mlx.getShape(idx)[1], @backingInt(mlx.mlx_array_dtype(x)), @intCast(layer), code, 0 }, &.{ x, idx, weights });
     }
 
     /// The worker's partial for the layer input `x`: its shape and dtype.
@@ -943,10 +945,23 @@ fn expertExchange(layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, weights: mlx
     if (p.failed or !p.planned) return error.DistWorkerLeft;
     const io = cluster().group.?.io;
     const t0 = io_util.nowUsMonotonic(io);
-    try p.sendExperts(x, idx, weights, layer);
-    const r = try queuedRecv(&p.link, &.{ mlx.getShape(x)[0], mlx.getShape(x)[1] }, .float32, 1);
+    const back = expertsBack(mlx.mlx_array_dtype(x), env.span(.MLX_SERVE_DIST_EXPERTS_BF16));
+    try p.sendExperts(x, idx, weights, layer, back);
+    const r = try queuedRecv(&p.link, &.{ mlx.getShape(x)[0], mlx.getShape(x)[1] }, back, 1);
     noteExperts(&cluster().experts_timing, "rank 0", .{ io_util.nowUsMonotonic(io) - t0, 0, 0 }, mlx.getShape(x)[0]);
     return r;
+}
+
+/// The dtype a worker's expert share comes back in: the rows' bf16 (half the wire; rank 0 sums in f32), f32 for
+/// other rows or with the lever `=0`.
+fn expertsBack(rows: mlx.mlx_dtype, lever: ?[]const u8) mlx.mlx_dtype {
+    const bf16 = lever == null or !std.mem.startsWith(u8, lever.?, "0");
+    return if (bf16 and rows == .bfloat16) .bfloat16 else .float32;
+}
+
+/// The dtype header slot 6 asks a share back in.
+fn backOf(code: i32) mlx.mlx_dtype {
+    return if (code == 0) .float32 else @fromBackingInt(@intCast(code));
 }
 
 /// Per `EXPERT_LINE` exchanges, one line of where their time went (µs summed): rank 0 its wait from the send
@@ -1685,8 +1700,14 @@ fn servePluginExperts(io: std.Io, allocator: std.mem.Allocator, link: *const Lin
                     log.err("[dist] worker: expert share at layer {d} refused: {s}\n", .{ m[5], v.why.slice() });
                     return error.DistBadMessage;
                 }
-                const y: mlx.mlx_array = .{ .ctx = out.ctx };
+                var y: mlx.mlx_array = .{ .ctx = out.ctx };
                 defer _ = mlx.mlx_array_free(y);
+                if (backOf(m[6]) != .float32) {
+                    var c = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_astype(&c, y, backOf(m[6]), mlx.gpuStream()));
+                    _ = mlx.mlx_array_free(y);
+                    y = c;
+                }
                 try evalOne(y);
                 const t2 = io_util.nowUsMonotonic(io);
                 const sent = try link.send(y, 0);
@@ -2326,4 +2347,12 @@ test "a load waits for a worker whose link is still opening, and not for one who
     try std.testing.expect(!awaitJoin("m", 200)); // still opening, never joins: the wait ends
     cluster().opening.store(false, .release);
     try std.testing.expect(!awaitJoin("m", 10_000)); // the link failed: no wait
+}
+
+test "a pair's expert share comes back in the rows' bf16 unless the lever is 0, and an old header's 0 is f32" {
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, expertsBack(.bfloat16, null));
+    try std.testing.expectEqual(mlx.mlx_dtype.float32, expertsBack(.bfloat16, "0"));
+    try std.testing.expectEqual(mlx.mlx_dtype.float32, expertsBack(.float32, null));
+    try std.testing.expectEqual(mlx.mlx_dtype.float32, backOf(0));
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, backOf(@intCast(@backingInt(mlx.mlx_dtype.bfloat16))));
 }
