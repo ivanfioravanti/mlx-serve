@@ -110,11 +110,18 @@ fn captureCuts(gpu: bool) !void {
     const visits = pack.parsed.shell.num_hidden_layers;
     var long: [2200]u32 = undefined;
     for (&long, 0..) |*t, i| t.* = @intCast(1 + (i * 37 + i / 7) % (VOCAB - 1));
-    const Case = struct { ids: []const u32, cuts: []const usize };
-    for ([_]Case{ .{ .ids = &prompt, .cuts = &.{ 1, 7, 12, prompt.len } }, .{ .ids = long[0..600], .cuts = &.{ 520, 600 } }, .{ .ids = &long, .cuts = &.{2170} } }) |cs| {
+    // `from` rows are prefilled first, so the capture runs behind a held state, as a restored tail's does.
+    const Case = struct { ids: []const u32, from: usize = 0, cuts: []const usize };
+    for ([_]Case{
+        .{ .ids = &prompt, .cuts = &.{ 1, 7, 12, prompt.len } },
+        .{ .ids = &prompt, .from = 9, .cuts = &.{ 10, 17, prompt.len } },
+        .{ .ids = long[0..600], .cuts = &.{ 520, 600 } },
+        .{ .ids = &long, .from = 2100, .cuts = &.{2170} },
+    }) |cs| {
         var whole = try test_cache.TestCache.init(a, visits);
         defer whole.deinit();
-        a.free(try stepMode(a, &pack, &whole, cs.ids, 0, .last_row, .verify));
+        if (cs.from > 0) a.free(try stepMode(a, &pack, &whole, cs.ids[0..cs.from], 0, .last_row, .prefill));
+        a.free(try stepMode(a, &pack, &whole, cs.ids[cs.from..], cs.from, .last_row, .verify));
         for (cs.cuts) |r| {
             var part = try test_cache.TestCache.init(a, visits);
             defer part.deinit();
@@ -123,10 +130,10 @@ fn captureCuts(gpu: bool) !void {
                 const win: ops.Array = .{ .ctx = w.conv_input.ctx };
                 const want: ops.Array = .{ .ctx = p.conv.ctx };
                 const km1 = ops.shape(want)[1];
-                try testing.expectEqual(@as(c_int, @intCast(cs.ids.len)) + km1, ops.shape(win)[1]);
+                try testing.expectEqual(@as(c_int, @intCast(cs.ids.len - cs.from)) + km1, ops.shape(win)[1]);
                 var g = ops.Graph.init(a, if (gpu) mlx.gpuStream() else mlx.mlx_default_cpu_stream_new());
                 defer g.deinit();
-                const at: c_int = @intCast(r);
+                const at: c_int = @intCast(r - cs.from);
                 fx_stream = g.s;
                 try expectClose(try g.sliceAxis(win, 1, at, at + km1), want, if (gpu) 2e-2 else 1e-4, "capture cut");
             }
