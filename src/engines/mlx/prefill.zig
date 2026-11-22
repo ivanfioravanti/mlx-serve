@@ -281,7 +281,10 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         @import("finish.zig").releasePluginSlot(slot);
         publishHotCacheResidency(sch);
     };
-    if (module_binding) |binding| {
+    if (slot.stacked_rows > 0) {
+        hot_matched = slot.stacked_rows;
+        prefill_tokens = slot.full_prompt[hot_matched..];
+    } else if (module_binding) |binding| {
         hot_matched = @intCast(try restoreModulePrompt(sch, slot, binding));
         prefill_tokens = slot.full_prompt[hot_matched..];
         publishHotCacheResidency(sch);
@@ -296,7 +299,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             log.info("[dsv41] resumed {d} of {d} prompt tokens\n", .{ resumed, slot.full_prompt.len });
         }
     }
-    if (module_binding == null) if (slot.prefix_cache) |hc| {
+    if (module_binding == null and slot.stacked_rows == 0) if (slot.prefix_cache) |hc| {
         {
             // Only build a restore target when this request will actually
             // draft — a non-dflash turn leaves the payload in the entry for
