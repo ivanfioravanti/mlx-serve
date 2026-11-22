@@ -58,6 +58,46 @@ pub const SSMCheckpoint = struct {
     }
 };
 
+/// Every layer's recurrent state is a conv window: a capture of it is the forward's own input rows, no per-row stack.
+pub fn convOnlyState(ssm_entries: []const SSMCacheEntry) bool {
+    for (ssm_entries) |*e| if (e.ssm_state.ctx != null or e.aux_state.ctx != null or e.group != null) return false;
+    return true;
+}
+
+/// The checkpoint `captureSsmCheckpoint` takes after the first `rows` of a capturing forward over `verify_len` rows,
+/// each conv window cut from that forward's capture. Conv-only state: a layer with a scan or auxiliary state refuses.
+pub fn captureSsmCheckpointAt(
+    allocator: std.mem.Allocator,
+    ssm_entries: []const SSMCacheEntry,
+    pos: usize,
+    rows: u32,
+    verify_len: u32,
+    s: mlx.mlx_stream,
+) !SSMCheckpoint {
+    const at = try allocator.alloc(SSMCacheEntry, ssm_entries.len);
+    defer allocator.free(at);
+    var cut: usize = 0;
+    defer for (at[0..cut]) |e| if (e.conv_state.ctx != null) {
+        _ = mlx.mlx_array_free(e.conv_state);
+    };
+    for (ssm_entries, at) |*src, *dst| {
+        if (src.ssm_state.ctx != null or src.aux_state.ctx != null or src.group != null) return error.CaptureNotConvOnly;
+        dst.* = src.*;
+        dst.conv_state = .{ .ctx = null };
+        if (src.spec_conv_input.ctx == null) {
+            if (src.conv_state.ctx != null) return error.CaptureMissing;
+        } else {
+            dst.conv_state = mlx.mlx_array_new();
+            const sh = mlx.getShape(src.spec_conv_input); // [B, (k-1)+T, C]
+            const km1 = sh[1] - @as(c_int, @intCast(verify_len));
+            const r: c_int = @intCast(rows);
+            try mlx.check(mlx.mlx_slice(&dst.conv_state, src.spec_conv_input, &[_]c_int{ 0, r, 0 }, 3, &[_]c_int{ sh[0], r + km1, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        }
+        cut += 1;
+    }
+    return captureSsmCheckpoint(allocator, at, pos, s);
+}
+
 /// Snapshot of every entry in `ssm_entries` at the current point. Caller owns
 /// the resulting buffer (free via `SSMCheckpoint.deinit`).
 ///
