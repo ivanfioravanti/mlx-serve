@@ -327,19 +327,23 @@ pub fn yieldSpecToCompany(self: *Generator, mode: []const u8) void {
 /// fallback.
 pub fn checkDflashRuntimeGate(self: *Generator) void {
     if (self.spec_disabled_runtime or self.dflash_pol != null) return;
+    // The bar is for rounds verifying every draft; rounds verifying fewer cost less, and their bar falls with them.
+    const full: u64 = self.dflash_block_size -| 1;
+    const verified = if (self.dflash_attempted > 0 and full > 0) @min(full, (self.dflash_verified_drafts + self.dflash_attempted / 2) / self.dflash_attempted) else full;
+    const floor = if (full > 0) self.dflash_min_accepted_per_round * @as(f32, @floatFromInt(verified)) / @as(f32, @floatFromInt(full)) else self.dflash_min_accepted_per_round;
     if (!dflashGateShouldDisable(
         self.dflash_attempted,
         self.dflash_accepted_tokens,
-        self.dflash_min_accepted_per_round,
+        floor,
     )) return;
     // The table's own measure outranks the calibrated bar: a round emitting
     // tokens cheaper than the plain step it would yield to stays on.
-    if (self.xfm.round_cost.roundBeatsSerial(self.dflash_block_size -| 1, self.mtpKvLen()) == true) return;
+    if (self.xfm.round_cost.roundBeatsSerial(@intCast(@max(verified, 1)), self.mtpKvLen()) == true) return;
     const avg = @as(f32, @floatFromInt(self.dflash_accepted_tokens)) /
         @as(f32, @floatFromInt(self.dflash_attempted));
     log.info(
         "  dflash=disabled (runtime yield {d:.2} accepted/round < {d:.2} after {d} attempts)\n",
-        .{ avg, self.dflash_min_accepted_per_round, self.dflash_attempted },
+        .{ avg, floor, self.dflash_attempted },
     );
     self.spec_disabled_runtime = true;
 }

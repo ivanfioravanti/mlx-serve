@@ -385,7 +385,16 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
             for (rows) |*r| r.* = .{ .ctx = null };
             q_rows = rows;
         }
-        var prev: u32 = t1;
+        // The chain stays on the GPU: each step's token feeds the next as a lazy array, read back once a block.
+        const t1_i32: i32 = @intCast(t1);
+        var prev = mlx.mlx_array_new_data(&t1_i32, &[_]c_int{1}, 1, .int32);
+        defer _ = mlx.mlx_array_free(prev);
+        const picks = try allocator.alloc(mlx.mlx_array, 2 * m);
+        defer allocator.free(picks);
+        for (picks) |*p| p.* = .{ .ctx = null };
+        defer for (picks) |p| if (p.ctx != null) {
+            _ = mlx.mlx_array_free(p);
+        };
         var step: u32 = 0;
         var markov_round: dflash_mod.MarkovRound = .{};
         defer markov_round.deinit();
@@ -408,6 +417,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
                 break :blk try rnn.step(&markov_round, mh.w1, base_row, hidden_row, dctx.anchor, prev, s);
             } else try mh.stepLogits(base_row, prev, s);
             defer _ = mlx.mlx_array_free(corrected);
+            var next = mlx.mlx_array_new();
             if (stochastic) {
                 // Sample the step from the request's own filtered
                 // distribution and keep the row as q — the accept ratio
@@ -424,9 +434,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
                 var sampled = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(sampled);
                 try mlx.check(mlx.mlx_random_categorical(&sampled, logq, -1, key, s));
-                try mlx.check(mlx.mlx_array_eval(sampled));
-                const sd = mlx.mlx_array_data_int32(sampled) orelse return error.MlxArrayDataNull;
-                prev = @intCast(sd[0]);
+                try mlx.check(mlx.mlx_reshape(&next, sampled, &[_]c_int{1}, 1, s));
                 q_rows.?[step] = qrow;
             } else {
                 var amax = mlx.mlx_array_new();
@@ -435,11 +443,46 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
                 var as_i32 = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(as_i32);
                 try mlx.check(mlx.mlx_astype(&as_i32, amax, .int32, s));
-                try mlx.check(mlx.mlx_array_eval(as_i32));
-                const ad = mlx.mlx_array_data_int32(as_i32) orelse return error.MlxArrayDataNull;
-                prev = @intCast(ad[0]);
+                try mlx.check(mlx.mlx_reshape(&next, as_i32, &[_]c_int{1}, 1, s));
+                // The pick's probability under the head: the run of them says how far the drafts are worth verifying.
+                var probs = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(probs);
+                try mlx.check(mlx.mlx_softmax_axis(&probs, corrected, 2, true, s));
+                picks[m + step] = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_max(&picks[m + step], probs, false, s));
             }
-            ids_i32[step] = @intCast(prev);
+            picks[step] = next;
+            _ = mlx.mlx_array_free(prev);
+            prev = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&prev, next));
+        }
+        {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            for (picks) |p| if (p.ctx != null) {
+                _ = mlx.mlx_vector_array_append_value(vec, p);
+            };
+            try mlx.check(mlx.mlx_eval(vec));
+        }
+        var sure: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+        for (0..m) |k| {
+            ids_i32[k] = (mlx.mlx_array_data_int32(picks[k]) orelse return error.MlxArrayDataNull)[0];
+            if (!stochastic) {
+                var v: f32 = 0;
+                try mlx.check(mlx.mlx_array_item_float32(&v, picks[m + k]));
+                sure[k] = v;
+            }
+        }
+        if (!stochastic) {
+            // Only the drafts the head is sure of ride the verify; none makes the round a plain step.
+            m = draftsToVerify(sure[0..m], ids_i32[0..m], markovCut(self), self.eos_token_ids);
+            self.dflash_round_width = m;
+            if (m == 0) {
+                self.dflash_unobserved = true;
+                const plain = try self.dflashPlainRound(allocator, t1, serial, stochastic);
+                self.dflashRecordDrafted(1, dflash_kv_watch.read());
+                return plain;
+            }
         }
         if (q_rows) |rows| {
             const vec = mlx.mlx_vector_array_new();
@@ -591,6 +634,7 @@ pub fn dflashVerify(self: *Generator, allocator: std.mem.Allocator, r: VerifyIn)
         for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
     };
     self.dflash_attempted += 1;
+    self.dflash_verified_drafts += m;
     if (tracing) {
         // Captures ride the same forward — eval them here or their cost
         // is billed to `append`.
@@ -1102,6 +1146,55 @@ pub fn dflashPolicyRows(self: *Generator, sel: *const dflash_mod.SelectedPath, m
     return self.dflashRowsFor(p[0..m_draft], &costs);
 }
 
+/// The drafts a Markov round verifies: while the run of the head's pick probabilities stays at `cut` or above, and none
+/// past a stop id (it ends the turn).
+pub fn draftsToVerify(sure: []const f32, ids: []const i32, cut: f32, stops: []const u32) u32 {
+    var run: f32 = 1;
+    var n: u32 = 0;
+    while (n < sure.len) {
+        run *= sure[n];
+        if (run < cut) break;
+        n += 1;
+        if (std.mem.indexOfScalar(u32, stops, @intCast(ids[n - 1])) != null) break;
+    }
+    return n;
+}
+
+/// The run probability a Markov round verifies down to: 1.34 sqrt(a verified row's cost over a plain step's), within
+/// [0.3, 0.8] (the curve through each machine's best cut); 0.5 until the round-cost table holds a plain cost and two
+/// widths at this context. A row's cost is the slope of the round's cost over its draft count.
+pub fn markovCut(self: *const Generator) f32 {
+    const t = &self.xfm.round_cost;
+    const b = t.bucketOf(@intCast(self.mtpKvLen()));
+    const plain = t.measuredMs(0, b) orelse t.serialMsPerTok(b) orelse return 0.5;
+    var n: f32 = 0;
+    var sk: f32 = 0;
+    var sy: f32 = 0;
+    var skk: f32 = 0;
+    var sky: f32 = 0;
+    for (1..dflash_policy.MAX_DRAFTS + 1) |k| if (t.measuredMs(@intCast(k), b)) |ms| {
+        const x: f32 = @floatFromInt(k);
+        n += 1;
+        sk += x;
+        sy += ms;
+        skk += x * x;
+        sky += x * ms;
+    };
+    if (n < 2 or plain <= 0) return 0.5;
+    const row = (n * sky - sk * sy) / (n * skk - sk * sk);
+    return std.math.clamp(1.34 * @sqrt(@max(row / plain, 0)), 0.3, 0.8);
+}
+
+test "draftsToVerify: drafts while the run of the head's probabilities holds, none past a stop" {
+    const ids = [_]i32{ 5, 6, 7, 8 };
+    try std.testing.expectEqual(@as(u32, 4), draftsToVerify(&.{ 0.99, 0.99, 0.99, 0.99 }, &ids, 0.5, &.{}));
+    // 0.9 * 0.8 = 0.72 holds, * 0.5 = 0.36 falls under the cut.
+    try std.testing.expectEqual(@as(u32, 2), draftsToVerify(&.{ 0.9, 0.8, 0.5, 0.99 }, &ids, 0.5, &.{}));
+    try std.testing.expectEqual(@as(u32, 0), draftsToVerify(&.{ 0.4, 0.99, 0.99, 0.99 }, &ids, 0.5, &.{}));
+    // A stop id is verified, nothing after it.
+    try std.testing.expectEqual(@as(u32, 2), draftsToVerify(&.{ 0.99, 0.99, 0.99, 0.99 }, &ids, 0.5, &.{6}));
+}
+
 /// `[dflash-round]`: what the selector was sure of against what the target kept (the calibration's raw material).
 pub fn logDflashRound(self: *const Generator, conf: []const f32, rows_drafts: u32, accepted: u32) void {
     _ = self;
@@ -1349,6 +1442,59 @@ fn markovSeededRun(out: *std.ArrayList(u32)) !void {
         try out.append(allocator, @intCast(1000 + res.tokens.len));
     }
     try testing.expect(gen.dflash_attempted > 0);
+}
+
+// Bar: a greedy request drafting through the Markov head (its chain on the GPU, its verify cut to the drafts the head
+// is sure of, a plain step where it is sure of none) emits serial greedy's tokens.
+test "dflash: a greedy request through the Markov head emits serial greedy's tokens, its verify cut to the sure drafts" {
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_trunk = std.testing.tmpDir(.{});
+    defer tmp_trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_path = trunk_buf[0..try tmp_trunk.dir.realPath(io, &trunk_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, mlx.gpuStream());
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    defer config.deinit(allocator);
+    var tmp_asst = std.testing.tmpDir(.{});
+    defer tmp_asst.cleanup();
+    var asst_buf: [512]u8 = undefined;
+    const asst_path = asst_buf[0..try tmp_asst.dir.realPath(io, &asst_buf)];
+    try dflash_mod.TinyFix.writeAssistantMarkov(io, tmp_asst.dir, asst_path, mlx.gpuStream());
+    var tok_dummy: Tokenizer = undefined; // never read by the Generator
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const want: usize = 40;
+    var serial: [want]u32 = undefined;
+    {
+        var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{ .skip_lazy_preforward = true });
+        defer gen.deinit(allocator);
+        for (&serial) |*t| t.* = (try gen.next(allocator)).?;
+    }
+    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
+    defer xfm.deinit();
+    var dm = try dflash_mod.loadDflash(io, allocator, mlx.gpuStream(), asst_path);
+    defer dm.deinit();
+    try testing.expect(dm.markov != null);
+    try dm.bind(&xfm);
+    var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
+        .dflash_enabled = true,
+        .dflash = &dm,
+        .dflash_min_accepted_per_round = 0,
+    });
+    defer gen.deinit(allocator);
+    var got = std.ArrayList(u32).empty;
+    defer got.deinit(allocator);
+    while (try gen.nextDflash(allocator)) |res| {
+        defer allocator.free(res.tokens);
+        try got.appendSlice(allocator, res.tokens);
+    }
+    try testing.expect(gen.dflash_attempted > 0);
+    try testing.expect(gen.dflash_verified_drafts <= gen.dflash_attempted * (gen.dflash_block_size - 1));
+    try testing.expectEqualSlices(u32, &serial, got.items);
 }
 
 test "dflash: a seeded sampled request drafts through the Markov head the same way twice" {

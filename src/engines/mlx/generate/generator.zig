@@ -210,6 +210,8 @@ pub const Generator = struct {
     dflash_round_width: u32 = 0,
     /// Stats: count of nextDflash calls that ran a verify forward.
     dflash_attempted: u64 = 0,
+    /// Drafts the attempted rounds verified (a round may verify fewer than it drafted: the Markov head's sure prefix).
+    dflash_verified_drafts: u64 = 0,
     /// Round policy (`dflash_policy.zig`); null = the fixed block and the sticky yield gate.
     dflash_pol: ?DflashPol = null,
     /// Stats: rounds drafted from the context (no assistant forward), the tokens they proposed and the ones kept.

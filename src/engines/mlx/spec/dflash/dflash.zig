@@ -914,20 +914,19 @@ pub const MarkovRnn = struct {
     }
 
     /// One step: `base_row` `[1, 1, vocab]` (the block row's bare head logits), `hidden_row` `[1, 1, hidden]`,
-    /// `anchor` `[1, 1, hidden]` (the newest context row, mixed and normed). Returns `[1, 1, rows]` f32, softcapped.
-    pub fn step(self: *const MarkovRnn, round: *MarkovRound, w1: mlx.mlx_array, base_row: mlx.mlx_array, hidden_row: mlx.mlx_array, anchor: mlx.mlx_array, prev_token: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    /// `anchor` `[1, 1, hidden]` (the newest context row, mixed and normed), `prev` the previous token `[1]` int32 (a
+    /// lazy array: the chain stays on the GPU). Returns `[1, 1, rows]` f32, softcapped.
+    pub fn step(self: *const MarkovRnn, round: *MarkovRound, w1: mlx.mlx_array, base_row: mlx.mlx_array, hidden_row: mlx.mlx_array, anchor: mlx.mlx_array, prev: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
         if (self.fold_w.ctx == null or anchor.ctx == null) return error.DflashMarkovUnbound;
         var sx = Scope.init(std.heap.c_allocator, s);
         defer sx.deinit();
         const dt = mlx.mlx_array_dtype(self.proj_w);
         const r = self.rank;
         const state = if (round.state.ctx != null) round.state else try sx.zeros(&.{ 1, r }, dt);
-        const idx_i32: i32 = @intCast(prev_token);
-        const idx = try sx.keep(mlx.mlx_array_new_data(&idx_i32, &[_]c_int{1}, 1, .int32));
         const h = mlx.getShape(hidden_row)[2];
         const input = try sx.concat(&.{
             state,
-            try sx.astype(try sx.take(w1, idx), dt),
+            try sx.astype(try sx.take(w1, prev), dt),
             try sx.astype(try sx.reshape(hidden_row, &.{ 1, h }), dt),
             try sx.astype(try sx.reshape(anchor, &.{ 1, h }), dt),
         }, 1);
@@ -944,7 +943,6 @@ pub const MarkovRnn = struct {
             const cap = try sx.keep(mlx.mlx_array_new_float(self.softcap));
             logits = try sx.mul(try sx.tanh(try sx.div(logits, cap)), cap);
         }
-        try mlx.check(mlx.mlx_array_eval(next));
         if (round.state.ctx != null) _ = mlx.mlx_array_free(round.state);
         round.state = sx.out(next);
         return sx.out(try sx.reshape(logits, &.{ 1, 1, self.rows }));
@@ -1037,17 +1035,12 @@ pub const MarkovHead = struct {
     pub fn stepLogits(
         self: *const MarkovHead,
         base_row: mlx.mlx_array,
-        prev_token: u32,
+        prev: mlx.mlx_array,
         s: mlx.mlx_stream,
     ) !mlx.mlx_array {
-        const idx_i32: i32 = @intCast(prev_token);
-        const idx_shape = [_]c_int{1};
-        const idx = mlx.mlx_array_new_data(&idx_i32, &idx_shape, 1, .int32);
-        defer _ = mlx.mlx_array_free(idx);
-
         var row = mlx.mlx_array_new(); // [1, rank]
         defer _ = mlx.mlx_array_free(row);
-        try mlx.check(mlx.mlx_take_axis(&row, self.w1, idx, 0, s));
+        try mlx.check(mlx.mlx_take_axis(&row, self.w1, prev, 0, s));
 
         const rsh = mlx.getShape(row);
         const shaped = [_]c_int{ 1, 1, rsh[1] };
