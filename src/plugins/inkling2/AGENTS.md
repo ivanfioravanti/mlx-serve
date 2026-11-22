@@ -34,7 +34,8 @@ attention block, `rel_attn.zig` the attention read and its simdgroup kernel, `re
   fp32 op chain, a decode row MLX's fused attention), so a tie between two tokens can fall the other way: drafted
   text is not serial's byte for byte, and `tests/test_inkling2.sh` holds it to "the list continues", not a hash. Oracle: `tests/dump_inkling2_drafter_fixtures.py` (oMLX's drafter modules, vLLM's context windows).
 - Declined by name: a variable loop, shared experts, a core off the block boundaries, `use_value_norm_no_gamma` or
-  `attn_res_normalize_values` off, q/o biases.
-- Oracle: mlx-lm PR #2086 on `mlx-community/Inkling-2-Mini-4bit` (`tests/dump_inkling2_fixtures.py`,
-  `tests/test_inkling2.sh`). A prompt's bar is the reference's own kernel-vs-op-chain spread (`self_gap`, floor
+  `attn_res_normalize_values` off, q/o biases, an oMLX-layout pack (experts `w13`/`w2`, `Inkling-2-Mini-oQ4e-mtp`).
+- A prompt chunk's experts: a per-expert tiled qmm lost to MLX's padded sorted gather on non-NAX.
+- Oracle: mlx-lm PR #2086 on `mlx-community/Inkling-2-Mini-4bit` and its bf16 (`mlx_lm.convert -d`: dense banks)
+  (`tests/dump_inkling2_fixtures.py`, `tests/test_inkling2.sh`). A prompt's bar is the reference's own kernel-vs-op-chain spread (`self_gap`, floor
   0.75): a rounding-equivalent change moves a long prompt's worst gap by 0.1-0.3, so no fixed bar tells it from a bug.

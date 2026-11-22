@@ -121,6 +121,9 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     const mt = field(root, "model_type") orelse return unsupported("no model_type");
     if (mt != .string or !std.mem.eql(u8, mt.string, model_types[0])) return unsupported("another model_type");
     if (quant_config.foreign(root)) return unsupported("a quantization_config naming a quant_method");
+    // oMLX's own layout (`model.layers.N.attn.*`, experts `w13`/`w2`) is not mlx-lm's.
+    if (field(root, "quantization")) |q| if (q == .object) for (q.object.keys()) |k|
+        if (std.mem.indexOf(u8, k, ".experts.w13") != null) return unsupported("an oMLX-layout pack (experts w13/w2), not mlx-lm's");
     const tc = field(root, "text_config") orelse return unsupported("no text_config");
     if (tc != .object) return unsupported("text_config");
     const cfg = tc.object;
@@ -332,8 +335,8 @@ test "inkling2 config: the Mini pack's loop gives 48 visits, each with its own c
     for ([_]usize{ 0, 6, 18, 30, 42 }) |v| try testing.expect(lay[v].kind == .sliding and lay[v].window == 1024 and lay[v].nope);
 }
 
-test "inkling2 config: a variable loop, shared experts or a core off the block boundaries is refused unsupported" {
-    inline for (.{ .{ "\"is_varloop\":false", "\"is_varloop\":true" }, .{ "\"n_shared_experts\":0", "\"n_shared_experts\":1" }, .{ "\"core_start\":6", "\"core_start\":5" }, .{ "\"use_value_norm_no_gamma\":true", "\"use_value_norm_no_gamma\":false" } }) |swap| {
+test "inkling2 config: a variable loop, shared experts, a core off the block boundaries or an oMLX-layout pack is refused unsupported" {
+    inline for (.{ .{ "\"is_varloop\":false", "\"is_varloop\":true" }, .{ "\"n_shared_experts\":0", "\"n_shared_experts\":1" }, .{ "\"core_start\":6", "\"core_start\":5" }, .{ "\"use_value_norm_no_gamma\":true", "\"use_value_norm_no_gamma\":false" }, .{ "\"quantization\":{", "\"quantization\":{\"model.layers.0.mlp.experts.w13\":{\"bits\":4}," } }) |swap| {
         const json = comptime blk: {
             @setEvalBranchQuota(100_000);
             const at = std.mem.indexOf(u8, mini_4bit, swap[0]).?;
