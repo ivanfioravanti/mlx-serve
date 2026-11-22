@@ -83,6 +83,13 @@ pub const Tp = struct {
     live: bool = true,
 };
 
+/// A line through the host's log.
+fn say(h: *const host_abi.Host, level: host_abi.LogLevel, comptime fmt: []const u8, args: anytype) void {
+    if (!h.log_enabled(h.ctx, level)) return;
+    var buf: [192]u8 = undefined;
+    h.log(h.ctx, level, host_abi.Str.of(std.fmt.bufPrint(&buf, fmt, args) catch return));
+}
+
 /// Prefill chunks from this many rows split their experts with the worker; decode, verify rounds and short spans
 /// never cross the wire.
 pub const TP_ROWS = 512;
@@ -148,7 +155,7 @@ pub const Model = struct {
         }
 
         /// The MLP of a prefill chunk on a tensor-parallel pair: this rank's share of every expert, plus the worker's,
-        /// sent before this share's graph so the return overlaps it; null = the single-node MLP (a short chunk, no
+        /// this share queued on the GPU before the exchange so the two overlap; null = the single-node MLP (a short chunk, no
         /// pair, or the worker gone, which ends the pair for the request and is logged).
         fn pairMlp(t: *Trunk, L: *const Layer, li: usize, x: Array, x32: Array) !?Array {
             const tp = t.w.tp orelse return null;
@@ -161,19 +168,19 @@ pub const Model = struct {
             const sh = ops.shape(x);
             const flat = try g.reshape(x, &.{ sh[0] * sh[1], sh[2] });
             const r = try moe.routed(&L.mlp, g, flat, try g.reshape(x32, &.{ sh[0] * sh[1], sh[2] }));
+            const mine = try moe.partial(&L.mlp, g, &share, flat, r);
+            const queued = mlx.mlx_vector_array_new_data(&[_]Array{mine}, 1);
+            defer _ = mlx.mlx_vector_array_free(queued);
+            try mlx.check(mlx.mlx_async_eval(queued));
             var theirs: host_abi.Array = .{};
             const v = exchange(h.ctx, @intCast(li), .{ .ctx = flat.ctx }, .{ .ctx = r.idx.ctx }, .{ .ctx = r.weights.ctx }, &theirs);
             if (!v.isOk()) {
                 // No worker at all is the single-node server, not news.
                 tp.live = false;
-                if (v.code != .unsupported and h.log_enabled(h.ctx, .warn)) {
-                    var buf: [160]u8 = undefined;
-                    const line = std.fmt.bufPrint(&buf, "[inkling2] tensor-parallel worker lost at layer {d}: this request finishes on one node\n", .{li}) catch "";
-                    h.log(h.ctx, .warn, host_abi.Str.of(line));
-                }
+                if (v.code != .unsupported) say(h, .warn, "[inkling2] tensor-parallel worker lost at layer {d}: this request finishes on one node\n", .{li});
                 return null;
             }
-            const mine = try moe.partial(&L.mlp, g, &share, flat, r);
+            if (li == 0) say(h, .info, "[dist] inkling2 experts engaged: {d} rows at {d}\n", .{ t.c.rows, t.c.offset() });
             const sum = try g.add(mine, try g.adopt(.{ .ctx = theirs.ctx }));
             return try g.reshape(try g.astype(sum, ops.dtype(x)), sh);
         }
@@ -455,7 +462,10 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         const all = try l.made("message_input.query", .{}, .{});
         for (m.layers[c.core_start..c.core_end], 0..) |*L, j| L.message_query = try l.row(all, @intCast(j));
     }
-    if (c.vision) |v| m.tower = try vision.Tower.load(&r, &m.owned, v);
+    // A tensor-parallel worker only serves expert shares.
+    if (c.vision) |v| if (ctx.tp_rank == 0) {
+        m.tower = try vision.Tower.load(&r, &m.owned, v);
+    };
 
     const embed = try r.tableAt(try l.name("embed_tokens", .{}), hidden);
     try m.owned.linear(embed);
@@ -481,13 +491,29 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
             const s = try moe.half(&L.mlp, &g, @intCast(ctx.tp_rank), @intCast(ctx.tp_size));
             for ([_]Array{ s.gate_up.w, s.gate_up.s, s.gate_up.b, s.down.w, s.down.s, s.down.b }) |a| if (a.ctx != null) try m.owned.own(a);
             L.share = s;
+            // The worker never runs a whole MLP.
+            if (ctx.tp_rank != 0) {
+                for ([_]Array{ L.mlp.gate_up.w, L.mlp.gate_up.s, L.mlp.gate_up.b, L.mlp.down.w, L.mlp.down.s, L.mlp.down.b }) |a| disown(&m.owned, a);
+                L.mlp.gate_up = s.gate_up;
+                L.mlp.down = s.down;
+            }
         }
         if (ctx.tp_rank == 0) if (ctx.host) |hp| {
             m.tp = .{ .host = hp };
             m.base.weights.tp = &m.tp;
+            say(hp, .info, "[inkling2] tensor parallel: prefill chunks from {d} rows split every expert with the worker\n", .{TP_ROWS});
         };
     }
     return m;
+}
+
+/// Frees `a` and drops it from `o`.
+fn disown(o: *loader.Owned, a: Array) void {
+    if (a.ctx == null) return;
+    for (o.list.items, 0..) |x, i| if (x.ctx == a.ctx) {
+        _ = mlx.mlx_array_free(o.list.swapRemove(i));
+        return;
+    };
 }
 
 fn loadLayer(l: *Load, c: *const config.Config, i: usize) !Layer {
@@ -729,6 +755,10 @@ test "inkling2 pair: rank 0's split plus the worker's share is one node's prefil
     var rank0 = try conformance.Loaded.openWith(io, a, plugin.name, &table, try conformanceFixture(a), .{ .host = fh.host(), .tp_rank = 0, .tp_size = 2 });
     defer rank0.close();
     Pair.worker = worker.model;
+    // The worker holds only its share of each bank.
+    const held: *Loaded = @ptrCast(@alignCast(worker.model));
+    const full: *Loaded = @ptrCast(@alignCast(whole.model));
+    try std.testing.expectEqual(@divExact(ops.shape(full.layers[0].mlp.gate_up.w)[2], 2), ops.shape(held.layers[0].mlp.gate_up.w)[2]);
 
     const tokens = try a.alloc(u32, TP_ROWS);
     for (tokens, 0..) |*t, i| t.* = @intCast((i * 7 + 1) % 60);
