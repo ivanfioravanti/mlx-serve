@@ -1325,6 +1325,8 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     };
     // A capturing forward leaves each recurrent row's state for the partial-accept rollback (`Ctx.capture_spec`).
     const capture = ctx.capture_ssm_seq and ctx.ssm_entries != null;
+    // The prompt's own capture (a cut checkpoint) stays a prefill: only a verify reads every row.
+    const prompt_capture = capture and ctx.prefill and !ctx.spec_verify;
     const head = !(ctx.skip_lm_head or xfm.embedding_mode);
     // Module-owned state (`Caps.owns_decode_state`): the cache is never appended to, its step is the position, and
     // only a verify reads more than the last row's logits.
@@ -1335,7 +1337,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     var captured: [64]abi.Array = undefined;
     if (ids.len > captured.len) return error.PluginForwardUnsupported;
     @memset(captured[0..ids.len], .{});
-    const mode: abi.Mode = if (capture) .verify else if (rows == 1) .decode else if (ctx.spec_verify) .verify else .prefill;
+    const mode: abi.Mode = if (capture and !prompt_capture) .verify else if (rows == 1) .decode else if (ctx.spec_verify) .verify else .prefill;
     // The ANE prefill programs (`--ane-prefill`) serve prompt chunks only.
     const offload: ?abi.Offload = if (mode == .prefill and xfm.ane_prefill != null) xfm.aneOffload() else null;
     var ablated: Ablated = .{};
@@ -1346,7 +1348,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     const f: abi.Forward = .{
         .mode = mode,
         .row_exact = xfm.config.dflash_bound,
-        .logits = if (!head or drop_logits) .none else if (last_row and !capture and !ctx.spec_verify) .last_row else .all_rows,
+        .logits = if (!head or drop_logits) .none else if (last_row and (!capture or prompt_capture) and !ctx.spec_verify) .last_row else .all_rows,
         .want_hidden = want_hidden,
         .rows = rows,
         .tokens = .{},
@@ -1376,6 +1378,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         .prompt_spans = if (mode == .prefill) .of(ctx.prompt_spans) else .{},
         .ssm_checkpoints = if (mode == .prefill) .of(ctx.ssm_cp_positions) else .{},
         .prefill = ctx.prefill,
+        .capture = prompt_capture,
     };
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);

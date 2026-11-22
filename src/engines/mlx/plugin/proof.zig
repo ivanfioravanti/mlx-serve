@@ -678,6 +678,56 @@ test "plugin forward: a prompt forward hands the plugin the host's prefill count
     try testing.expect(!T.saw_progress);
 }
 
+// Bar: a prompt forward that captures stays a prefill (its spans, last-row logits, the capture flag); a capture outside
+// the prompt is a verify over every row.
+test "plugin forward: a capturing prompt forward is a prefill with last-row logits; a capture outside the prompt is a verify" {
+    const T = struct {
+        var mode: abi.Mode = .decode;
+        var logits: abi.Logits = .none;
+        var capture = false;
+        var n_spans: usize = 0;
+        fn forward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            mode = f.mode;
+            logits = f.logits;
+            capture = f.capture;
+            n_spans = f.prompt_spans.len;
+            return llama.table.forward(m, f, out);
+        }
+        const table: abi.ModelTable = blk: {
+            var t = llama.table;
+            t.forward = &forward;
+            break :blk t;
+        };
+    };
+    var b: Served = undefined;
+    try b.open(.{}, 0x5a19);
+    defer b.close();
+    b.xfm.plugin.?.table = &T.table;
+    b.xfm.config.plugin.?.parsed.caps.prompt_last_row = true;
+    var s: Slot = undefined;
+    try s.init(b.layers);
+    defer s.deinit();
+    var none: [0]SSMCacheEntry = .{};
+    s.ctx.ssm_entries = &none;
+    s.ctx.capture_ssm_seq = true;
+    s.ctx.last_row_logits = true;
+    s.ctx.prefill = true;
+    s.ctx.prompt_spans = &.{5};
+    var g = ops.Graph.init(testing.allocator, fixture.stream());
+    defer g.deinit();
+    _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{ 7, 8, 9, 10, 11 })));
+    try testing.expectEqual(abi.Mode.prefill, T.mode);
+    try testing.expectEqual(abi.Logits.last_row, T.logits);
+    try testing.expect(T.capture);
+    try testing.expectEqual(@as(usize, 1), T.n_spans);
+    s.ctx.prefill = false;
+    s.ctx.prompt_spans = &.{};
+    _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{ 12, 13 })));
+    try testing.expectEqual(abi.Mode.verify, T.mode);
+    try testing.expectEqual(abi.Logits.all_rows, T.logits);
+    try testing.expect(!T.capture);
+}
+
 test "plugin forward: a whole-prompt prefill hands the plugin the engine's span ends and checkpoint positions, and its checkpoint reaches the engine's list" {
     const T = struct {
         var spans: [4]u64 = @splat(0);
