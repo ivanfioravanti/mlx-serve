@@ -653,7 +653,7 @@ pub fn batches(g: *const Graph, w: *const Body, h: Array, slots: c_int) bool {
 
 /// `attend` for stacked prompts: slot i's `c.rows` rows of the visit's prep, read as that slot's own sequence (its
 /// cache, its position) and set back in slot order.
-fn attendStacked(c: *block.Ctx, L: *const Layer, cfg: *const Config, p: *const Prep, sinks: Array) !Array {
+fn attendStacked(c: *block.Ctx, L: *const Layer, cfg: *const Config, p: *const Prep, sinks: Array, opens: ?[]Open) !Array {
     const g = c.g;
     const n = c.caches.len;
     if (n > max_slots) return error.TooManySlots;
@@ -674,7 +674,7 @@ fn attendStacked(c: *block.Ctx, L: *const Layer, cfg: *const Config, p: *const P
             .bias = p.bias,
             .rel = try g.sliceAxis(p.rel, 1, at, at + r),
         };
-        reads[i] = try attend(&one, L, cfg, &pi, try g.sliceAxis(sinks, 1, at, at + r), null, false);
+        reads[i] = try attend(&one, L, cfg, &pi, try g.sliceAxis(sinks, 1, at, at + r), if (opens) |os| &os[i] else null, false);
     }
     return g.concat(reads[0..n], 1);
 }
@@ -1006,7 +1006,9 @@ pub fn convState(g: *Graph, st: Array, kp: Array, vp: Array, op: Array, xm: Arra
 /// One visit of one sequence's rows `[1, S, D]`: `layers.layerForward`, or null where the kernels do not run (nothing
 /// is appended then). `bank` is the last pass's bank and normed output on a later loop pass; `open` a draft verify's
 /// visit. Batched slots (`c.slots` > 1) are the rows, each a sequence of its own with its own cache and conv state.
-pub fn visit(c: *block.Ctx, L: *const Layer, w: *const Body, h: Array, blocks: ?Array, bank: ?[2]Array, open: ?*Open) !?layers.Post {
+/// `slot_opens`: batched slots' verify of their rows (one `Open` a slot, in slot order): each slot's rows read its cache
+/// with its own behind them and append nothing; each slot's window lands in its `Open`.
+pub fn visit(c: *block.Ctx, L: *const Layer, w: *const Body, h: Array, blocks: ?Array, bank: ?[2]Array, open: ?*Open, slot_opens: ?[]Open) !?layers.Post {
     const g = c.g;
     const cfg = &w.cfg;
     if (!runs(g, L, cfg, h)) return null;
@@ -1018,11 +1020,21 @@ pub fn visit(c: *block.Ctx, L: *const Layer, w: *const Body, h: Array, blocks: ?
     const one = c.rows == 1 and !batch;
     const p = (try prep(g, L, cfg, &f.proj, f.dyn, st, if (one and L.global) layers.stepTau(cfg, total) else 1.0, if (one) keysSeen(L, cfg, total) else 0)) orelse return null;
     const fuse = one and open == null and oFormat(&L.o, ops.dtype(h)) != null;
-    const read = if (batch and c.rows > 1) try attendStacked(c, L, cfg, &p, f.proj[3]) else if (batch) try attendSlots(c, L, cfg, &p, f.proj[3]) else try attend(c, L, cfg, &p, f.proj[3], open, fuse);
+    const read = if (batch and (c.rows > 1 or slot_opens != null)) try attendStacked(c, L, cfg, &p, f.proj[3], slot_opens) else if (batch) try attendSlots(c, L, cfg, &p, f.proj[3]) else try attend(c, L, cfg, &p, f.proj[3], open, fuse);
     const m = try mid(g, L, w, read, if (fuse) p.gate else null, h, f.normed, blocks, st, f.messages);
     const t = try experts(g, L, cfg, &m, f.proj[4], f.proj[5], st, open);
     // Every path through `experts` meets here: a capture keeps the rows' conv inputs behind the old state, written
     // before the state is replaced (`st` is the cache's own array).
+    if (slot_opens) |os| {
+        // Each slot's window `[K - 1 + rows, .]`: its state, then its rows' conv inputs; nothing reaches the caches.
+        const rows = try g.astype(try g.concat(&.{ f.proj[4], f.proj[5], m.op, t.xm }, 2), .float32);
+        const all = try g.concat(&.{ st, try g.reshape(rows, &.{ c.slots, c.rows, -1 }) }, 1);
+        for (os, 0..) |*o, i| {
+            const at: c_int = @intCast(i);
+            o.window = try o.g.keep(try g.sliceAxis(all, 0, at, at + 1));
+        }
+        return .{ .h = t.h, .blocks = m.blocks };
+    }
     if (c.capture_spec and open == null) {
         const rows = try g.astype(try g.concat(&.{ f.proj[4], f.proj[5], m.op, t.xm }, 2), .float32);
         // Stacked prompts: each slot's span behind its own state, written to it by `state.put`.

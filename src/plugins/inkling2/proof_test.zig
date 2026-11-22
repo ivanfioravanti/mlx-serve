@@ -278,6 +278,120 @@ test "inkling2 proof: a verified block's kept rows leave the state a forward of 
     }
 }
 
+/// One slot's verify of `block` from `at`: its rows' logits through an open forward (nothing appended), then its first
+/// `kept` rows committed, then the next step's row.
+const VerifyOut = struct { rows: []f32, next: []f32 };
+
+fn openVerifyAlone(a: std.mem.Allocator, s: *Setup, cache: *test_cache.TestCache, at: usize, width: usize, kept: usize) !VerifyOut {
+    const m: *plugin.Loaded = @ptrCast(@alignCast(s.pack.model));
+    const visits = s.pack.parsed.shell.num_hidden_layers;
+    var g = ops.Graph.init(a, m.base.s);
+    defer g.deinit();
+    const opens = try a.alloc(kernels.Open, visits);
+    defer a.free(opens);
+    @memset(opens, .{ .g = &g });
+    var sp: plugin.Spec = .{ .visits = &.{}, .keep = 4 };
+    defer {
+        m.base.weights.spec = null;
+        for ([_]mlx.mlx_array{ sp.ring, sp.held }) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+    }
+    m.base.weights.spec = &sp;
+    sp.opens = opens;
+    const rows = try step(a, &s.pack, cache, prompt[at .. at + width], at, .all_rows);
+    sp.opens = null;
+    try testing.expectEqual(@as(u64, at), test_cache.ops.len(cache.handle(), 0));
+    try commitKept(&g, m, cache, opens, at, kept);
+    return .{ .rows = rows, .next = try step(a, &s.pack, cache, prompt[at + kept .. at + kept + 1], at + kept, .last_row) };
+}
+
+fn commitKept(g: *ops.Graph, m: *plugin.Loaded, cache: *test_cache.TestCache, opens: []const kernels.Open, at: usize, kept: usize) !void {
+    const run_mod = @import("../../sdk/bases/run.zig");
+    var h = [_]abi.Handle{cache.handle()};
+    const pos = [_]u32{@intCast(at)};
+    const r: run_mod.Run = .{ .mode = .verify, .rows = @intCast(kept), .positions = &pos, .caches = &h, .cache_ops = &test_cache.ops };
+    var c = r.ctx(g, &m.base.shared);
+    try kernels.commit(&c, &m.base.weights.body.cfg, opens, @intCast(kept));
+    try testing.expectEqual(@as(u64, at + kept), test_cache.ops.len(cache.handle(), 0));
+}
+
+// Bar: N slots of different lengths verify blocks of different widths in ONE batched open forward (each padded to the
+// widest by repeating its last token): every slot's real rows are what its own open verify serves, nothing reaches a
+// cache, and each slot's kept rows committed from its own windows leave the next step the one-slot round leaves.
+test "inkling2 proof: batched slots' open verify and per-slot commit serve what each slot's own round does" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Setup.init(a, true);
+    defer s.deinit(a);
+    const m: *plugin.Loaded = @ptrCast(@alignCast(s.pack.model));
+    const visits = s.pack.parsed.shell.num_hidden_layers;
+    const lens = [8]usize{ 3, 5, 7, 9, 11, 4, 6, 8 };
+    const widths = [8]usize{ 2, 3, 4, 5, 6, 8, 7, 2 };
+    const kepts = [8]usize{ 1, 3, 2, 5, 4, 6, 1, 2 };
+    for ([_]usize{ 2, 4, 8 }) |n| {
+        var width: usize = 0;
+        for (widths[0..n]) |w| width = @max(width, w);
+        // Each slot alone.
+        var want: [8]VerifyOut = undefined;
+        for (0..n) |i| {
+            var cache = try test_cache.TestCache.init(a, visits);
+            defer cache.deinit();
+            a.free(try step(a, &s.pack, &cache, prompt[0..lens[i]], 0, .last_row));
+            want[i] = try openVerifyAlone(a, &s, &cache, lens[i], widths[i], kepts[i]);
+        }
+        defer for (want[0..n]) |w| {
+            a.free(w.rows);
+            a.free(w.next);
+        };
+        // All at once.
+        var caches: [8]test_cache.TestCache = undefined;
+        for (caches[0..n], 0..) |*c, i| {
+            c.* = try test_cache.TestCache.init(a, visits);
+            a.free(try step(a, &s.pack, c, prompt[0..lens[i]], 0, .last_row));
+        }
+        defer for (caches[0..n]) |*c| c.deinit();
+        var g = ops.Graph.init(a, m.base.s);
+        defer g.deinit();
+        const opens = try a.alloc(kernels.Open, visits * n);
+        defer a.free(opens);
+        @memset(opens, .{ .g = &g });
+        var sp: plugin.Spec = .{ .visits = &.{}, .keep = 4 };
+        defer m.base.weights.spec = null;
+        m.base.weights.spec = &sp;
+        sp.batch_opens = opens;
+        var tokens: [8 * 8]u32 = undefined;
+        var positions: [8]u32 = undefined;
+        var handles: [8]abi.Handle = undefined;
+        var slot_ids: [8]u32 = undefined;
+        for (0..n) |i| {
+            for (0..width) |k| tokens[i * width + k] = prompt[lens[i] + @min(k, widths[i] - 1)];
+            positions[i] = @intCast(lens[i]);
+            handles[i] = caches[i].handle();
+            slot_ids[i] = @intCast(i);
+        }
+        var out: abi.ForwardOut = .{};
+        const v = s.pack.table.forward(s.pack.model, &.{ .mode = .batched_rows, .logits = .all_rows, .rows = @intCast(width), .tokens = .of(tokens[0 .. n * width]), .slots = .of(slot_ids[0..n]), .positions = .of(positions[0..n]), .caches = .of(handles[0..n]), .cache_ops = &test_cache.ops }, &out);
+        sp.batch_opens = null;
+        try testing.expect(v.isOk());
+        if (out.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.hidden.ctx });
+        const got = try conformance.consumeF32(a, out.logits);
+        defer a.free(got);
+        for (0..n) |i| {
+            try testing.expectEqual(@as(u64, lens[i]), test_cache.ops.len(caches[i].handle(), 0));
+            try expectRows(got[i * width * VOCAB ..][0 .. widths[i] * VOCAB], want[i].rows);
+            // Slot i's Opens: one a visit, `n` apart.
+            const mine = try a.alloc(kernels.Open, visits);
+            defer a.free(mine);
+            for (mine, 0..) |*o, vi| o.* = opens[vi * n + i];
+            try commitKept(&g, m, &caches[i], mine, lens[i], kepts[i]);
+            const next = try step(a, &s.pack, &caches[i], prompt[lens[i] + kepts[i] .. lens[i] + kepts[i] + 1], lens[i] + kepts[i], .last_row);
+            defer a.free(next);
+            try expectRows(next, want[i].next);
+        }
+    }
+}
+
 /// One batched decode step: slot i's `tokens[i]` at `positions[i]` on `caches[i]`; the rows' logits.
 fn batchedStep(a: std.mem.Allocator, pack: *conformance.Loaded, caches: []test_cache.TestCache, tokens: []const u32, positions: []const u32) ![]f32 {
     var handles: [8]abi.Handle = undefined;

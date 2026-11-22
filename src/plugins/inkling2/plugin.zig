@@ -52,6 +52,8 @@ pub const Spec = struct {
     clock: u64 = 0,
     /// Set for a verify: the visits read the caches without appending and leave their rows here.
     opens: ?[]kernels.Open = null,
+    /// Set for a batched slots' verify: `visits x slots` Opens, a visit's slots together in slot order.
+    batch_opens: ?[]kernels.Open = null,
     /// A verify's taps `[1, S, taps * hidden]`, held until its accept.
     held: Array = .{},
 
@@ -182,6 +184,8 @@ pub const Model = struct {
 
         const visits = cfg.visits();
         const spec: ?*Spec = if (batched) null else w.spec;
+        const batch_opens: ?[]kernels.Open = if (batched) (if (w.spec) |sp| sp.batch_opens else null) else null;
+        const n_slots: usize = @intCast(run.slots);
         var taps: [config.max_taps]ops.Array = undefined;
         for (0..visits) |v| {
             const at = cfg.visit(@intCast(v));
@@ -209,7 +213,8 @@ pub const Model = struct {
             const L = &w.body.layers[at.layer];
             const messaged = at.pass > 0;
             const open: ?*kernels.Open = if (spec) |sp| (if (sp.opens) |o| &o[v] else null) else null;
-            const stepped: ?layers.Post = try kernels.visit(&c, L, &w.body, h, blocks, if (messaged) .{ bank, bank_partial } else null, open);
+            const slot_opens: ?[]kernels.Open = if (batch_opens) |bo| bo[v * n_slots .. (v + 1) * n_slots] else null;
+            const stepped: ?layers.Post = try kernels.visit(&c, L, &w.body, h, blocks, if (messaged) .{ bank, bank_partial } else null, open, slot_opens);
             // A verify's rows must not reach the caches, nor batched slots the one-sequence chain.
             if (stepped == null and (open != null or batched)) return error.Inkling2KernelVisit;
             const out = stepped orelse try layers.layerForward(L, &w.body, &c, h, blocks, if (messaged) try layers.messagesFor(&lg, L, bank, bank_partial) else null);
