@@ -315,12 +315,16 @@ pub fn ssmCapturePos(stride: usize, abs_end: usize, dense_low_grid: bool) bool {
     return dense_low_grid and abs_end % SSM_GRID_LOW_DENSE_STRIDE == 0 and abs_end <= SSM_GRID_LOW_DENSE_TOP;
 }
 
+/// Past this many rows one forward over a restored tail, with its capture and cut, is slower than the chunk loop's split.
+pub const ONE_FORWARD_TAIL_ROWS_MAX: usize = 640;
+
 /// PURE: the rows before the snapshot backoff of a restored tail (`offset` > 0) that runs as one forward, its checkpoint
 /// cut from the forward's capture; 0 = the chunk loop's split. Only a tail of at most one chunk, longer than the
-/// backoff, that crosses no position the chunk loop would checkpoint at.
+/// backoff, at most `ONE_FORWARD_TAIL_ROWS_MAX` rows, that crosses no position the chunk loop would checkpoint at.
 pub fn oneForwardTailRows(offset: usize, prefix_len: usize, backoff: usize, chunk: usize, stride: usize, dense_low_grid: bool) usize {
     if (offset == 0 or backoff >= prefix_len or prefix_len + 1 > chunk) return 0;
     const rows = prefix_len - backoff;
+    if (rows > ONE_FORWARD_TAIL_ROWS_MAX) return 0;
     for (offset + 1..offset + rows + 1) |p| if (ssmCapturePos(stride, p, dense_low_grid)) return 0;
     return rows;
 }
@@ -1342,4 +1346,9 @@ test "oneForwardTailRows: a restored tail of one chunk past the backoff runs who
     try std.testing.expectEqual(@as(usize, 0), oneForwardTailRows(65500, 139, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
     try std.testing.expectEqual(@as(usize, 0), oneForwardTailRows(8150, 139, SSM_SNAPSHOT_BACKOFF, 8192, 65536, true));
     try std.testing.expectEqual(@as(usize, 109), oneForwardTailRows(8150, 139, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
+    // A tail past the row bound splits, a 4k tail included.
+    const most = ONE_FORWARD_TAIL_ROWS_MAX + SSM_SNAPSHOT_BACKOFF;
+    try std.testing.expectEqual(ONE_FORWARD_TAIL_ROWS_MAX, oneForwardTailRows(12, most, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
+    try std.testing.expectEqual(@as(usize, 0), oneForwardTailRows(12, most + 1, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
+    try std.testing.expectEqual(@as(usize, 0), oneForwardTailRows(12, 4019, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
 }
