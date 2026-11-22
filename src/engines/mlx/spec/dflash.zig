@@ -21,6 +21,8 @@ const CommittedArgmax = @import("verify.zig").CommittedArgmax;
 const DFLASH_COPY_MATCH = @import("dflash_tree.zig").DFLASH_COPY_MATCH;
 const DFLASH_COPY_WINDOW = @import("dflash_tree.zig").DFLASH_COPY_WINDOW;
 const DrafterStepResult = @import("drafter.zig").DrafterStepResult;
+const Slot = @import("../slot.zig").Slot;
+const slotSpecMode = @import("wiring.zig").slotSpecMode;
 const Generator = @import("../generate/generator.zig").Generator;
 const MTP_EV_EMA_BETA = @import("mtp/depth.zig").MTP_EV_EMA_BETA;
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
@@ -1308,6 +1310,75 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         try testing.expectEqual(want, got.items.len);
         for (serial, got.items) |a, b| try testing.expectEqual(a, b);
     }
+}
+
+// Bar: a DFlash request its runtime gate stops goes on in PLD, and the stream is still serial greedy's.
+test "dflash: a request the runtime gate stops goes on in PLD, its tokens serial greedy's" {
+    if (mlx.noGpuBackend()) return;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_trunk = std.testing.tmpDir(.{});
+    defer tmp_trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_path = trunk_buf[0..try tmp_trunk.dir.realPath(io, &trunk_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, s);
+    var tmp_asst = std.testing.tmpDir(.{});
+    defer tmp_asst.cleanup();
+    var asst_buf: [512]u8 = undefined;
+    const asst_path = asst_buf[0..try tmp_asst.dir.realPath(io, &asst_buf)];
+    try dflash_mod.TinyFix.writeAssistant(io, tmp_asst.dir, asst_path, s);
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    defer config.deinit(allocator);
+    var tok_dummy: Tokenizer = undefined; // never read by the Generator
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const want: usize = 64;
+
+    var serial: [want]u32 = undefined;
+    {
+        var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{ .skip_lazy_preforward = true });
+        defer gen.deinit(allocator);
+        for (&serial) |*t| t.* = (try gen.next(allocator)).?;
+    }
+
+    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
+    defer xfm.deinit();
+    var dm = try dflash_mod.loadDflash(io, allocator, s, asst_path);
+    defer dm.deinit();
+    try dm.bind(&xfm);
+    // A floor no round reaches: the gate stops DFlash after its warmup.
+    var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
+        .dflash_enabled = true,
+        .dflash = &dm,
+        .dflash_min_accepted_per_round = 100,
+        .pld_enabled = true,
+    });
+    defer gen.deinit(allocator);
+    var slot: Slot = undefined;
+    slot.enable_mtp = false;
+    slot.enable_drafter = true;
+    slot.enable_pld = true;
+    var got = std.ArrayList(u32).empty;
+    defer got.deinit(allocator);
+    var pld_ticks: usize = 0;
+    while (true) {
+        const tokens = switch (slotSpecMode(&slot, &gen)) {
+            .dflash => ((try gen.nextDflash(allocator)) orelse break).tokens,
+            .pld => blk: {
+                pld_ticks += 1;
+                break :blk ((try gen.nextPld(allocator, 5, 3)) orelse break).tokens;
+            },
+            else => return error.TestUnexpectedResult,
+        };
+        defer allocator.free(tokens);
+        try got.appendSlice(allocator, tokens);
+    }
+    try testing.expectEqual(@as(u64, DFLASH_GATE_WARMUP), gen.dflash_attempted);
+    try testing.expect(pld_ticks > 0);
+    try testing.expectEqualSlices(u32, &serial, got.items);
 }
 
 /// One seeded temperature-1 request through DSpark's Markov arm on the tiny pair: the emitted ids and each round's

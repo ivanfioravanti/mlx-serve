@@ -69,6 +69,7 @@ pub fn specInitWiring(
     // loaded DFlash sidecar is an explicit choice (`--drafter` or the pack's
     // own `drafter/`) while the MTP head ships with the checkpoint;
     // `--no-drafter` (or `enable_drafter:false`) hands the round back to MTP.
+    // PLD is armed beside DFlash for the rest of a request DFlash's runtime gate stops.
     const use_dflash = enable_drafter and has_dflash;
     const use_mtp = !use_dflash and enable_mtp and has_mtp;
     const use_drafter = !use_mtp and !use_dflash and enable_drafter and has_drafter;
@@ -76,7 +77,7 @@ pub fn specInitWiring(
         .use_mtp = use_mtp,
         .use_drafter = use_drafter,
         .use_dflash = use_dflash,
-        .use_pld = !use_mtp and !use_dflash and !use_drafter and enable_pld,
+        .use_pld = !use_mtp and !use_drafter and enable_pld,
         .native_intent = false,
     };
 }
@@ -140,7 +141,7 @@ pub fn slotSpecMode(slot: *const Slot, gen: *const Generator) SpecTickMode {
         gen.mtp != null,
         slot.enable_drafter,
         gen.drafter != null,
-        gen.dflash != null,
+        gen.dflash != null and !gen.dflash_yielded,
         slot.enable_pld,
         gen.pld_enabled,
         gen.dspark_enabled,
@@ -288,14 +289,14 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
     // DFlash rides the enable_drafter switch: dflash > MTP > drafter > PLD.
     {
         const w = specInitWiring(false, false, false, false, false, true, false, true, true);
-        try testing.expect(!w.use_mtp and w.use_dflash and !w.use_drafter and !w.use_pld);
+        try testing.expect(!w.use_mtp and w.use_dflash and !w.use_drafter and w.use_pld);
     }
     // A loaded drafter outranks the checkpoint's own MTP head: the sidecar
     // is an explicit choice (`--drafter` or the in-dir `drafter/`), the head
     // ships with every pack; `--no-drafter` restores MTP by not loading it.
     {
         const w = specInitWiring(false, false, false, true, true, true, false, true, true);
-        try testing.expect(w.use_dflash and !w.use_mtp and !w.use_pld);
+        try testing.expect(w.use_dflash and !w.use_mtp and w.use_pld);
     }
     // enable_drafter:false on the request hands the round back to MTP.
     {

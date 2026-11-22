@@ -323,8 +323,8 @@ pub fn yieldSpecToCompany(self: *Generator, mode: []const u8) void {
 /// DFlash runtime economics gate. Sticky within the request: once a
 /// `DFLASH_GATE_WARMUP`-round sample proves the block-parallel path yields
 /// less than its width-normalized request-class threshold, subsequent
-/// ticks use the regular pipelined decoder through `nextDflash`'s entry
-/// fallback.
+/// ticks go to PLD where it is armed (`dflash_yielded`), else to the regular
+/// pipelined decoder through `nextDflash`'s entry fallback.
 pub fn checkDflashRuntimeGate(self: *Generator) void {
     if (self.spec_disabled_runtime or self.dflash_pol != null) return;
     if (!dflashGateShouldDisable(
@@ -338,10 +338,10 @@ pub fn checkDflashRuntimeGate(self: *Generator) void {
     const avg = @as(f32, @floatFromInt(self.dflash_accepted_tokens)) /
         @as(f32, @floatFromInt(self.dflash_attempted));
     log.info(
-        "  dflash=disabled (runtime yield {d:.2} accepted/round < {d:.2} after {d} attempts)\n",
-        .{ avg, self.dflash_min_accepted_per_round, self.dflash_attempted },
+        "  dflash=disabled (runtime yield {d:.2} accepted/round < {d:.2} after {d} attempts){s}\n",
+        .{ avg, self.dflash_min_accepted_per_round, self.dflash_attempted, if (self.pld_enabled) ": pld takes the rest" else "" },
     );
-    self.spec_disabled_runtime = true;
+    if (self.pld_enabled) self.dflash_yielded = true else self.spec_disabled_runtime = true;
 }
 
 /// Runtime acceptance gate for the drafter: after warmup, if the per-draft

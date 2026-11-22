@@ -62,7 +62,7 @@ pub fn slotMtpGroupable(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedGdnDecode()) return false;
     if (gen.ctx.ssm_entries == null and t.hasRecurrentLayers()) return false;
-    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.drafter != null, gen.dflash != null, slot.enable_pld, gen.pld_enabled, gen.dspark_enabled) == .mtp;
+    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.drafter != null, gen.dflash != null and !gen.dflash_yielded, slot.enable_pld, gen.pld_enabled, gen.dspark_enabled) == .mtp;
 }
 
 pub const Planner = @import("mtp_group_planner.zig");

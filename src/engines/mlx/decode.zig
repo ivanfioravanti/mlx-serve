@@ -281,7 +281,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
         gen.mtp != null,
         slot.enable_drafter,
         gen.drafter != null,
-        gen.dflash != null,
+        gen.dflash != null and !gen.dflash_yielded,
         slot.enable_pld,
         gen.pld_enabled,
         gen.dspark_enabled,

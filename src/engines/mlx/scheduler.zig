@@ -1351,6 +1351,36 @@ test "a load refused for memory unloads idle models one at a time until it loads
     try t.expectEqual(@as(usize, 0), c.unloaded);
 }
 
+// Bar: a DFlash slot yielding to company ticks plain and batches (PLD never takes it); only the runtime gate hands to PLD.
+test "a DFlash slot that yields to company ticks plain and batches; a runtime-gate yield ticks PLD" {
+    var dm: @import("spec/dflash/dflash.zig").DflashModel = undefined;
+    var gen: Generator = undefined;
+    gen.mtp = null;
+    gen.drafter = null;
+    gen.dflash = &dm;
+    gen.pld_enabled = true;
+    gen.dspark_enabled = false;
+    gen.spec_disabled_runtime = false;
+    gen.dflash_yielded = false;
+    var slot: Slot = undefined;
+    slot.planner_force_plain = false;
+    slot.enable_mtp = false;
+    slot.enable_drafter = true;
+    slot.enable_pld = true;
+    slot.legacy_gen = gen;
+    const g = &slot.legacy_gen.?;
+    try testing.expectEqual(SpecTickMode.dflash, slotSpecMode(&slot, g));
+    try testing.expect(!slotTicksRegular(&slot));
+    g.yieldSpecToCompany("dflash");
+    try testing.expectEqual(SpecTickMode.dflash, slotSpecMode(&slot, g));
+    try testing.expect(slotTicksRegular(&slot));
+    g.spec_disabled_runtime = false;
+    g.dflash_yielded = true;
+    try testing.expectEqual(SpecTickMode.pld, slotSpecMode(&slot, g));
+    g.pld_enabled = false;
+    try testing.expectEqual(SpecTickMode.regular, slotSpecMode(&slot, g));
+}
+
 test "a live MTP slot never ticks regular, an unarmed one always does" {
     try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, true, true, false));
     try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, true, false, false, true, false, false));

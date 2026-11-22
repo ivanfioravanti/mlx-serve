@@ -88,7 +88,7 @@ fn logShortGen(slot: *Slot, reason: []const u8) void {
         gen.mtp != null,
         slot.enable_drafter,
         gen.drafter != null,
-        gen.dflash != null,
+        gen.dflash != null and !gen.dflash_yielded,
         slot.enable_pld,
         gen.pld_enabled,
         gen.dspark_enabled,

@@ -454,6 +454,8 @@ pub const Generator = struct {
     spec_disabled_runtime: bool = false,
     /// Why `spec_disabled_runtime` was set, for `[spec-stats]`.
     spec_disable_reason: SpecDisableReason = .none,
+    /// DFlash's runtime gate stopped it with PLD armed: PLD drives the rest of the request. Sticky.
+    dflash_yielded: bool = false,
     /// Adaptive serial controller: which arm this request is on and the KV bucket it was decided in.
     mtp_adaptive: MtpAdaptive = .{},
     /// This request has released the module-owned MTP head (sticky serial arm reached a serial

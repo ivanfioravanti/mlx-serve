@@ -207,7 +207,7 @@ pub fn commitForcedTokens(self: *Generator, allocator: std.mem.Allocator, forced
     const shape = [_]c_int{ 1, @intCast(input.items.len) };
     const tok_input = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 2, .int32);
     defer _ = mlx.mlx_array_free(tok_input);
-    const dflash_live = self.dflash != null and self.dflash_ctx != null and !self.spec_disabled_runtime;
+    const dflash_live = self.dflash != null and self.dflash_ctx != null and !self.spec_disabled_runtime and !self.dflash_yielded;
     const caps = try allocator.alloc(mlx.mlx_array, if (dflash_live) self.dflash.?.config.target_layer_ids.len else 0);
     defer {
         for (caps) |a| _ = mlx.mlx_array_free(a);
