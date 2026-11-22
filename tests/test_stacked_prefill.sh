@@ -3,6 +3,8 @@
 # Caps.stacks_prompts): [1] four cold prompts sent at once each decode what they decode alone after (raw completions,
 # greedy; a first divergence at the alone run's near-tie is acquitted, as the batched rows round apart); [2] the pass
 # engaged for them (its log line); [3] a lone request never stacks, and one after the stack is no restore.
+#   [4] four requests behind one cached prefix (a primed system prompt, each its own tail) stack their restored tails in
+#   one pass and each decodes what it decodes alone.
 #   With MLX_SERVE_DIAG=stacked-prefill-fail the pass fails after its first slot: [2] becomes its failure line and [1]
 #   must still hold (every slot reset and prefilled alone).
 #
@@ -76,17 +78,42 @@ if (after.get("usage", {}).get("prompt_tokens_details") or {}).get("cached_token
     print("❌ FAIL: a fresh prompt after the stack was taken as restored"); ec = 1
 else:
     print("✅ a fresh prompt after the stack prefills cold")
-for i in range(4):
-    a, b = alone[i], got[i]
-    for k in range(min(len(a["ids"]), len(b["tokens"]))):
-        if a["ids"][k] != b["tokens"][k]:
-            top = sorted((a["top_logprobs"][k] or {}).values(), reverse=True)
-            gap = top[0] - top[1] if len(top) > 1 else 99.0
-            ok = gap <= tie
-            print(f"{'✅' if ok else '❌ FAIL:'} prompt {i}: {'near-tie acquitted' if ok else 'diverged'} at token {k} (alone top-2 gap {gap:.3f} nats, bound {tie})")
-            ec |= not ok
-            break
-    else:
-        print(f"✅ prompt {i}: stacked decodes what it decodes alone")
+def compare(alone, got, what):
+    global ec
+    for i in range(len(alone)):
+        a, b = alone[i], got[i]
+        for k in range(min(len(a["ids"]), len(b["tokens"]))):
+            if a["ids"][k] != b["tokens"][k]:
+                top = sorted((a["top_logprobs"][k] or {}).values(), reverse=True)
+                gap = top[0] - top[1] if len(top) > 1 else 99.0
+                ok = gap <= tie
+                print(f"{'✅' if ok else '❌ FAIL:'} {what} {i}: {'near-tie acquitted' if ok else 'diverged'} at token {k} (alone top-2 gap {gap:.3f} nats, bound {tie})")
+                ec |= not ok
+                break
+        else:
+            print(f"✅ {what} {i}: stacked decodes what it decodes alone")
+compare(alone, got, "prompt")
+# [4] One cached prefix, four tails: the prefix primed alone, then the four at once (their restored tails stack), then
+# each alone (a restore of its own tail).
+prefix = "[shared] " + " ".join(f"{words[(k * 3) % len(words)]}{k % 11}" for k in range(700)) + "."
+def tailed(i):
+    return prefix + f" [user {i}] " + " ".join(f"{words[(i * 7 + k) % len(words)]}{k % 5}" for k in range(40 + 6 * i)) + ". Next:"
+call(prefix, False)
+warm_needle = "[prefill] stacked pass failed" if fail else "restored tails in one forward"
+def warm_lines():
+    try: return sum(warm_needle in l for l in open(slog))
+    except OSError: return 0
+wgot = [None] * 4
+th = [threading.Thread(target=lambda i=i: wgot.__setitem__(i, call(tailed(i), False))) for i in range(4)]
+before = warm_lines()
+[t.start() for t in th]; [t.join() for t in th]
+walone = [call(tailed(i)) for i in range(4)]
+for a in walone:
+    a["ids"] = [str(t) for t in post("/tokenize", {"content": "".join(a["tokens"])})["tokens"]]
+if warm_lines() == before:
+    print(f"❌ FAIL: four tails behind one cached prefix never logged {warm_needle!r}"); ec = 1
+else:
+    print("✅ the restored tails " + ("failed their pass and reset" if fail else "stacked"))
+compare(walone, wgot, "tail")
 sys.exit(ec)
 PY

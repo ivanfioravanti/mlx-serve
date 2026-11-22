@@ -241,7 +241,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         var stack: [prefill_stacked.MAX_SLOTS]*Slot = undefined;
         const pk = prefill_stacked.pick(to_prefill[0..n_prefill], &stack);
         if (pk.n >= 2) {
-            if (prefill_stacked.run(stack[0..pk.n], pk.width, pk.left_out, pk.longest_left)) |_| {
+            if (prefill_stacked.run(stack[0..pk.n], pk.width, pk.warm, pk.left_out, pk.longest_left)) |_| {
                 // The stacked slots' prefills forward nothing: they start decoding first, ahead of any solo prefill.
                 prefill_stacked.stackedFirst(to_prefill[0..n_prefill]);
                 sch.queue_mu.lockUncancelable(sch.io);
