@@ -95,13 +95,13 @@ pub fn exchange(g: *Graph, L: *const layers.Layer, cfg: *const Config, x: Array,
     const send = host_abi.expertExchangeOf(h) orelse return null;
     const d = ops.shape(x)[2];
     const k: c_int = @intCast(cfg.top_k);
-    const mine = try partial(g, L, cfg, share, x, idx, weights);
-    const queued = mlx.mlx_vector_array_new_data(&[_]Array{mine}, 1);
-    defer _ = mlx.mlx_vector_array_free(queued);
-    try mlx.check(mlx.mlx_async_eval(queued));
     const flat = try g.reshape(x, &.{ s, d });
     const routes = try g.astype(try g.reshape(idx, &.{ s, k }), .uint32);
     const w32 = try g.astype(try g.reshape(weights, &.{ s, k }), .float32);
+    // The rows go out as soon as they exist: queued with this rank's share, the send waits for the whole batch.
+    try queue(&.{ flat, routes, w32 });
+    const mine = try partial(g, L, cfg, share, x, idx, weights);
+    try queue(&.{mine});
     var theirs: host_abi.Array = .{};
     const v = send(h.ctx, share.layer, .{ .ctx = flat.ctx }, .{ .ctx = routes.ctx }, .{ .ctx = w32.ctx }, &theirs);
     if (!v.isOk()) {
@@ -113,6 +113,12 @@ pub fn exchange(g: *Graph, L: *const layers.Layer, cfg: *const Config, x: Array,
     if (share.layer == 0) say(h, .info, "[dist] inkling2 experts engaged: {d} rows\n", .{s});
     const sum = try g.add(mine, try g.reshape(try g.adopt(.{ .ctx = theirs.ctx }), &.{ 1, s, d }));
     return try g.astype(sum, ops.dtype(x));
+}
+
+fn queue(xs: []const Array) !void {
+    const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_async_eval(v));
 }
 
 /// The worker's share of layer `layer`'s experts for rank 0's rows `x` `[t, d]`, routes `idx` `[t, k]` and weights
