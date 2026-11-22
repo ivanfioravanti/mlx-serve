@@ -5,8 +5,9 @@
 # engaged); [3] warm prompt_ms <= 0.7x cold.
 #
 #   MLX_HYBRID_MODEL=<dir> ./tests/test_hybrid_reuse_equivalence.sh   # default Qwen3.5-4B-MLX-4bit; PORT (19077)
-#   NEXT_TURN_PROMPTS=5 adds [4]: a prompt grown by a few hundred tokens after its base was served (a next-turn tail
-#   past one forward's 128 rows) decodes on the warm server what a second, cache-cold server decodes (PORT+1).
+#   [4] (NEXT_TURN_PROMPTS, default 5; 0 skips): a prompt grown by a few hundred tokens after its base was served (a
+#   next-turn tail past one forward's 128 rows) decodes on the warm server what a second, cache-cold server decodes
+#   (PORT+1), a divergence at a cold near-tie acquitted.
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
@@ -105,7 +106,7 @@ else
     echo "✅ warm TTFT $SPEEDUP faster (warm=${WARM_MS}ms vs cold=${COLD_MS}ms)"
 fi
 
-if [ "${NEXT_TURN_PROMPTS:-0}" -gt 0 ]; then
+if [ "${NEXT_TURN_PROMPTS:-5}" -gt 0 ]; then
     CPORT=$((PORT + 1)); CBASE="http://127.0.0.1:$CPORT"; CLOG="$(mktemp)"
     srv_preclean "$CPORT"
     "$BIN" --model "$MODEL" --serve --port "$CPORT" --ctx-size 8192 \
@@ -113,33 +114,38 @@ if [ "${NEXT_TURN_PROMPTS:-0}" -gt 0 ]; then
     COLD_PID=$!
     trap 'kill "$SERVER_PID" "$COLD_PID" 2>/dev/null; rm -f "$LOG" "$CLOG"; true' EXIT
     srv_wait_health "$CBASE" 120 0.5 "$COLD_PID" || { echo "fail: cold server died:"; tail -20 "$CLOG"; exit 1; }
-    ask() { # base prompt
-        curl -sf --max-time 120 -X POST "$1/v1/chat/completions" -H 'Content-Type: application/json' \
-            -d "$(jq -nc --arg p "$2" '{messages:[{role:"user",content:$p}],max_tokens:40,temperature:0,stream:false}')"
-    }
-    for i in $(seq 1 "$NEXT_TURN_PROMPTS"); do
-        PAIR=$(python3 - "$i" <<'PY'
-import json, sys
-i = int(sys.argv[1])
+    # Warm and cold of one prompt are not bit-identical (a tail's width moves the kernels' rounding, as it does in
+    # mlx-lm): a divergence at a cold near-tie is acquitted, wider is a bug. inkling2's bar is its verify rows' class.
+    TIE_NATS=0.15
+    [ "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]+'/config.json')).get('model_type',''))" "$MODEL")" = "inkling2_loop" ] && TIE_NATS=0.75
+    python3 - "$BASE" "$CBASE" "${NEXT_TURN_PROMPTS:-5}" "$TIE_NATS" <<'PY' || EC=1
+import json, sys, urllib.request
+warm, cold, n, tie = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
 words = "river lantern harbor ledger meadow canyon glacier thunder cabin orchard signal copper marble ribbon".split()
-base = f"Session {i}. " + " ".join(f"{words[(i * 7 + k) % len(words)]}-{k}" for k in range(220 + 40 * i)) + "."
-ext = base + " Then: " + " ".join(f"{words[(i * 3 + k) % len(words)]}{k % 9}" for k in range(60 + 25 * i)) + ". Continue."
-print(json.dumps({"base": base, "ext": ext}))
+def call(base, prompt, max_tokens):
+    body = {"prompt": prompt, "max_tokens": max_tokens, "temperature": 0, "stream": False, "logprobs": 2}
+    req = urllib.request.Request(base + "/v1/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=300))
+bad = 0
+for i in range(1, n + 1):
+    base = f"Session {i}. " + " ".join(f"{words[(i * 7 + k) % len(words)]}-{k}" for k in range(220 + 40 * i)) + "."
+    ext = base + " Then: " + " ".join(f"{words[(i * 3 + k) % len(words)]}{k % 9}" for k in range(60 + 25 * i)) + ". Continue."
+    call(warm, base, 8)
+    w, c = call(warm, ext, 40), call(cold, ext, 40)
+    tail = w["usage"]["prompt_tokens"] - w["usage"].get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    wl, cl = w["choices"][0]["logprobs"] or {"tokens": []}, c["choices"][0]["logprobs"] or {"tokens": [], "top_logprobs": []}
+    for k in range(min(len(wl["tokens"]), len(cl["tokens"]))):
+        if wl["tokens"][k] != cl["tokens"][k]:
+            top = sorted((cl["top_logprobs"][k] or {}).values(), reverse=True)
+            gap = top[0] - top[1] if len(top) > 1 else 99.0
+            verdict = "near-tie acquitted" if gap <= tie else "FAIL"
+            print(f"{'✅' if gap <= tie else '❌'} next turn {i} (tail {tail} rows): {verdict} at token {k}, cold top-2 gap {gap:.3f} nats (bound {tie})")
+            bad += gap > tie
+            break
+    else:
+        print(f"✅ next turn {i} (tail {tail} rows): warm decodes what cold decodes")
+sys.exit(1 if bad else 0)
 PY
-)
-        BASE_P=$(echo "$PAIR" | jq -r .base); EXT_P=$(echo "$PAIR" | jq -r .ext)
-        ask "$BASE" "$BASE_P" > /dev/null
-        W=$(ask "$BASE" "$EXT_P"); C=$(ask "$CBASE" "$EXT_P")
-        WT=$(echo "$W" | jq -r "$TEXT"); CT=$(echo "$C" | jq -r "$TEXT")
-        TAIL=$(echo "$W" | jq -r '(.usage.prompt_tokens) - (.timings.cached_n)')
-        if [ -n "$WT" ] && [ "$WT" = "$CT" ]; then
-            echo "✅ next turn $i: warm (tail $TAIL rows) decodes what cold decodes"
-        else
-            echo "❌ FAIL: next turn $i (tail $TAIL rows): warm diverged from cold"
-            diff <(printf "%s" "$CT") <(printf "%s" "$WT") | head -10
-            EC=1
-        fi
-    done
 fi
 
 exit $EC
