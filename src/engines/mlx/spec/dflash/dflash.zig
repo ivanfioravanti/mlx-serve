@@ -3769,6 +3769,25 @@ pub const TinyFix = struct {
         try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
     }
 
+    pub const MARKOV_RANK: usize = 64;
+
+    /// The tiny assistant with DSpark's vanilla Markov head (`markov_rank` at the root).
+    pub fn writeAssistantMarkov(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream) !void {
+        const cfg = try std.mem.replaceOwned(u8, testing.allocator, ASSISTANT_CONFIG, "\"block_size\": 4,", "\"block_size\": 4,\n  \"markov_rank\": 64,");
+        defer testing.allocator.free(cfg);
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = cfg });
+        const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir_path}, 0);
+        defer testing.allocator.free(st_path);
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        try putV1AssistantWeights(map, s, false, HIDDEN);
+        try putW(map, "markov_head.markov_w1.weight", VOCAB, MARKOV_RANK, 180, s);
+        try putW(map, "markov_head.markov_w2.weight", VOCAB, MARKOV_RANK, 181, s);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
     fn putV1AssistantWeights(map: mlx.mlx_map_string_to_array, s: mlx.mlx_stream, quantize: bool, hidden: usize) !void {
         const q_out = N_HEADS * HEAD_DIM;
         const kv_out = N_KV * HEAD_DIM;

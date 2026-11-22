@@ -417,11 +417,13 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
                 var logq = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(logq);
                 try mlx.check(mlx.mlx_log(&logq, qrow, s));
-                const null_key = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(null_key);
+                // Keyed off the request's prng, as the accept draws are: a seed fixes the drafts too.
+                var key = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(key);
+                try mlx.check(mlx.mlx_random_key(&key, self.prng.random().int(u64)));
                 var sampled = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(sampled);
-                try mlx.check(mlx.mlx_random_categorical(&sampled, logq, -1, null_key, s));
+                try mlx.check(mlx.mlx_random_categorical(&sampled, logq, -1, key, s));
                 try mlx.check(mlx.mlx_array_eval(sampled));
                 const sd = mlx.mlx_array_data_int32(sampled) orelse return error.MlxArrayDataNull;
                 prev = @intCast(sd[0]);
@@ -1306,6 +1308,59 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         try testing.expectEqual(want, got.items.len);
         for (serial, got.items) |a, b| try testing.expectEqual(a, b);
     }
+}
+
+/// One seeded temperature-1 request through DSpark's Markov arm on the tiny pair: the emitted ids and each round's
+/// accepted count, appended to `out`.
+fn markovSeededRun(out: *std.ArrayList(u32)) !void {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_trunk = std.testing.tmpDir(.{});
+    defer tmp_trunk.cleanup();
+    var trunk_buf: [512]u8 = undefined;
+    const trunk_path = trunk_buf[0..try tmp_trunk.dir.realPath(io, &trunk_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, s);
+    var config = try model_mod.parseConfig(io, allocator, trunk_path);
+    defer config.deinit(allocator);
+    var tmp_asst = std.testing.tmpDir(.{});
+    defer tmp_asst.cleanup();
+    var asst_buf: [512]u8 = undefined;
+    const asst_path = asst_buf[0..try tmp_asst.dir.realPath(io, &asst_buf)];
+    try dflash_mod.TinyFix.writeAssistantMarkov(io, tmp_asst.dir, asst_path, s);
+
+    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
+    defer xfm.deinit();
+    var dm = try dflash_mod.loadDflash(io, allocator, s, asst_path);
+    defer dm.deinit();
+    try testing.expect(dm.markov != null);
+    try dm.bind(&xfm);
+    var tok_dummy: Tokenizer = undefined; // never read by the Generator
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 48, .{ .temperature = 1.0, .seed = 7 }, &.{}, .{
+        .dflash_enabled = true,
+        .dflash = &dm,
+        .dflash_min_accepted_per_round = 0,
+    });
+    defer gen.deinit(allocator);
+    while (try gen.nextDflash(allocator)) |res| {
+        defer allocator.free(res.tokens);
+        try out.appendSlice(allocator, res.tokens);
+        try out.append(allocator, @intCast(1000 + res.tokens.len));
+    }
+    try testing.expect(gen.dflash_attempted > 0);
+}
+
+test "dflash: a seeded sampled request drafts through the Markov head the same way twice" {
+    // The bar: a seed fixes the drafts as it fixes the accept draws, so two runs emit the same ids in the same rounds.
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var a = std.ArrayList(u32).empty;
+    defer a.deinit(testing.allocator);
+    var b = std.ArrayList(u32).empty;
+    defer b.deinit(testing.allocator);
+    try markovSeededRun(&a);
+    try markovSeededRun(&b);
+    try testing.expectEqualSlices(u32, a.items, b.items);
 }
 
 const PolicyArm = struct {
