@@ -95,7 +95,19 @@ pub const Host = extern struct {
     /// holds no quant table, so its loads ask here (`outside.Format.open`). Read it through `quantClaimantOf`, which
     /// also answers null for a host older than this field. Any thread.
     quant_claimant: ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable = null,
+
+    /// Tensor-parallel experts (`--dist tensor`): hands the paired worker one MoE layer's rows `x` `[t, d]`, their
+    /// routes `idx` `[t, k]` u32 and weights `[t, k]` f32, and writes its share's partial `[t, d]` f32 to `out` as a
+    /// receive queued behind the sends, so a graph that adds it after the local share overlaps the wire. A refusal =
+    /// no worker or it left: the caller runs the whole MLP. Inference thread. Read it through `expertExchangeOf`.
+    expert_exchange: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, weights: Array, out: *Array) callconv(.c) Verdict = null,
 };
+
+/// `h.expert_exchange`, or null where the host has none or predates it.
+pub fn expertExchangeOf(h: *const Host) ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, weights: Array, out: *Array) callconv(.c) Verdict {
+    if (h.size < @offsetOf(Host, "expert_exchange") + @sizeOf(@FieldType(Host, "expert_exchange"))) return null;
+    return h.expert_exchange;
+}
 
 /// `h.quant_claimant`, or null where the host has none or predates it (its `size` ends before the field).
 pub fn quantClaimantOf(h: *const Host) ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable {
