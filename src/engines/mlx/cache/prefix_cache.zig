@@ -1985,12 +1985,13 @@ pub const HotPrefixCache = struct {
     /// owner and its first `writeAtOffset` donates in place. Called right before
     /// `Generator.initWithOptions`, after the admission pass that can still refuse: releasing at
     /// restore time threw away a 364k session for a request that never ran. Idempotent.
-    pub fn donateCheckout(self: *HotPrefixCache, slot_id: usize) void {
+    pub fn donateCheckout(self: *HotPrefixCache, slot_id: usize, slot_cache: *KVCache) void {
         for (self.entries.items) |*e| {
             if (e.checked_out_by != slot_id) continue;
             if (e.checkout_donated) continue;
             e.snapshot.releaseHandles();
             e.checkout_donated = true;
+            slot_cache.ownRestored();
         }
     }
 
@@ -10573,7 +10574,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         try testing.expectEqual(@as(usize, 600), res.matched);
         // The transfer is the scheduler's second step, taken at the last point
         // before the first write (see `donateCheckout`).
-        hc.donateCheckout(0xA11CE);
+        hc.donateCheckout(0xA11CE, &slot);
 
         // The entry gave the buffers up: its handles are empty and it names the slot.
         const e = &hc.entries.items[0];
@@ -10622,6 +10623,35 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
     // The move arm allocated nothing beyond the tail; a quarter of one buffer is a loose ceiling.
     try testing.expect(moved_delta * 4 < buf_bytes);
     try testing.expectEqualSlices(f32, &copied_bytes, &moved_bytes);
+}
+
+test "restore by move: a checked-out entry donates in place even when this request reserves less than it holds" {
+    // Bar: the slot's reservation (prompt + a short reply) is far below the donor's buffer, and the first write still
+    // lands in the moved buffer (no grow, its capacity kept); a share at that reservation would regrow and copy.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 1 << 20);
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, &.{}, null, null, 0xA11CE);
+    try testing.expectEqual(@as(usize, 600), res.matched);
+    slot.reserve(700);
+    hc.donateCheckout(0xA11CE, &slot);
+    const cap = KVCache.bufferCapacity(slot.entries[0].keys);
+    const grows = KVCache.kv_cap_buf_grows;
+    try testWriteCacheLayer(&slot, s, 0, 600, 8);
+    try testing.expectEqual(grows, KVCache.kv_cap_buf_grows);
+    try testing.expectEqual(cap, KVCache.bufferCapacity(slot.entries[0].keys));
 }
 
 fn testReadKeyRows(cache: *KVCache, layer: usize, row: usize, out: []f32) !void {
@@ -10779,7 +10809,7 @@ test "restore by move: a slot that ends without committing DROPS its checked-out
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
 
     // Admitted and about to write: the handles go over.
-    hc.donateCheckout(42);
+    hc.donateCheckout(42, &slot);
     try testing.expect(hc.entries.items[0].checkout_donated);
     try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx == null);
 

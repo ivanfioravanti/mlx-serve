@@ -221,6 +221,11 @@ pub const KVCache = struct {
         self.step = snap.step;
     }
 
+    /// The restored buffers are this cache's alone (a checked-out entry gave them up): the first write donates in place.
+    pub fn ownRestored(self: *KVCache) void {
+        for (self.entries) |*e| e.shared_view = false;
+    }
+
     const chunk_step = 256;
 
     /// Cap on the slack a single growth event adds, in tokens. Keeps the

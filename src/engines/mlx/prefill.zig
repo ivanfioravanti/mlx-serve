@@ -545,7 +545,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Restore by move, the transfer: the last point at which nothing has written to `slot.cache`.
     // Everything above can still refuse and `releaseCheckout` then hands the entry back whole;
     // nothing between here and `initWithOptions` may fail.
-    if (slot.prefix_cache) |hc| hc.donateCheckout(@intFromPtr(slot));
+    if (slot.prefix_cache) |hc| hc.donateCheckout(@intFromPtr(slot), &slot.cache);
     const graphs_were = mlx.setCudaGraphs(mlx.prefillKeepsCudaGraphs());
     defer _ = mlx.setCudaGraphs(graphs_were);
     var gen = Generator.initWithOptions(
