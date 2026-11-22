@@ -802,7 +802,7 @@ pub fn initWithOptions(
         }
     }
     if (one_forward_cp > 0) ctx.capture_ssm_seq = true;
-    const raw_logits = if (tail_mtp_capture) blk: {
+    const raw_logits = if (options.prefilled_logits) |lg| lg else if (tail_mtp_capture) blk: {
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
     } else if (need_capture) blk: {
