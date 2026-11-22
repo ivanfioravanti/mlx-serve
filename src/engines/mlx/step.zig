@@ -38,14 +38,6 @@ const warm_requests = @import("warm_requests.zig");
 const drainSideQueues = @import("runtime/loop.zig").drainSideQueues;
 
 /// Caller holds queue_mu. Recheck arrivals under the lock before the short, wakeable retry wait.
-/// A slot whose stacked pass failed starts its prompt over alone.
-fn resetStacked(s: *Slot) void {
-    emptySlotCache(s);
-    s.stacked_rows = 0;
-    if (s.stacked_checkpoint) |*cp| cp.deinit(s.allocator);
-    s.stacked_checkpoint = null;
-}
-
 fn waitForDiskRetryLocked(sch: *Scheduler, ms: u32) void {
     if (hasWorkPendingLocked(sch) or sch.shutdown.load(.acquire)) return;
     sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .boot } }) catch {};
@@ -244,13 +236,12 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         sch.queue_mu.unlock(sch.io);
     }
 
-    // Two or more cold prompts of one model forward their common span stacked first.
+    // Two or more cold prompts of one model forward all but their last token stacked first (`prefill_stacked`).
     if (n_prefill > 1) {
-        var stack: [8]*Slot = undefined;
+        var stack: [prefill_stacked.MAX_SLOTS]*Slot = undefined;
         const pk = prefill_stacked.pick(to_prefill[0..n_prefill], &stack);
         if (pk.n >= 2) prefill_stacked.run(stack[0..pk.n], pk.width, pk.left_out, pk.longest_left) catch |err| {
             log.warn("[prefill] stacked pass failed ({s}): each prompt prefills alone\n", .{@errorName(err)});
-            for (stack[0..pk.n]) |s| resetStacked(s);
         };
     }
 
