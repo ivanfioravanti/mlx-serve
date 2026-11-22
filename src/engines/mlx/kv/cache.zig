@@ -677,6 +677,110 @@ test "KVCache: an append after a short restore sizes its copy from the prefix, n
     }
 }
 
+const DonateFix = struct {
+    const cfgs = [_]kv_quant.KVQuantConfig{ kv_quant.KVQuantConfig.dense, kv_quant.KVQuantConfig.affine(8) };
+    const heads = 8;
+    const width = 128;
+    const restored = 1000;
+
+    /// `[1, heads, len, width]` f32 rows, evaluated: random when `fill` is null, else every element `fill`.
+    fn rows(s: mlx.mlx_stream, len: c_int, fill: ?f32) !mlx.mlx_array {
+        const shape = [_]c_int{ 1, heads, len, width };
+        var a = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(a);
+        if (fill) |v| {
+            const val = mlx.mlx_array_new_float(v);
+            defer _ = mlx.mlx_array_free(val);
+            try mlx.check(mlx.mlx_full(&a, &shape, 4, val, .float32, s));
+        } else {
+            var key = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(key);
+            try mlx.check(mlx.mlx_random_key(&key, 7));
+            try mlx.check(mlx.mlx_random_normal(&a, &shape, 4, .float32, 0.0, 1.0, key, s));
+        }
+        try mlx.check(mlx.mlx_array_eval(a));
+        return a;
+    }
+
+    fn buffers(e: *const KVCacheEntry) [6]mlx.mlx_array {
+        return .{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases };
+    }
+
+    fn evalAll(c: *const KVCache) !void {
+        for (buffers(&c.entries[0])) |x| if (x.ctx != null and mlx.mlx_array_size(x) > 0) try mlx.check(mlx.mlx_array_eval(x));
+    }
+
+    /// A `restored`-row cache's snapshot; the donor is gone, so the snapshot holds the only handles.
+    fn snapshotOf(cfg: kv_quant.KVQuantConfig, s: mlx.mlx_stream) !KVCacheSnapshot {
+        var donor = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+        defer donor.deinit();
+        const k = try rows(s, restored, null);
+        defer _ = mlx.mlx_array_free(k);
+        var v = try donor.update(0, k, k, s, 0);
+        v.deinit();
+        try evalAll(&donor);
+        return donor.snapshot();
+    }
+};
+
+test "KVCache: a shared restore's append never writes into the snapshot's buffer" {
+    // Bar: after a grow-free four-row append by the sharer, every snapshot buffer is byte-identical to before it, and
+    // the sharer's rows are the appended ones. Red if MLX ever donates a buffer the snapshot still references.
+    const s = mlx.gpuStream();
+    const four = try DonateFix.rows(s, 4, 7.0);
+    defer _ = mlx.mlx_array_free(four);
+    const r: c_int = DonateFix.restored;
+    for (DonateFix.cfgs) |cfg| {
+        var snap = try DonateFix.snapshotOf(cfg, s);
+        defer snap.deinit();
+        var before: [6]mlx.mlx_array = @splat(.{ .ctx = null });
+        defer for (before) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+        for (DonateFix.buffers(&snap.entries[0]), 0..) |x, i| {
+            if (x.ctx == null or mlx.mlx_array_size(x) == 0) continue;
+            try mlx.check(mlx.mlx_array_eval(x));
+            before[i] = try materializedOwnedCopy(s, x);
+            try mlx.check(mlx.mlx_array_eval(before[i]));
+        }
+        var shared = try KVCache.initWithConfig(testing.allocator, 1, cfg);
+        defer shared.deinit();
+        try shared.restore(&snap);
+        try testing.expect(KVCache.bufferCapacity(shared.entries[0].keys) >= DonateFix.restored + 4);
+        var appended = try shared.update(0, four, four, s, 0);
+        try DonateFix.evalAll(&shared);
+        appended.deinit();
+        for (DonateFix.buffers(&snap.entries[0]), before) |x, b| {
+            if (b.ctx == null) continue;
+            var eq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eq);
+            try mlx.check(mlx.mlx_array_equal(&eq, x, b, true, s));
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+            try testing.expect(same);
+        }
+        var view = try shared.denseView(0, s);
+        defer view.deinit();
+        var tail = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tail);
+        try mlx.check(mlx.mlx_slice(&tail, view.k, &[_]c_int{ 0, 0, r, 0 }, 4, &[_]c_int{ 1, DonateFix.heads, r + 4, DonateFix.width }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+        const seven = mlx.mlx_array_new_float(7.0);
+        defer _ = mlx.mlx_array_free(seven);
+        var off = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(off);
+        try mlx.check(mlx.mlx_subtract(&off, tail, seven, s));
+        var mag = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mag);
+        try mlx.check(mlx.mlx_abs(&mag, off, s));
+        var worst = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(worst);
+        try mlx.check(mlx.mlx_max(&worst, mag, false, s));
+        var w: f32 = 0;
+        try mlx.check(mlx.mlx_array_item_float32(&w, worst));
+        try testing.expect(w < 0.1);
+    }
+}
+
 test "KVCache.compactRows: a tree's accepted path lands as serial appends would, dense and quantized" {
     const s = mlx.gpuStream();
     const base: usize = 6;
