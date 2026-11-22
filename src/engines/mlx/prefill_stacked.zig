@@ -102,20 +102,32 @@ pub fn pick(slots: []const *Slot, out: *[MAX_SLOTS]*Slot) Pick {
     return p;
 }
 
+/// PURE: the absolute rows after which a stacked span of a `total`-row prompt from `base` files its checkpoints: the
+/// snapshot backoff before its last token, and (`end_snapshot`) one row short of its end, as a solo final span does;
+/// 0 = none (behind the restore, or no prefix cache to file into: `want`).
+pub fn stackedCuts(total: u32, base: u32, want: bool, end_snapshot: bool) [2]u32 {
+    if (!want) return .{ 0, 0 };
+    const backoff: u32 = if (total - 1 > SSM_SNAPSHOT_BACKOFF and total - 1 - SSM_SNAPSHOT_BACKOFF > base) total - 1 - SSM_SNAPSHOT_BACKOFF else 0;
+    const end: u32 = if (end_snapshot and total - 1 > base) total - 1 else 0;
+    return .{ backoff, end };
+}
+
 /// One slot after a pass of `width` rows from `base` (its restored rows; 0 cold): its cache truncated to `base + span`
 /// rows, its conv windows those after them, cut from the pass's capture, and (`cp_at` > 0, absolute) the checkpoint
 /// there.
-pub fn settleSpan(a: std.mem.Allocator, cache: *transformer_mod.KVCache, entries: ?[]transformer_mod.SSMCacheEntry, base: u32, span: u32, width: u32, cp_at: u32, s: mlx.mlx_stream) !?checkpoint.SSMCheckpoint {
+pub fn settleSpan(a: std.mem.Allocator, cache: *transformer_mod.KVCache, entries: ?[]transformer_mod.SSMCacheEntry, base: u32, span: u32, width: u32, cuts: [2]u32, s: mlx.mlx_stream) ![2]?checkpoint.SSMCheckpoint {
     try cache.truncate(base + span, s);
-    const ents = entries orelse return null;
+    var cps: [2]?checkpoint.SSMCheckpoint = .{ null, null };
+    const ents = entries orelse return cps;
     defer for (ents) |*e| transformer_mod.ssmFreeSpecCapture(e);
-    var cp: ?checkpoint.SSMCheckpoint = null;
-    errdefer if (cp) |*c| c.deinit(a);
-    if (cp_at > base) cp = try checkpoint.captureSsmCheckpointAt(a, ents, cp_at, cp_at - base, width, s);
+    errdefer for (&cps) |*c| if (c.*) |*x| x.deinit(a);
+    for (cuts, &cps) |at, *cp| if (at > base) {
+        cp.* = try checkpoint.captureSsmCheckpointAt(a, ents, at, at - base, width, s);
+    };
     var at = try checkpoint.captureSsmCheckpointAt(a, ents, base + span, span, width, s);
     defer at.deinit(a);
     for (ents, at.layers) |*e, *l| try transformer_mod.ssmRestore(e, l);
-    return cp;
+    return cps;
 }
 
 /// Forwards each of `slots`' prompts whole (or, `warm`, the tail each one's hot-cache restore leaves, restored here by
@@ -167,9 +179,12 @@ pub fn run(slots: []const *Slot, width: u32, warm: bool, left_out: usize, longes
         if (i == 1 and env.on(.STACKED_PREFILL_FAIL)) return error.StackedPrefillDiag;
         const total: u32 = @intCast(s.full_prompt.len);
         const span = total - offs[i];
-        // The checkpoint a prefill of this prompt files: the snapshot backoff before its last token.
-        const want_cp = s.prefix_cache != null and s.model.ssm_checkpoint_stride > 0 and total - 1 > SSM_SNAPSHOT_BACKOFF;
-        s.stacked_checkpoint = try settleSpan(s.allocator, &s.cache, s.ssm_entries, offs[i], span, width, if (want_cp) total - 1 - SSM_SNAPSHOT_BACKOFF else 0, xfm.s);
+        // The checkpoints a prefill of this prompt files: the snapshot backoff before its last token, and the end-1 one.
+        const want_cp = s.prefix_cache != null and s.model.ssm_checkpoint_stride > 0;
+        const end_snapshot = if (s.model.config) |cfg| if (cfg.plugin) |pb| pb.parsed.caps.end_snapshot else false else false;
+        const cps = try settleSpan(s.allocator, &s.cache, s.ssm_entries, offs[i], span, width, stackedCuts(total, offs[i], want_cp, end_snapshot), xfm.s);
+        s.stacked_checkpoint = cps[0];
+        s.stacked_end_checkpoint = cps[1];
         s.stacked_logits = try lastRow(logits, i, span, xfm.s);
         s.moe_seq_offset = total;
         s.stacked_rows = total - 1;
@@ -221,6 +236,8 @@ pub fn abandon(s: *Slot, drafter: bool) void {
     s.stacked_rows = 0;
     if (s.stacked_checkpoint) |*cp| cp.deinit(s.allocator);
     s.stacked_checkpoint = null;
+    if (s.stacked_end_checkpoint) |*cp| cp.deinit(s.allocator);
+    s.stacked_end_checkpoint = null;
     if (s.stacked_logits) |lg| _ = mlx.mlx_array_free(lg);
     s.stacked_logits = null;
     s.enable_drafter = drafter;
@@ -262,6 +279,19 @@ test "pickItems: a stack is all cold prompts or all restored tails of one model,
     // One stackable slot is no pass (the caller stacks from two).
     p = pickItems(&.{.{ .kind = .warm, .span = 100, .model = 1 }}, &out);
     try t.expect(p.n < 2 and p.width == 0);
+}
+
+test "stackedCuts: a stacked span files the backoff cut and, where the model declares it, one a row short of its end" {
+    const t = std.testing;
+    // A cold 300-row prompt: the backoff at 269, the end-1 at 299.
+    try t.expectEqual([2]u32{ 269, 299 }, stackedCuts(300, 0, true, true));
+    try t.expectEqual([2]u32{ 269, 0 }, stackedCuts(300, 0, true, false));
+    // A restored tail of 100 rows behind 10 000: both cuts past the restore.
+    try t.expectEqual([2]u32{ 10_069, 10_099 }, stackedCuts(10_100, 10_000, true, true));
+    // A tail shorter than the backoff: the backoff falls behind the restore (none), the end-1 still lands.
+    try t.expectEqual([2]u32{ 0, 10_019 }, stackedCuts(10_020, 10_000, true, true));
+    // No prefix cache to file into: none.
+    try t.expectEqual([2]u32{ 0, 0 }, stackedCuts(300, 0, false, true));
 }
 
 test "stridePastStack: a stacked span crosses no stride checkpoint unless the prefill chunk is under the stack" {
