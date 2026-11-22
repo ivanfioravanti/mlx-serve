@@ -5,6 +5,8 @@
 # engaged); [3] warm prompt_ms <= 0.7x cold.
 #
 #   MLX_HYBRID_MODEL=<dir> ./tests/test_hybrid_reuse_equivalence.sh   # default Qwen3.5-4B-MLX-4bit; PORT (19077)
+#   NEXT_TURN_PROMPTS=5 adds [4]: a prompt grown by a few hundred tokens after its base was served (a next-turn tail
+#   past one forward's 128 rows) decodes on the warm server what a second, cache-cold server decodes (PORT+1).
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
@@ -104,6 +106,43 @@ if ! python3 -c "import sys; sys.exit(0 if float('$WARM_MS') < 0.7 * float('$COL
 else
     SPEEDUP=$(python3 -c "print(f'{float(\"$COLD_MS\") / max(float(\"$WARM_MS\"), 1e-6):.2f}x')")
     echo "✅ warm TTFT $SPEEDUP faster (warm=${WARM_MS}ms vs cold=${COLD_MS}ms)"
+fi
+
+if [ "${NEXT_TURN_PROMPTS:-0}" -gt 0 ]; then
+    CPORT=$((PORT + 1)); CBASE="http://127.0.0.1:$CPORT"; CLOG="$(mktemp)"
+    srv_preclean "$CPORT"
+    "$BIN" --model "$MODEL" --serve --port "$CPORT" --ctx-size 8192 \
+        --prefix-cache-entries 4 --ssm-checkpoint-stride 128 --log-level warn > "$CLOG" 2>&1 &
+    COLD_PID=$!
+    trap 'kill "$SERVER_PID" "$COLD_PID" 2>/dev/null; rm -f "$LOG" "$CLOG"; true' EXIT
+    srv_wait_health "$CBASE" 120 0.5 "$COLD_PID" || { echo "fail: cold server died:"; tail -20 "$CLOG"; exit 1; }
+    ask() { # base prompt
+        curl -sf --max-time 120 -X POST "$1/v1/chat/completions" -H 'Content-Type: application/json' \
+            -d "$(jq -nc --arg p "$2" '{messages:[{role:"user",content:$p}],max_tokens:40,temperature:0,stream:false}')"
+    }
+    for i in $(seq 1 "$NEXT_TURN_PROMPTS"); do
+        read -r BASE_P EXT_P < <(python3 - "$i" <<'PY'
+import json, sys
+i = int(sys.argv[1])
+words = "river lantern harbor ledger meadow canyon glacier thunder cabin orchard signal copper marble ribbon".split()
+base = f"Session {i}. " + " ".join(f"{words[(i * 7 + k) % len(words)]}-{k}" for k in range(220 + 40 * i)) + "."
+ext = base + " Then: " + " ".join(f"{words[(i * 3 + k) % len(words)]}{k % 9}" for k in range(60 + 25 * i)) + ". Continue."
+print(json.dumps(base), json.dumps(ext))
+PY
+)
+        BASE_P=$(echo "$BASE_P" | jq -r .); EXT_P=$(echo "$EXT_P" | jq -r .)
+        ask "$BASE" "$BASE_P" > /dev/null
+        W=$(ask "$BASE" "$EXT_P"); C=$(ask "$CBASE" "$EXT_P")
+        WT=$(echo "$W" | jq -r "$TEXT"); CT=$(echo "$C" | jq -r "$TEXT")
+        TAIL=$(echo "$W" | jq -r '(.usage.prompt_tokens) - (.timings.cached_n)')
+        if [ -n "$WT" ] && [ "$WT" = "$CT" ]; then
+            echo "✅ next turn $i: warm (tail $TAIL rows) decodes what cold decodes"
+        else
+            echo "❌ FAIL: next turn $i (tail $TAIL rows): warm diverged from cold"
+            diff <(printf "%s" "$CT") <(printf "%s" "$WT") | head -10
+            EC=1
+        fi
+    done
 fi
 
 exit $EC
