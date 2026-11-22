@@ -843,7 +843,8 @@ pub fn mid(g: *Graph, L: *const Layer, w: *const Body, attn: Array, out_gate: ?A
 }
 
 /// A visit's output stream and its new conv state.
-pub const Tail = struct { h: Array, state: Array };
+/// The visit's stream, its next conv state and the MLP's output rows (the conv state's last input, read for a capture).
+pub const Tail = struct { h: Array, state: Array, xm: Array };
 
 /// The picked experts' soft-capped SwiGLU `[N, 1, I]` in `gu`'s dtype: `gu` `[N, 1, 2 I]` holds each pick's gate
 /// (even) and up (odd) rows, times `scale[sel]` when `scaled`; `caps` = { 1 / gate cap, gate cap, 1 / up cap, up cap }.
@@ -960,9 +961,9 @@ pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle,
     };
     if (open) |v| {
         v.window = try v.g.keep(try g.concat(&.{ st, try g.astype(try g.concat(&.{ kp, vp, m.op, o[1] }, 2), .float32) }, 1));
-        return .{ .h = o[0], .state = st };
+        return .{ .h = o[0], .state = st, .xm = o[1] };
     }
-    return .{ .h = o[0], .state = try convState(g, st, kp, vp, m.op, o[1]) };
+    return .{ .h = o[0], .state = try convState(g, st, kp, vp, m.op, o[1]), .xm = o[1] };
 }
 
 /// A visit's conv state `[1, KT - 1, .]` f32 after its rows: the last KT - 1 rows of the old state `st` followed
@@ -998,6 +999,8 @@ pub fn visit(c: *block.Ctx, L: *const Layer, w: *const Body, h: Array, blocks: ?
     const m = try mid(g, L, w, read, if (fuse) p.gate else null, h, f.normed, blocks, st, f.messages);
     const t = try experts(g, L, cfg, &m, f.proj[4], f.proj[5], st, open);
     if (batch) try slot_state.put(c, .conv, t.state) else if (open == null) try kv.setState(c, .conv, t.state);
+    // Every path through `experts` meets here: a capture keeps the rows' conv inputs behind the old state.
+    if (c.capture_spec and !batch and open == null) try kv.setState(c, .conv_input, try g.concat(&.{ st, try g.astype(try g.concat(&.{ f.proj[4], f.proj[5], m.op, t.xm }, 2), .float32) }, 1));
     return .{ .h = t.h, .blocks = m.blocks };
 }
 
