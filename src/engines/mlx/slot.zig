@@ -78,6 +78,8 @@ pub const Slot = struct {
     /// Prompt rows a stacked pass forwarded with other admitted prompts (`prefill_stacked.zig`): the prefill takes
     /// them as restored.
     stacked_rows: u32 = 0,
+    /// The snapshot-backoff checkpoint the stacked pass cut for this prompt; the prefill files it (ownership moves).
+    stacked_checkpoint: ?transformer_mod.SSMCheckpoint = null,
     skip_prefix_cache: bool = false,
     /// What the request changes about the model's state (`ModuleBinding.variant`; a directional ablation's key): a
     /// module-owned cache keys its entries by it, the KV prefix cache is neither read nor written.
@@ -415,6 +417,7 @@ pub const Slot = struct {
     /// finished/errored it AND the connection thread has consumed the final
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
+        if (self.stacked_checkpoint) |*cp| cp.deinit(self.allocator);
         // A slot freed before its terminator (a cancel pulled into cleanup) still tells its stream it is done.
         if (self.sink != null) self.emitFinished(.cancelled, null);
         if (self.model.transformer) |xfm| if (xfm.qwen4Trunk()) |t| t.markQsaPooledRopeStale();

@@ -1,24 +1,27 @@
-//! Admitted prompts prefilled stacked: two or more cold prompts of one model (`Caps.stacks_prompts`) forward their
-//! common span in one batched pass, then each prefills the rest of its prompt alone, the stacked rows taken as
-//! restored (`Slot.stacked_rows`). One forward of N spans costs about what one prompt of their rows does, where N
-//! serial prefills pay a short forward's fixed cost each.
+//! Admitted prompts prefilled stacked: two or more cold prompts of one model (`Caps.stacks_prompts`) forward all but
+//! their last token in one batched pass, each padded at its end to the longest. Pad rows repeat the slot's last real
+//! token at the next positions; every block is causal over rows (attention, the short convs), so no real row reads
+//! one, and each slot's cache is truncated back to its own rows, its conv windows and its snapshot-backoff checkpoint
+//! cut from the pass's per-row capture. Each slot then prefills only its last token, the stacked rows taken as
+//! restored (`Slot.stacked_rows`). One forward of N spans costs about what one prompt of their rows does.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const transformer_mod = @import("transformer.zig");
+const checkpoint = @import("ssm/checkpoint.zig");
 const Slot = @import("slot.zig").Slot;
 const ForwardCtx = @import("forward_ctx.zig").ForwardCtx;
 const slotUncachedTail = @import("prefill_interleave.zig").slotUncachedTail;
+const MAX_PAD_WASTE = @import("batching/verdict.zig").MAX_PAD_WASTE;
+const SSM_SNAPSHOT_BACKOFF: u32 = @intCast(@import("generate.zig").SSM_SNAPSHOT_BACKOFF);
 
 /// Stacked rows past which a pass stops paying: from about a thousand rows a forward's cost per row stops falling, and
 /// a stack only makes the first prompt wait for the last.
 pub const STACK_ROWS = 1024;
-/// Rows each prompt keeps for its own prefill: the snapshot backoff's tail and its last row.
-const OWN_TAIL = 32;
-/// A shorter common span is not worth a pass.
+/// A shorter prompt is not worth a pass.
 const MIN_SPAN = 16;
-const MAX_SLOTS = 8;
+pub const MAX_SLOTS = 8;
 
 /// A slot the stacked pass may take: a cold prompt of a model that stacks prompts, decoded plainly enough to batch.
 fn stackable(slot: *const Slot) bool {
@@ -27,36 +30,63 @@ fn stackable(slot: *const Slot) bool {
     if (!pb.parsed.caps.stacks_prompts) return false;
     if (slot.vision_embeddings != null or slot.media.len > 0 or slot.logprobs_n > 0 or slot.prompt_logprobs) return false;
     if (slot.sampling.constraint != null or slot.sampling.penalized()) return false;
-    if (slot.full_prompt.len < OWN_TAIL + MIN_SPAN or slot.full_prompt.len > STACK_ROWS) return false;
+    if (slot.full_prompt.len < MIN_SPAN + 1 or slot.full_prompt.len > STACK_ROWS) return false;
     // A prompt the hot cache would restore keeps its restore.
     return slotUncachedTail(@constCast(slot)) == slot.full_prompt.len;
 }
 
-/// The slots of `slots` that ride one pass, and its span: the first stackable slot's model, at most `MAX_SLOTS`,
-/// stacked rows within `STACK_ROWS`. `n` < 2 = no pass.
-pub fn pick(slots: []const *Slot, out: *[MAX_SLOTS]*Slot) struct { n: usize, span: u32 } {
-    var n: usize = 0;
-    var span: usize = std.math.maxInt(usize);
+pub const Pick = struct { n: usize, width: u32, left_out: usize = 0, longest_left: usize = 0 };
+
+/// The slots of `slots` that ride one pass and its padded width: the first stackable slot's model, at most `MAX_SLOTS`,
+/// stacked rows within `STACK_ROWS` and padding within `MAX_PAD_WASTE` of their real rows. A slot that would break a
+/// bound prefills alone. `n` < 2 = no pass.
+pub fn pick(slots: []const *Slot, out: *[MAX_SLOTS]*Slot) Pick {
+    var p: Pick = .{ .n = 0, .width = 0 };
+    var real: usize = 0;
     for (slots) |s| {
-        if (n == MAX_SLOTS or !stackable(s)) continue;
-        if (n > 0 and s.model != out[0].model) continue;
-        const next_span = @min(span, s.full_prompt.len - OWN_TAIL);
-        if ((n + 1) * next_span > STACK_ROWS) break;
-        out[n] = s;
-        n += 1;
-        span = next_span;
+        if (!stackable(s) or (p.n > 0 and s.model != out[0].model)) continue;
+        const span = s.full_prompt.len - 1;
+        const width = @max(p.width, span);
+        const fits = p.n < MAX_SLOTS and (p.n + 1) * width <= STACK_ROWS and
+            @as(f64, @floatFromInt((p.n + 1) * width)) <= MAX_PAD_WASTE * @as(f64, @floatFromInt(real + span));
+        if (!fits) {
+            p.left_out += 1;
+            p.longest_left = @max(p.longest_left, span);
+            continue;
+        }
+        out[p.n] = s;
+        p.n += 1;
+        p.width = @intCast(width);
+        real += span;
     }
-    return .{ .n = n, .span = if (n >= 2) @intCast(span) else 0 };
+    if (p.n < 2) p.width = 0;
+    return p;
 }
 
-/// Forwards `slots`' first `span` prompt rows in one batched pass into each slot's own cache and recurrent entries.
-/// Their drafters stay off for the request: the pass builds no assistant context.
-pub fn run(slots: []const *Slot, span: u32) !void {
+/// One slot after a pass of `width` rows: its cache truncated to its own `span` rows, its conv windows those after
+/// them, cut from the pass's capture, and (`want_cp`) the snapshot-backoff checkpoint a prefill of the span would file.
+pub fn settleSpan(a: std.mem.Allocator, cache: *transformer_mod.KVCache, entries: ?[]transformer_mod.SSMCacheEntry, span: u32, width: u32, want_cp: bool, s: mlx.mlx_stream) !?checkpoint.SSMCheckpoint {
+    try cache.truncate(span, s);
+    const ents = entries orelse return null;
+    defer for (ents) |*e| transformer_mod.ssmFreeSpecCapture(e);
+    var cp: ?checkpoint.SSMCheckpoint = null;
+    errdefer if (cp) |*c| c.deinit(a);
+    if (want_cp and span > SSM_SNAPSHOT_BACKOFF) cp = try checkpoint.captureSsmCheckpointAt(a, ents, span - SSM_SNAPSHOT_BACKOFF, span - SSM_SNAPSHOT_BACKOFF, width, s);
+    var at = try checkpoint.captureSsmCheckpointAt(a, ents, span, span, width, s);
+    defer at.deinit(a);
+    for (ents, at.layers) |*e, *l| try transformer_mod.ssmRestore(e, l);
+    return cp;
+}
+
+/// Forwards each of `slots`' prompts but its last token in one batched pass of `width` rows a slot, into the slot's
+/// own cache and recurrent entries. Their drafters stay off for the request: the pass builds no assistant context.
+pub fn run(slots: []const *Slot, width: u32, left_out: usize, longest_left: usize) !void {
     const xfm: *transformer_mod.Transformer = slots[0].model.transformer.?;
     var ctxs: [MAX_SLOTS]*ForwardCtx = undefined;
     var offs: [MAX_SLOTS]u32 = @splat(0);
-    const ids = try std.heap.page_allocator.alloc(i32, slots.len * span);
+    const ids = try std.heap.page_allocator.alloc(i32, slots.len * width);
     defer std.heap.page_allocator.free(ids);
+    var real: usize = 0;
     for (slots, 0..) |s, i| {
         s.ctx.cache = &s.cache;
         s.ctx.moe_seq_offset = &s.moe_seq_offset;
@@ -65,9 +95,12 @@ pub fn run(slots: []const *Slot, span: u32) !void {
         s.ctx.capture_hidden = null;
         s.ctx.kv_attn_fused = s.kv_attn_fused;
         ctxs[i] = &s.ctx;
-        for (s.full_prompt[0..span], ids[i * span ..][0..span]) |t, *d| d.* = @intCast(t);
+        const span = s.full_prompt.len - 1;
+        real += span;
+        const row = ids[i * width ..][0..width];
+        for (row, 0..) |*d, k| d.* = @intCast(s.full_prompt[@min(k, span - 1)]);
     }
-    const shape = [_]c_int{ @intCast(slots.len), @intCast(span) };
+    const shape = [_]c_int{ @intCast(slots.len), @intCast(width) };
     const toks = mlx.mlx_array_new_data(ids.ptr, &shape, 2, .int32);
     defer _ = mlx.mlx_array_free(toks);
     var hl = mlx.mlx_array_new();
@@ -76,24 +109,14 @@ pub fn run(slots: []const *Slot, span: u32) !void {
     defer _ = mlx.mlx_array_free(ha);
     const logits = try xfm.forwardMoeBatchedVerify(toks, ctxs[0..slots.len], offs[0..slots.len], &hl, &ha);
     _ = mlx.mlx_array_free(logits);
-    const vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
     for (slots) |s| {
-        for (s.cache.entries) |*e| if (e.initialized) {
-            _ = mlx.mlx_vector_array_append_value(vec, e.keys);
-            _ = mlx.mlx_vector_array_append_value(vec, e.values);
-        };
-        if (s.ssm_entries) |ents| for (ents) |*e| if (e.conv_state.ctx != null) {
-            _ = mlx.mlx_vector_array_append_value(vec, e.conv_state);
-        };
-    }
-    try mlx.check(mlx.mlx_eval(vec));
-    for (slots) |s| {
-        // The pass captured per row as a verify does; nothing reads it.
-        if (s.ssm_entries) |ents| for (ents) |*e| transformer_mod.ssmFreeSpecCapture(e);
+        const span: u32 = @intCast(s.full_prompt.len - 1);
+        const want_cp = s.prefix_cache != null and s.model.ssm_checkpoint_stride > 0;
+        s.stacked_checkpoint = try settleSpan(s.allocator, &s.cache, s.ssm_entries, span, width, want_cp, xfm.s);
         s.moe_seq_offset = span;
         s.stacked_rows = span;
         s.enable_drafter = false;
     }
-    log.info("[prefill] stacked {d} prompts x {d} rows in one forward ({d} rows); their drafters stay off this request\n", .{ slots.len, span, slots.len * span });
+    log.info("[prefill] stacked {d} prompts in one forward ({d} rows a slot, {d} real of {d}); their drafters stay off this request\n", .{ slots.len, width, real, slots.len * width });
+    if (left_out > 0) log.info("[prefill] {d} prompt(s) prefill alone past the stack's bounds (longest {d} rows)\n", .{ left_out, longest_left });
 }

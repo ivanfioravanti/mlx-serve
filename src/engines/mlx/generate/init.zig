@@ -240,6 +240,11 @@ pub fn initWithOptions(
         for (ssm_checkpoints.items) |*cp| cp.deinit(allocator);
         ssm_checkpoints.deinit(allocator);
     }
+    if (options.stacked_checkpoint) |cp| ssm_checkpoints.append(allocator, cp) catch |e| {
+        var doomed = cp;
+        doomed.deinit(allocator);
+        return e;
+    };
     const has_vision = ctx.vision_embeddings != null;
     const want_ssm_cp = shouldCheckpointSsmPrefill(
         options.ssm_checkpoint_stride,
