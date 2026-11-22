@@ -327,13 +327,14 @@ const state_launch = metal.Launch{ .name = "msv_inkling2_state", .inputs = &.{ "
 /// The conv kernel's taps: the state holds one row fewer.
 const KT = 4;
 
-fn State(comptime dt: mlx.mlx_dtype) type {
+/// `seqs` sequences, the rows split in equal spans behind a state each (batched slots, stacked prompts).
+fn State(comptime dt: mlx.mlx_dtype, comptime seqs: usize) type {
     return struct {
         rig: metal.Rig,
         launch: *const metal.Launch = &state_launch,
         arena: std.heap.ArenaAllocator,
         shape: Shape = undefined,
-        /// `st` `[KT - 1, 2 C + 2 D]`, then the rows' `kp`, `vp` `[S, C]` and `op`, `xm` `[S, D]`.
+        /// `st` `[seqs, KT - 1, 2 C + 2 D]`, then the rows' `kp`, `vp` `[S, C]` and `op`, `xm` `[S, D]`.
         st: []f64 = &.{},
         new: [4][]f64 = @splat(&.{}),
         args: [5]mlx.mlx_array = undefined,
@@ -354,11 +355,10 @@ fn State(comptime dt: mlx.mlx_dtype) type {
         }
 
         pub fn geometry(_: *const Self, shape: Shape) ?metal.Geometry {
-            if (shape.rows == 0 or shape.n == 0 or shape.k == 0 or (KT - 1) * width(shape) % 64 != 0) return null;
-            var g = metal.Geometry{ .grid = .{ @intCast((KT - 1) * width(shape)), 1, 1 }, .tg = .{ 64, 1, 1 } };
-            g.out(&.{ 1, KT - 1, @intCast(width(shape)) }, .float32);
+            if (shape.rows == 0 or shape.rows % seqs != 0 or shape.n == 0 or shape.k == 0 or (KT - 1) * width(shape) % 64 != 0) return null;
+            var g = metal.Geometry{ .grid = .{ @intCast(seqs * (KT - 1) * width(shape)), 1, 1 }, .tg = .{ 64, 1, 1 } };
+            g.out(&.{ @intCast(seqs), KT - 1, @intCast(width(shape)) }, .float32);
             g.int("KT", @as(c_int, KT));
-            g.int("SEQ", @as(c_int, 1));
             return g;
         }
 
@@ -370,7 +370,7 @@ fn State(comptime dt: mlx.mlx_dtype) type {
             var prng = std.Random.DefaultPrng.init(seed);
             const rng = prng.random();
             const s: c_int = @intCast(shape.rows);
-            self.st = try spread(a, rng, (KT - 1) * width(shape), .f32);
+            self.st = try spread(a, rng, seqs * (KT - 1) * width(shape), .f32);
             const widths = [4]usize{ shape.n, shape.n, shape.k, shape.k };
             for (&self.new, widths) |*x, w| x.* = try spread(a, rng, shape.rows * w, elemOf(dt));
             if (fill == .nonfinite) {
@@ -379,7 +379,7 @@ fn State(comptime dt: mlx.mlx_dtype) type {
                 for (self.new, widths, [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) }) |x, w, v| x[(shape.rows - 1) * w + w / 2] = v;
             }
             self.rig.reset();
-            self.args[0] = try self.rig.input(.float32, &.{ 1, KT - 1, @intCast(width(shape)) }, self.st);
+            self.args[0] = try self.rig.input(.float32, &.{ @intCast(seqs), KT - 1, @intCast(width(shape)) }, self.st);
             for (self.args[1..], self.new, widths) |*arg, x, w| arg.* = try self.rig.input(dt, &.{ 1, s, @intCast(w) }, x);
             return true;
         }
@@ -389,14 +389,14 @@ fn State(comptime dt: mlx.mlx_dtype) type {
         }
 
         pub fn count(self: *const Self) usize {
-            return (KT - 1) * width(self.shape);
+            return seqs * (KT - 1) * width(self.shape);
         }
 
-        /// Row `at` of [the old state | the new rows], column `col`.
-        fn value(self: *const Self, at: usize, col: usize) f64 {
+        /// Row `at` of [sequence `seq`'s old state | its new rows], column `col`.
+        fn value(self: *const Self, seq: usize, at: usize, col: usize) f64 {
             const sw = width(self.shape);
-            if (at < KT - 1) return self.st[at * sw + col];
-            const r = at - (KT - 1);
+            if (at < KT - 1) return self.st[(seq * (KT - 1) + at) * sw + col];
+            const r = seq * (self.shape.rows / seqs) + at - (KT - 1);
             const c = self.shape.n;
             const d = self.shape.k;
             if (col < c) return self.new[0][r * c + col];
@@ -407,8 +407,9 @@ fn State(comptime dt: mlx.mlx_dtype) type {
 
         pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
             const sw = width(self.shape);
+            const span = self.shape.rows / seqs;
             for (want, mag, 0..) |*w, *m, e| {
-                w.* = self.value(self.shape.rows + e / sw, e % sw);
+                w.* = self.value(e / ((KT - 1) * sw), span + (e / sw) % (KT - 1), e % sw);
                 m.* = @abs(w.*);
             }
         }
@@ -670,7 +671,6 @@ const Sum = struct {
         g.int("K", @as(c_int, PICKS));
         g.int("KT", @as(c_int, KT));
         g.int("SCALED", @as(c_int, @intFromBool(scaled(shape))));
-        g.int("SEQ", @as(c_int, 1));
         return g;
     }
 
@@ -2366,7 +2366,7 @@ pub fn register(set: *kc.Set) !void {
             // One row, a draft verify, a prompt chunk: rows of 24 heads x 128.
             .served = &.{ .{ .rows = 1, .n = 1, .k = 3072 }, .{ .rows = 8, .n = 1, .k = 3072 }, .{ .rows = 2048, .n = 1, .k = 3072 } },
         }, null);
-        try set.add(State(dt), .init(set.a), .{
+        try set.add(State(dt, 1), .init(set.a), .{
             .name = name("inkling2 state", dt),
             .accum = .none,
             .depth = none,
@@ -2375,6 +2375,15 @@ pub fn register(set: *kc.Set) !void {
             .tiles = .{ .{ .size = KT - 1 }, .{}, .{} },
             // One row, and the narrowed prompt chunk: kv width 1024, hidden 2304.
             .served = &.{ .{ .rows = 1, .n = 1024, .k = 2304 }, .{ .rows = 2048, .n = 1024, .k = 2304 } },
+        }, null);
+        try set.add(State(dt, 3), .init(set.a), .{
+            .name = name("inkling2 state (3 sequences)", dt),
+            .accum = .none,
+            .depth = none,
+            .out = .f32,
+            .tiles = .{ .{ .size = 3 * (KT - 1) }, .{}, .{} },
+            // Three batched slots a row each, and three stacked prompts of 81 rows.
+            .served = &.{ .{ .rows = 3, .n = 1024, .k = 2304 }, .{ .rows = 243, .n = 1024, .k = 2304 } },
         }, null);
         try set.add(Mask(dt), .init(set.a), .{
             .name = name("inkling2 relmask", dt),
@@ -2495,7 +2504,7 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
         }
     }
     var at: usize = 4;
-    inline for (dtypes) |dt| inline for (.{ Gated(dt), State(dt), Mask(dt) }) |T| {
+    inline for (dtypes) |dt| inline for (.{ Gated(dt), State(dt, 1), State(dt, 3), Mask(dt) }) |T| {
         const k = set.kernels.items[at];
         at += 1;
         const p: *T = @ptrCast(@alignCast(k.ctx));

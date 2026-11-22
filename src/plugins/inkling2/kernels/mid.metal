@@ -1,7 +1,7 @@
 // Inkling 2: a visit between its output projection and its router for S rows. grid (D, S), threadgroup (TG, 1): one
 // thread per stream element of a row; sums over the stream as pre.metal's. OP [1, S, D] (T) is the output
 // projection; its short conv runs over the rows behind the window before them (columns OFF.. of ST [1, KT - 1, SW]
-// f32; SEQ 0: each row behind its own window, ST [S, KT - 1, SW]) with AW [D, KT, 1] (WT), the sum rounded to WT as the conv op does, plus OP, times PR[0], rounded to T. RES
+// f32; or a state per sequence, ST [S / SR, KT - 1, SW], SR its rows) with AW [D, KT, 1] (WT), the sum rounded to WT as the conv op does, plus OP, times PR[0], rounded to T. RES
 // [1, S, D] f32 is that plus the stream HIN [1, S, D], or that alone where the layer opens a block (BOUND), whose
 // saved stream NORMED [1, S, D] f32 then joins the blocks BLK [1, S, NB, D] f32. The MLP's input is the softmax of QY
 // [D] f32 over a row's blocks and its RES's unweighted norm, mixing them.
@@ -18,6 +18,9 @@ constexpr uint NSG = TG / 32;
 constexpr uint NS = NB + BOUND + 1;
 constexpr uint R1 = 1 + NS + MSG;
 const uint SW = ST_shape[2];
+// Rows a sequence (`prep.metal`): SR = S one state, 1 a state per row, else a state per slot of SR rows.
+const uint SR = OP_shape[1] / ST_shape[0];
+const uint local = row % SR, seq = row / SR;
 threadgroup float red1[NSG * R1];
 threadgroup float red2[NSG];
 float acc[R1];
@@ -26,10 +29,10 @@ for (uint r = 0; r < R1; r++) acc[r] = 0.0f;
 for (uint i = t, k = 0; i < D; i += TG, k++) {
     const float x = float(OP[ro + i]);
     float y = 0.0f;
-    // Tap j reads row `row + j` of [ST | the rows]; SEQ 0: tap j of [the row's own ST | the row].
+    // Tap j reads row `local + j` of [the sequence's ST | its rows].
     for (uint j = 0; j < KT; j++) {
-        const bool old = SEQ ? row + j < KT - 1 : j + 1 < KT;
-        y += (old ? ST[(SEQ ? row + j : row * (KT - 1) + j) * SW + OFF + i] : float(OP[(SEQ ? row + j - (KT - 1) : row) * D + i])) * float(AW[i * KT + j]);
+        const bool old = local + j < KT - 1;
+        y += (old ? ST[(seq * (KT - 1) + local + j) * SW + OFF + i] : float(OP[(row + j - (KT - 1)) * D + i])) * float(AW[i * KT + j]);
     }
     y = float(WT(y));
     float r = float(T((y + x) * PR[0]));

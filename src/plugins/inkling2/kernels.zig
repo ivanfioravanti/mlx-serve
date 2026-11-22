@@ -339,7 +339,7 @@ pub fn prep(g: *Graph, L: *const Layer, cfg: *const Config, proj: *const [6]Arra
         .{ "T", .{ .dtype = dt } },                  .{ "WT", .{ .dtype = ops.dtype(kw) } }, .{ "S", .{ .dtype = ops.dtype(L.q_scale) } },
         .{ "H", .{ .int = heads } },                 .{ "HD", .{ .int = hd } },              .{ "HKV", .{ .int = kv_heads } },
         .{ "DREL", .{ .int = d_rel } },              .{ "KT", .{ .int = kt } },              .{ "DYN", .{ .int = @intFromBool(dynamic) } },
-        .{ "WIDE", .{ .int = @intFromBool(wide) } }, .{ "SEQ", seqOf(st) },
+        .{ "WIDE", .{ .int = @intFromBool(wide) } },
     });
     return .{ .q = o[0], .gate = o[1], .k = o[2], .v = o[3], .bias = o[4], .rel = o[5] };
 }
@@ -651,6 +651,34 @@ pub fn batches(g: *const Graph, w: *const Body, h: Array, slots: c_int) bool {
     return true;
 }
 
+/// `attend` for stacked prompts: slot i's `c.rows` rows of the visit's prep, read as that slot's own sequence (its
+/// cache, its position) and set back in slot order.
+fn attendStacked(c: *block.Ctx, L: *const Layer, cfg: *const Config, p: *const Prep, sinks: Array) !Array {
+    const g = c.g;
+    const n = c.caches.len;
+    if (n > max_slots) return error.TooManySlots;
+    const r: c_int = @intCast(c.rows);
+    const gate_row = @divExact(ops.shape(p.gate)[0], @as(c_int, @intCast(n)) * r);
+    var reads: [max_slots]Array = undefined;
+    for (0..n) |i| {
+        const at: c_int = @as(c_int, @intCast(i)) * r;
+        var one = c.*;
+        one.slots = 1;
+        one.caches = c.caches[i .. i + 1];
+        one.positions = c.positions[i .. i + 1];
+        const pi: Prep = .{
+            .q = try g.sliceAxis(p.q, 1, at, at + r),
+            .k = try g.sliceAxis(p.k, 2, at, at + r),
+            .v = try g.sliceAxis(p.v, 2, at, at + r),
+            .gate = try g.sliceAxis(p.gate, 0, at * gate_row, (at + r) * gate_row),
+            .bias = p.bias,
+            .rel = try g.sliceAxis(p.rel, 1, at, at + r),
+        };
+        reads[i] = try attend(&one, L, cfg, &pi, try g.sliceAxis(sinks, 1, at, at + r), null, false);
+    }
+    return g.concat(reads[0..n], 1);
+}
+
 /// `attend` for batched slots: row i of the visit's q, k, v and relative states is slot i's, appended to its own
 /// cache and read through its own view under its own bias and sink.
 fn attendSlots(c: *block.Ctx, L: *const Layer, cfg: *const Config, p: *const Prep, sinks: Array) !Array {
@@ -820,7 +848,7 @@ pub fn mid(g: *Graph, L: *const Layer, w: *const Body, attn: Array, out_gate: ?A
             .{ "TG", .{ .int = tg } },                                     .{ "D", .{ .int = d } },
             .{ "KT", .{ .int = kt } },                                     .{ "OFF", .{ .int = @intCast(2 * cfg.kvDim()) } },
             .{ "NB", .{ .int = if (blocks) |b| ops.shape(b)[2] else 0 } }, .{ "BOUND", .{ .int = @intFromBool(L.boundary) } },
-            .{ "MSG", .{ .int = @intFromBool(on) } },                      .{ "SEQ", seqOf(st) },
+            .{ "MSG", .{ .int = @intFromBool(on) } },
         }) catch |e| if (e == error.ThreadLimit and narrow(cfg.hidden_size)) continue else return e;
     };
     var x = o[1];
@@ -864,7 +892,7 @@ pub fn pickSum(g: *Graph, dn: Array, sel: Array, inverse: Array, scale: Array, w
     const dt = ops.dtype(dn);
     const out: Out = .{ .shape = &.{ 1, s, d }, .dtype = dt };
     return launch(g, &sum_kernel, &.{ dn, sel, inverse, scale, weights, residual, st, taps, conv_scale }, 2, .{ out, out }, s * d, 64, &.{
-        .{ "T", .{ .dtype = dt } }, .{ "WT", .{ .dtype = ops.dtype(taps) } }, .{ "K", .{ .int = k } }, .{ "KT", .{ .int = ops.shape(st)[1] + 1 } }, .{ "SCALED", .{ .int = @intFromBool(scaled) } }, .{ "SEQ", seqOf(st) },
+        .{ "T", .{ .dtype = dt } }, .{ "WT", .{ .dtype = ops.dtype(taps) } }, .{ "K", .{ .int = k } }, .{ "KT", .{ .int = ops.shape(st)[1] + 1 } }, .{ "SCALED", .{ .int = @intFromBool(scaled) } },
     });
 }
 
@@ -967,17 +995,12 @@ pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle,
 }
 
 /// A visit's conv state `[1, KT - 1, .]` f32 after its rows: the last KT - 1 rows of the old state `st` followed
-/// by the rows' conv inputs `[kp | vp | op | xm]`. With a state per row (`[S, KT - 1, .]`, batched slots) each moves
-/// on by its own row.
+/// by the rows' conv inputs `[kp | vp | op | xm]`. With a state per sequence (`[N, KT - 1, .]`, the rows N equal spans:
+/// batched slots a row each, or stacked prompts) each moves on by its own span.
 pub fn convState(g: *Graph, st: Array, kp: Array, vp: Array, op: Array, xm: Array) !Array {
     const sh = ops.shape(st);
-    const state = try launch(g, &state_kernel, &.{ st, kp, vp, op, xm }, 1, .{.{ .shape = &.{ sh[0], sh[1], sh[2] }, .dtype = .float32 }}, sh[0] * sh[1] * sh[2], 64, &.{ .{ "KT", .{ .int = sh[1] + 1 } }, .{ "SEQ", seqOf(st) } });
+    const state = try launch(g, &state_kernel, &.{ st, kp, vp, op, xm }, 1, .{.{ .shape = &.{ sh[0], sh[1], sh[2] }, .dtype = .float32 }}, sh[0] * sh[1] * sh[2], 64, &.{ .{ "KT", .{ .int = sh[1] + 1 } } });
     return state[0];
-}
-
-/// A conv state's rows: one state the rows chain behind (`SEQ` 1), or a state per row, each a sequence of its own.
-fn seqOf(st: Array) TArg {
-    return .{ .int = @intFromBool(ops.shape(st)[0] == 1) };
 }
 
 /// One visit of one sequence's rows `[1, S, D]`: `layers.layerForward`, or null where the kernels do not run (nothing
@@ -995,12 +1018,16 @@ pub fn visit(c: *block.Ctx, L: *const Layer, w: *const Body, h: Array, blocks: ?
     const one = c.rows == 1 and !batch;
     const p = (try prep(g, L, cfg, &f.proj, f.dyn, st, if (one and L.global) layers.stepTau(cfg, total) else 1.0, if (one) keysSeen(L, cfg, total) else 0)) orelse return null;
     const fuse = one and open == null and oFormat(&L.o, ops.dtype(h)) != null;
-    const read = if (batch) try attendSlots(c, L, cfg, &p, f.proj[3]) else try attend(c, L, cfg, &p, f.proj[3], open, fuse);
+    const read = if (batch and c.rows > 1) try attendStacked(c, L, cfg, &p, f.proj[3]) else if (batch) try attendSlots(c, L, cfg, &p, f.proj[3]) else try attend(c, L, cfg, &p, f.proj[3], open, fuse);
     const m = try mid(g, L, w, read, if (fuse) p.gate else null, h, f.normed, blocks, st, f.messages);
     const t = try experts(g, L, cfg, &m, f.proj[4], f.proj[5], st, open);
     // Every path through `experts` meets here: a capture keeps the rows' conv inputs behind the old state, written
     // before the state is replaced (`st` is the cache's own array).
-    if (c.capture_spec and !batch and open == null) try kv.setState(c, .conv_input, try g.concat(&.{ st, try g.astype(try g.concat(&.{ f.proj[4], f.proj[5], m.op, t.xm }, 2), .float32) }, 1));
+    if (c.capture_spec and open == null) {
+        const rows = try g.astype(try g.concat(&.{ f.proj[4], f.proj[5], m.op, t.xm }, 2), .float32);
+        // Stacked prompts: each slot's span behind its own state, written to it by `state.put`.
+        if (batch) try slot_state.put(c, .conv_input, try g.concat(&.{ st, try g.reshape(rows, &.{ c.slots, c.rows, -1 }) }, 1)) else try kv.setState(c, .conv_input, try g.concat(&.{ st, rows }, 1));
+    }
     if (batch) try slot_state.put(c, .conv, t.state) else if (open == null) try kv.setState(c, .conv, t.state);
     return .{ .h = t.h, .blocks = m.blocks };
 }
