@@ -64,11 +64,12 @@ const Lane = struct {
         fixture.freeEntries(l.ssm);
     }
 
-    /// Prefills `n` ids of `seed`'s sequence in chunks of at most 4096 rows.
+    /// Prefills `n` ids of `seed`'s sequence in chunks of at most 4096 rows; from seed 100 the sequence repeats every 47
+    /// ids, a prompt the model continues confidently.
     fn prefill(l: *Lane, n: usize, seed: u32) !void {
         const ids = try testing.allocator.alloc(i32, n);
         defer testing.allocator.free(ids);
-        for (ids, 0..) |*v, i| v.* = @intCast(1000 + (seed * 7919 + 37 * @as(u32, @intCast(i))) % 20000);
+        for (ids, 0..) |*v, i| v.* = if (seed >= 100) @intCast(1000 + (seed * 7919 + 37 * @as(u32, @intCast(i % 47))) % 20000) else @intCast(1000 + (seed * 7919 + 37 * @as(u32, @intCast(i))) % 20000);
         var at: usize = 0;
         while (at < n) {
             const end = @min(n, at + 4096);
@@ -161,4 +162,58 @@ test "inkling2 batched: a slot's row depends on its own state only, at any index
         try ops.expectBitEqual(b[2], a[0]);
         try expectSameState(&lanes[3], &lanes[0]);
     }
+}
+
+/// Row `i` of logits `[rows, vocab]` (or `[vocab]`) on the host, f32.
+fn hostRow(g: *ops.Graph, x: Array, i: c_int) ![]const f32 {
+    const sh = ops.shape(x);
+    const row = if (sh.len == 2) try g.sliceAxis(x, 0, i, i + 1) else x;
+    const f = try g.contiguous(try g.astype(row, .float32));
+    try ops.eval(f);
+    return mlx.mlx_array_data_float32(f).?[0..mlx.mlx_array_size(f)];
+}
+
+fn argmax(v: []const f32) u32 {
+    var best: usize = 0;
+    for (v, 0..) |x, i| if (x > v[best]) {
+        best = i;
+    };
+    return @intCast(best);
+}
+
+test "inkling2 batched: two slots decode what each decodes alone, within the routed kernels' numerics" {
+    // Bar: greedy ids equal to each prompt's solo run for 16 steps, and the batched row within 0.75 of the solo
+    // logits over the solo's top 10 (the MoE's multi-row kernels round apart from its one-token ones, and each side's
+    // own KV and windows carry that apart step by step; repeating prompts keep greedy off near-ties).
+    const p = (try Served.open()) orelse return error.SkipZigTest;
+    defer p.close();
+    var lanes: [4]Lane = undefined;
+    for (&lanes) |*l| try l.init(&p.xfm);
+    defer for (&lanes) |*l| l.deinit();
+    const lens = [_]usize{ 600, 1300, 600, 1300 };
+    const seeds = [_]u32{ 108, 109, 108, 109 };
+    for (&lanes, lens, seeds) |*l, n, sd| try l.prefill(n, sd);
+    var next = [2]u32{ 4021, 977 };
+    var worst: f32 = 0;
+    for (0..16) |_| {
+        var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
+        defer g.deinit();
+        var got: [2]Array = undefined;
+        try tick(&g, &p.xfm, &.{ &lanes[2], &lanes[3] }, &next, &got);
+        for (0..2) |i| {
+            const solo = try hostRow(&g, try lanes[i].step(&g, @intCast(next[i])), 0);
+            const batched = try hostRow(&g, got[i], 0);
+            try testing.expectEqual(argmax(solo), argmax(batched));
+            const top = try testing.allocator.dupe(f32, solo);
+            defer testing.allocator.free(top);
+            std.mem.sort(f32, top, {}, std.sort.desc(f32));
+            const floor = top[9];
+            for (solo, batched) |a, b| if (a >= floor) {
+                worst = @max(worst, @abs(a - b));
+            };
+            next[i] = argmax(solo);
+        }
+    }
+    std.debug.print("[inkling2 batched] worst gap over the solo top 10: {d:.3}\n", .{worst});
+    try testing.expect(worst <= 0.75);
 }
