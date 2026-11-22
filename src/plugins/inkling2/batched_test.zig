@@ -250,3 +250,65 @@ test "inkling2 served: a 140-row tail's checkpoint cut at 109 rows from one capt
         if (w.conv_state.ctx != null) try ops.expectBitEqual(w.conv_state, h.conv_state);
     }
 }
+
+/// `ids` of each lane as `[N, w]` through one batched forward: each lane's last-row logits `[1, vocab]`, owned by `g`.
+fn stackedPrefill(g: *ops.Graph, x: *Transformer, lanes: []const *Lane, ids: []const i32, w: usize) ![8]Array {
+    var ctxs: [8]*ForwardCtx = undefined;
+    var offs: [8]u32 = undefined;
+    for (lanes, 0..) |l, i| {
+        ctxs[i] = &l.ctx;
+        offs[i] = @intCast(l.off);
+    }
+    const toks = try g.fromSlice(i32, ids, &.{ @intCast(lanes.len), @intCast(w) });
+    var hl = mlx.mlx_array_new();
+    var ha = mlx.mlx_array_new();
+    const logits = try g.adopt(try x.forwardMoeBatchedVerify(toks, ctxs[0..lanes.len], offs[0..lanes.len], &hl, &ha));
+    _ = try g.adopt(hl);
+    _ = try g.adopt(ha);
+    for (lanes) |l| l.off += w;
+    var out: [8]Array = undefined;
+    const iw: c_int = @intCast(w);
+    for (0..lanes.len) |i| {
+        const ii: c_int = @intCast(i);
+        out[i] = try g.reshape(try g.sliceAxis(try g.sliceAxis(logits, 0, ii, ii + 1), 1, iw - 1, iw), &.{ 1, ops.shape(logits)[2] });
+    }
+    try ops.evalMany(out[0..lanes.len]);
+    return out;
+}
+
+test "inkling2 batched: slots' prompt spans in one forward give each span's solo prefill, within the routed kernels' numerics" {
+    // Bar: each slot's last row has its solo prefill's top token, within 0.75 of its logits over their top 10 (the MoE
+    // rounds the stacked rows apart from a lone span's), and leaves its conv windows within the same class.
+    const p = (try Served.open()) orelse return error.SkipZigTest;
+    defer p.close();
+    const n = 3;
+    const w = 81;
+    var lanes: [2 * n]Lane = undefined;
+    for (&lanes) |*l| try l.init(&p.xfm);
+    defer for (&lanes) |*l| l.deinit();
+    // Slots after their own restored prefixes of different lengths, then a prompt span each.
+    for (0..n) |i| for ([_]usize{ i, n + i }) |li| try lanes[li].prefill(200 + 150 * i, @intCast(100 + i));
+    var ids: [n * w]i32 = undefined;
+    for (&ids, 0..) |*v, i| v.* = @intCast(1000 + (101 * 7919 + 53 * @as(u32, @intCast(i))) % 20000);
+    var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    var stacked_lanes: [n]*Lane = undefined;
+    for (&stacked_lanes, 0..) |*s, i| s.* = &lanes[n + i];
+    const got = try stackedPrefill(&g, &p.xfm, &stacked_lanes, &ids, w);
+    var worst: f32 = 0;
+    for (0..n) |i| {
+        const solo_logits = try g.adopt(try p.xfm.forwardWith(&lanes[i].ctx, try g.fromSlice(i32, ids[i * w ..][0..w], &.{ 1, w })));
+        const sh = ops.shape(solo_logits);
+        const solo = try hostRow(&g, try g.reshape(try g.sliceAxis(solo_logits, 1, sh[1] - 1, sh[1]), &.{ 1, sh[2] }), 0);
+        const stacked = try hostRow(&g, got[i], 0);
+        try testing.expectEqual(argmax(solo), argmax(stacked));
+        const top = try testing.allocator.dupe(f32, solo);
+        defer testing.allocator.free(top);
+        std.mem.sort(f32, top, {}, std.sort.desc(f32));
+        for (solo, stacked) |a, b| if (a >= top[9]) {
+            worst = @max(worst, @abs(a - b));
+        };
+    }
+    std.debug.print("[inkling2 batched] stacked prompt spans, worst gap over the solo top 10: {d:.3}\n", .{worst});
+    try testing.expect(worst <= 0.75);
+}
