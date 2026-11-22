@@ -173,6 +173,41 @@ pub const Both = struct {
         try ops.expectBitEqual(after, try g.adopt(try b.xfm.forwardWith(&serial.ctx, try fixture.tokens(&g, &.{next}))));
     }
 
+    /// After `prompt`, the checkpoint cut at `rows` from one capturing forward over `tail` (`captureSsmCheckpointAt`)
+    /// is the one the chunk loop takes after a prefill chunk of `tail[0..rows]`, every layer bit for bit.
+    pub fn expectTailCheckpointIsChunks(b: *Both, prompt: []const i32, tail: []const i32, rows: usize) !void {
+        const checkpoint = @import("../ssm/checkpoint.zig");
+        var chunked: Slot = undefined;
+        try chunked.init(b, &b.xfm);
+        defer chunked.deinit();
+        var whole: Slot = undefined;
+        try whole.init(b, &b.xfm);
+        defer whole.deinit();
+        var g = ops.Graph.init(testing.allocator, b.xfm.s);
+        defer g.deinit();
+        for ([_]*Slot{ &chunked, &whole }) |s| {
+            s.ctx.prefill = true;
+            try ops.eval(try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, prompt))));
+        }
+        try ops.eval(try g.adopt(try b.xfm.forwardWith(&chunked.ctx, try fixture.tokens(&g, tail[0..rows]))));
+        var want = try checkpoint.captureSsmCheckpoint(testing.allocator, chunked.ssm.?, prompt.len + rows, b.xfm.s);
+        defer want.deinit(testing.allocator);
+        whole.ctx.capture_ssm_seq = true;
+        try ops.eval(try g.adopt(try b.xfm.forwardWith(&whole.ctx, try fixture.tokens(&g, tail))));
+        whole.ctx.capture_ssm_seq = false;
+        var got = try checkpoint.captureSsmCheckpointAt(testing.allocator, whole.ssm.?, prompt.len + rows, @intCast(rows), @intCast(tail.len), b.xfm.s);
+        defer got.deinit(testing.allocator);
+        var conv_layers: usize = 0;
+        for (want.layers, got.layers) |w, h| {
+            try testing.expectEqual(w.initialized, h.initialized);
+            try testing.expectEqual(w.conv_state.ctx == null, h.conv_state.ctx == null);
+            if (w.conv_state.ctx == null) continue;
+            try ops.expectBitEqual(w.conv_state, h.conv_state);
+            conv_layers += 1;
+        }
+        try testing.expect(conv_layers > 0);
+    }
+
     /// Greedy decode through the pipelined step (`lazyForward`: the next token stays a lazy argmax), tokens equal.
     pub fn expectGreedy(b: *Both) !void {
         // Off Metal the tiny pack's pipelined generation can stall in MLX's CUDA wait; served packs complete.

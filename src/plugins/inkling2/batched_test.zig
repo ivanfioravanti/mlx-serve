@@ -217,3 +217,36 @@ test "inkling2 batched: two slots decode what each decodes alone, within the rou
     std.debug.print("[inkling2 batched] worst gap over the solo top 10: {d:.3}\n", .{worst});
     try testing.expect(worst <= 0.75);
 }
+
+// Bar: a restored tail's checkpoint from one capturing forward is the chunk loop's, every visit's windows bit for bit.
+test "inkling2 served: a 140-row tail's checkpoint cut at 109 rows from one capturing forward is the chunk loop's" {
+    const p = (try Served.open()) orelse return error.SkipZigTest;
+    defer p.close();
+    const checkpoint = @import("../../engines/mlx/ssm/checkpoint.zig");
+    var chunked: Lane = undefined;
+    try chunked.init(&p.xfm);
+    defer chunked.deinit();
+    var whole: Lane = undefined;
+    try whole.init(&p.xfm);
+    defer whole.deinit();
+    for ([_]*Lane{ &chunked, &whole }) |l| {
+        l.ctx.prefill = true;
+        try l.prefill(600, 3);
+    }
+    var tail: [140]i32 = undefined;
+    for (&tail, 0..) |*v, i| v.* = @intCast(1000 + (11 * 7919 + 37 * @as(u32, @intCast(i))) % 20000);
+    var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    try ops.eval(try g.adopt(try p.xfm.forwardWith(&chunked.ctx, try g.fromSlice(i32, tail[0..109], &.{ 1, 109 }))));
+    var want = try checkpoint.captureSsmCheckpoint(testing.allocator, chunked.ssm, 709, p.xfm.s);
+    defer want.deinit(testing.allocator);
+    whole.ctx.capture_ssm_seq = true;
+    try ops.eval(try g.adopt(try p.xfm.forwardWith(&whole.ctx, try g.fromSlice(i32, &tail, &.{ 1, 140 }))));
+    whole.ctx.capture_ssm_seq = false;
+    var got = try checkpoint.captureSsmCheckpointAt(testing.allocator, whole.ssm, 709, 109, 140, p.xfm.s);
+    defer got.deinit(testing.allocator);
+    for (want.layers, got.layers) |w, h| {
+        try testing.expectEqual(w.initialized, h.initialized);
+        if (w.conv_state.ctx != null) try ops.expectBitEqual(w.conv_state, h.conv_state);
+    }
+}

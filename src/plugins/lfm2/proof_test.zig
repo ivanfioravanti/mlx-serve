@@ -181,6 +181,18 @@ test "lfm2 served: an lfm2_moe pack (dense first layer, sigmoid-routed experts, 
     try servedCase(.{ .moe = true }, 0x1f3c);
 }
 
+// Bar: a restored tail's checkpoint from one capturing forward is the chunk loop's, every conv window bit for bit.
+test "lfm2 served: a tail's checkpoint cut from one capturing forward is the chunk loop's, bit for bit" {
+    var p = fixture.Pack.init(0x1f3a);
+    defer p.deinit();
+    try writePack(&p, .{});
+    var cbuf: [2048]u8 = undefined;
+    var b = try both.Both.openAs(&lfm2.table, &p, try configJson(&cbuf, .{}), true, .none);
+    defer b.close();
+    const tail = [_]i32{ 9, 33, 77, 140, 2, 18, 19, 20, 21, 22, 23, 5, 61, 200, 3, 17, 42, 99, 7, 250, 1, 8, 66, 31 };
+    try b.expectTailCheckpointIsChunks(&.{ 3, 17, 42, 99, 7, 250, 1, 8 }, &tail, 17);
+}
+
 test "lfm2 plugin: parse equals the engine's parse on the shell and the plugin's own fields" {
     var buf: [2048]u8 = undefined;
     try expectParse(config.lfm25_text);
