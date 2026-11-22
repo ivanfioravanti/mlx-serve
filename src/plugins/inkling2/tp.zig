@@ -205,9 +205,14 @@ test "inkling2 tp: rank 0's split plus the worker's share is one node's prefill;
     const tokens = try a.alloc(u32, TP_ROWS);
     for (tokens, 0..) |*t, i| t.* = @intCast((i * 7 + 1) % 60);
     const want = try TestPair.prefill(a, &whole, tokens);
+    // A GPU forward of another width rounds otherwise, and on this random pack a last bit flips an expert pick here
+    // and there (`proof_test.zig`): the bar is each row's top token, not its logits.
     const near = struct {
         fn check(x: []const f32, y: []const f32) !void {
-            for (x, y) |p, q| try testing.expectApproxEqAbs(p, q, 2e-3);
+            const vocab = 60;
+            var same: usize = 0;
+            for (0..x.len / vocab) |r| same += @intFromBool(std.mem.indexOfMax(f32, x[r * vocab ..][0..vocab]) == std.mem.indexOfMax(f32, y[r * vocab ..][0..vocab]));
+            try testing.expect(same * 100 >= 98 * (x.len / vocab));
         }
     };
     const visits = held.base.weights.body.cfg.visits();
@@ -230,4 +235,39 @@ test "inkling2 tp: rank 0's split plus the worker's share is one node's prefill;
     try near.check(want, try TestPair.prefill(a, &rank0, tokens));
     try testing.expect(std.mem.indexOf(u8, fh.last(), "worker lost at layer 3") != null);
     TestPair.fail_at = null;
+}
+
+// Bar: the two ranks' shares of a layer's experts add up to the whole bank's weighted sum (the bank as one share) to
+// f32 summation order, at a chunk of rows; a worker cut as rank 0 must not.
+test "inkling2 tp: two shares of every expert's units sum to the whole MLP" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pack = try conformance.Loaded.openWith(testing.io, a, plugin.plugin.name, &plugin.table, try plugin.conformanceFixture(a), .{ .gpu = true });
+    defer pack.close();
+    const m: *plugin.Loaded = @ptrCast(@alignCast(pack.model));
+    const cfg = &m.base.weights.body.cfg;
+    const L = &m.layers[1];
+    var g = Graph.init(testing.allocator, m.base.s);
+    defer g.deinit();
+    const key = try g.call(mlx.mlx_random_key, .{@as(u64, 7)});
+    const x = try g.call(mlx.mlx_random_normal, .{ &[_]c_int{ 1, 40, @intCast(cfg.hidden_size) }, @as(usize, 3), ops.Dtype.float32, @as(f32, 0), @as(f32, 1), key });
+    const r = try layers.route(&g, L, cfg, x);
+    const shares = [_]Share{ try cut(L, &g, 0, 1, 1), try cut(L, &g, 0, 2, 1), try cut(L, &g, 1, 2, 1) };
+    for (shares) |sh| for ([_]Array{ sh.gate_up.w, sh.gate_up.s, sh.gate_up.b, sh.down.w, sh.down.s, sh.down.b }) |w| if (w.ctx != null) {
+        _ = try g.adopt(w);
+    };
+    const want = try partial(&g, L, cfg, &shares[0], x, r.idx, r.weights);
+    const scale = try g.addScalar(try g.call(mlx.mlx_max, .{ try g.abs(want), false }), 1e-6);
+    for ([_]struct { Array, bool }{
+        .{ try g.add(try partial(&g, L, cfg, &shares[1], x, r.idx, r.weights), try partial(&g, L, cfg, &shares[2], x, r.idx, r.weights)), true },
+        .{ try g.add(try partial(&g, L, cfg, &shares[1], x, r.idx, r.weights), try partial(&g, L, cfg, &shares[1], x, r.idx, r.weights)), false },
+    }) |c| {
+        const q = try g.div(try g.call(mlx.mlx_max, .{ try g.abs(try g.sub(c[0], want)), false }), scale);
+        try ops.eval(q);
+        var v: f32 = 0;
+        try mlx.check(mlx.mlx_array_item_float32(&v, q));
+        if (c[1]) try testing.expect(v <= 1e-5) else try testing.expect(v > 1e-2);
+    }
 }
