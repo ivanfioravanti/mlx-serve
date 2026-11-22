@@ -392,7 +392,7 @@ test "inkling2 stacked: a padded span settles to its own rows, whatever its neig
         lanes[0].off = span;
         try testing.expectEqual(@as(usize, span), lanes[0].kv.step);
         for (solo_at.layers, lanes[0].ssm) |x, y| if (x.conv_state.ctx != null) try expectClose(&g, x.conv_state, .{ .ctx = y.conv_state.ctx }, 0.15);
-        // Row 30 of a 60-row forward rounds apart from a 30-row one's (the K split's width class, wider this shallow).
+        // A span's head row rounds apart in a wider forward than its own chunk (the K split's width class).
         for (solo_cp.layers, cp.layers) |x, y| if (x.conv_state.ctx != null) try expectClose(&g, x.conv_state, y.conv_state, 0.3);
         const got = try hostRow(&g, try lanes[0].step(&g, prompt[span]), 0);
         try testing.expectEqual(argmax(solo_next), argmax(got));
