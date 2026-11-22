@@ -34,12 +34,12 @@ pub const Pair = struct {
 /// Rank 0's tie from a layer to the pair.
 pub const Tp = struct { pair: *Pair, layer: u32 };
 
-/// A rank's pairs, sorted by expert: their rows, experts and routing weights.
-pub const Pairs = struct { rows: []u32, sel: []u32, w: []f32 };
+/// A rank's pairs, sorted by expert: each one's place `row * k + pick` in the routing, its expert and its weight.
+pub const Pairs = struct { at: []u32, sel: []u32, w: []f32 };
 
 /// The pairs of `idx` / `weights` (`[t * k]`, row-major) split by expert: `worker` gets the experts it is given
 /// greedily, most pairs first, while its pairs stay within `share` of all; `mine` the rest. Both sorted by expert.
-pub fn split(a: std.mem.Allocator, idx: []const u32, weights: []const f32, k: usize, experts: usize, share: f32) ![2]Pairs {
+pub fn split(a: std.mem.Allocator, idx: []const u32, weights: []const f32, experts: usize, share: f32) ![2]Pairs {
     const counts = try a.alloc(u32, experts);
     defer a.free(counts);
     @memset(counts, 0);
@@ -71,12 +71,12 @@ pub fn split(a: std.mem.Allocator, idx: []const u32, weights: []const f32, k: us
         sizes[r] += counts[e];
     }
     var out: [2]Pairs = undefined;
-    for (&out, sizes) |*p, n| p.* = .{ .rows = try a.alloc(u32, n), .sel = try a.alloc(u32, n), .w = try a.alloc(f32, n) };
+    for (&out, sizes) |*p, n| p.* = .{ .at = try a.alloc(u32, n), .sel = try a.alloc(u32, n), .w = try a.alloc(f32, n) };
     for (idx, weights, 0..) |e, wt, j| {
         const p = &out[@intFromBool(theirs[e])];
         const i = at[e];
         at[e] += 1;
-        p.rows[i] = @intCast(j / k);
+        p.at[i] = @intCast(j);
         p.sel[i] = e;
         p.w[i] = wt;
     }
@@ -84,35 +84,56 @@ pub fn split(a: std.mem.Allocator, idx: []const u32, weights: []const f32, k: us
 }
 
 pub fn free(a: std.mem.Allocator, p: Pairs) void {
-    a.free(p.rows);
+    a.free(p.at);
     a.free(p.sel);
     a.free(p.w);
 }
 
-/// The weighted f32 sum `[t, D]` of the rows `x` `[t, D]` through the pairs `rows`, `sel` (sorted) and weights `w`
-/// (`[p]` each), as the gather path of `kernels.experts` runs a pair.
-pub fn pairsSum(g: *Graph, L: *const layers.Layer, cfg: *const Config, x: Array, rows: Array, sel: Array, w: Array) !Array {
-    const t = ops.shape(x)[0];
+/// The down projections `[p, 1, D]` of the rows `x` `[t, D]` through the pairs `at` (`row * k + pick`) and `sel`
+/// (sorted by expert), as the gather path of `kernels.experts` runs a pair.
+pub fn downs(g: *Graph, L: *const layers.Layer, cfg: *const Config, x: Array, at: Array, sel: Array) !Array {
     const d = ops.shape(x)[1];
     const p = ops.shape(sel)[0];
     const caps = try g.fromSlice(f32, &.{ 1.0 / cfg.gate_softcap, cfg.gate_softcap, 1.0 / cfg.up_softcap, cfg.up_softcap }, &.{4});
     const scaled = L.gate_up_scale.ctx != null;
+    const rows = try g.call(mlx.mlx_floor_divide, .{ at, try g.astype(try g.scalar(@floatFromInt(cfg.top_k), .float32), .uint32) });
     const picked = try g.reshape(try g.take(x, rows, 0), &.{ p, 1, d });
     const act = try kernels.activation(g, try layers.gather(g, picked, &L.gate_up, sel, true), sel, if (scaled) L.gate_up_scale else caps, caps, scaled);
-    const dn = try g.reshape(try g.astype(try layers.gather(g, act, &L.down, sel, true), .float32), &.{ p, d });
-    var wt = try g.astype(w, .float32);
-    if (L.down_scale.ctx != null) wt = try g.mul(wt, try g.take(L.down_scale, sel, 0));
-    const terms = try g.reshape(try g.mul(dn, try g.expandDims(wt, -1)), &.{ p, 1, d });
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx_scatter_add_single(&out, try g.zeros(&.{ t, d }, .float32), rows, terms, 0, g.s));
-    return g.adopt(out);
+    return layers.gather(g, act, &L.down, sel, true);
 }
 
-extern "c" fn mlx_scatter_add_single(res: *Array, a: Array, indices: Array, updates: Array, axis: c_int, s: mlx.mlx_stream) c_int;
+/// The sum kernel's view of a rank's pairs among a chunk's `n` = `t * k` places: each place's pair in the list, or
+/// `zero` (a zero row) where the pair is the other rank's, and its weight times the expert's down scale (`ds`, so
+/// the kernel reads no scale), 0 there.
+const Places = struct { inv: []u32, w: []f32 };
 
-/// Rank 0, a prefill chunk's MLP `[1, S, D]` in `x`'s dtype: the worker's pairs sent, this rank's queued, the sums
-/// added in f32; null = the single-node MLP (a short chunk, no pair, or the worker gone).
-pub fn exchange(g: *Graph, L: *const layers.Layer, cfg: *const Config, x: Array, idx: Array, weights: Array) !?Array {
+fn places(a: std.mem.Allocator, p: Pairs, n: usize, zero: u32, ds: ?[]const f32) !Places {
+    const inv = try a.alloc(u32, n);
+    const w = try a.alloc(f32, n);
+    @memset(inv, zero);
+    @memset(w, 0);
+    for (p.at, p.sel, p.w, 0..) |j, e, wt, i| {
+        inv[j] = @intCast(i);
+        w[j] = if (ds) |s| wt * s[e] else wt;
+    }
+    return .{ .inv = inv, .w = w };
+}
+
+/// `L.down_scale` on the host (evaluated at load), or null.
+fn downScale(L: *const layers.Layer) ?[]const f32 {
+    if (L.down_scale.ctx == null) return null;
+    const n: usize = @intCast(ops.shape(L.down_scale)[0]);
+    return (mlx.mlx_array_data_float32(L.down_scale) orelse return null)[0..n];
+}
+
+/// What `kernels.experts` hands the sum kernel for a split chunk: rank 0's pair outputs, the worker's row sums and a
+/// zero row (`dn`); each row's `k` places plus one for the worker's sum (`inverse` `[t * (k + 1)]`, `weights`
+/// `[1, t, k + 1]`, the down scales folded in); `picks` = k + 1.
+pub const Split = struct { dn: Array, sel: Array, inverse: Array, weights: Array, picks: c_int };
+
+/// Rank 0, a prefill chunk's experts split with the worker; null = the single-node MLP (a short chunk, no pair, the
+/// worker given nothing, or gone).
+pub fn exchange(g: *Graph, L: *const layers.Layer, cfg: *const Config, x: Array, idx: Array, weights: Array) !?Split {
     const tp = L.tp orelse return null;
     const pair = tp.pair;
     const s = ops.shape(x)[1];
@@ -121,25 +142,24 @@ pub fn exchange(g: *Graph, L: *const layers.Layer, cfg: *const Config, x: Array,
     const send = host_abi.expertExchangeOf(h) orelse return null;
     const d = ops.shape(x)[2];
     const k: usize = cfg.top_k;
+    const t: usize = @intCast(s);
+    const n = t * k;
     const flat = try g.reshape(x, &.{ s, d });
     const routes = try g.contiguous(try g.astype(try g.reshape(idx, &.{-1}), .uint32));
     const w32 = try g.contiguous(try g.astype(try g.reshape(weights, &.{-1}), .float32));
     // The split reads the routing here; the rows are ready to go once it returns.
-    try ops.eval(flat);
-    try ops.eval(routes);
-    try ops.eval(w32);
-    const n: usize = @intCast(ops.shape(routes)[0]);
-    const parts = try split(gpa, (mlx.mlx_array_data_uint32(routes) orelse return error.Inkling2TpRoutes)[0..n], (mlx.mlx_array_data_float32(w32) orelse return error.Inkling2TpRoutes)[0..n], k, cfg.num_experts, WORKER_SHARE);
+    try evalAll(&.{ flat, routes, w32 });
+    const parts = try split(gpa, (mlx.mlx_array_data_uint32(routes) orelse return error.Inkling2TpRoutes)[0..n], (mlx.mlx_array_data_float32(w32) orelse return error.Inkling2TpRoutes)[0..n], cfg.num_experts, WORKER_SHARE);
     defer for (parts) |p| free(gpa, p);
-    const mine = if (parts[0].sel.len > 0) try listSum(g, L, cfg, flat, parts[0]) else try g.zeros(&.{ s, d }, .float32);
-    if (parts[1].sel.len == 0) return try g.reshape(try g.astype(mine, ops.dtype(x)), &.{ 1, s, d });
-    try queue(&.{mine});
-    // The worker's pairs as `[p, 2]` (row, expert) and their weights `[p]`.
+    if (parts[1].sel.len == 0) return null;
+    const p0 = parts[0].sel.len;
     const p1: c_int = @intCast(parts[1].sel.len);
-    const theirs_pairs = try g.reshape(try g.concat(&.{ try g.fromSlice(u32, parts[1].rows, &.{ p1, 1 }), try g.fromSlice(u32, parts[1].sel, &.{ p1, 1 }) }, 1), &.{ p1, 2 });
+    const mine = if (p0 > 0) try downs(g, L, cfg, flat, try g.fromSlice(u32, parts[0].at, &.{@intCast(p0)}), try g.fromSlice(u32, parts[0].sel, &.{@intCast(p0)})) else null;
+    // The worker's pairs as `[p, 2]` (place, expert) and their weights `[p]`.
+    const theirs_pairs = try g.reshape(try g.concat(&.{ try g.fromSlice(u32, parts[1].at, &.{ p1, 1 }), try g.fromSlice(u32, parts[1].sel, &.{ p1, 1 }) }, 1), &.{ p1, 2 });
     const theirs_w = try g.fromSlice(f32, parts[1].w, &.{p1});
-    try ops.eval(theirs_pairs);
-    try ops.eval(theirs_w);
+    try evalAll(&.{ theirs_pairs, theirs_w });
+    if (mine) |y| try queue(&.{y});
     var theirs: host_abi.Array = .{};
     const v = send(h.ctx, tp.layer, .{ .ctx = flat.ctx }, .{ .ctx = theirs_pairs.ctx }, .{ .ctx = theirs_w.ctx }, &theirs);
     if (!v.isOk()) {
@@ -149,13 +169,38 @@ pub fn exchange(g: *Graph, L: *const layers.Layer, cfg: *const Config, x: Array,
         return null;
     }
     if (tp.layer == 0) say(h, .info, "[dist] inkling2 experts engaged: {d} rows, {d} of {d} pairs on the worker\n", .{ s, p1, n });
-    const sum = try g.add(mine, try g.astype(try g.adopt(.{ .ctx = theirs.ctx }), .float32));
-    return try g.reshape(try g.astype(sum, ops.dtype(x)), &.{ 1, s, d });
+    // Rows: rank 0's p0 outputs, the worker's t sums, one zero row; each row's last place is the worker's sum.
+    const pl = try places(gpa, parts[0], n, @intCast(p0 + t), downScale(L));
+    defer gpa.free(pl.inv);
+    defer gpa.free(pl.w);
+    const inv = try gpa.alloc(u32, t * (k + 1));
+    defer gpa.free(inv);
+    const wts = try gpa.alloc(f32, t * (k + 1));
+    defer gpa.free(wts);
+    for (0..t) |r| {
+        @memcpy(inv[r * (k + 1) ..][0..k], pl.inv[r * k ..][0..k]);
+        @memcpy(wts[r * (k + 1) ..][0..k], pl.w[r * k ..][0..k]);
+        inv[r * (k + 1) + k] = @intCast(p0 + r);
+        wts[r * (k + 1) + k] = 1;
+    }
+    const dt = ops.dtype(x);
+    const sums = try g.reshape(try g.astype(try g.adopt(.{ .ctx = theirs.ctx }), dt), &.{ s, 1, d });
+    const z = try g.zeros(&.{ 1, 1, d }, dt);
+    const dn = if (mine) |y| try g.concat(&.{ try g.astype(y, dt), sums, z }, 0) else try g.concat(&.{ sums, z }, 0);
+    const kp: c_int = @intCast(k + 1);
+    return .{
+        .dn = dn,
+        .sel = try g.zeros(&.{@intCast(p0 + t + 1)}, .uint32),
+        .inverse = try g.fromSlice(u32, inv, &.{s * kp}),
+        .weights = try g.fromSlice(f32, wts, &.{ 1, s, kp }),
+        .picks = kp,
+    };
 }
 
-fn listSum(g: *Graph, L: *const layers.Layer, cfg: *const Config, flat: Array, p: Pairs) !Array {
-    const np: c_int = @intCast(p.sel.len);
-    return pairsSum(g, L, cfg, flat, try g.fromSlice(u32, p.rows, &.{np}), try g.fromSlice(u32, p.sel, &.{np}), try g.fromSlice(f32, p.w, &.{np}));
+fn evalAll(xs: []const Array) !void {
+    const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_eval(v));
 }
 
 fn queue(xs: []const Array) !void {
@@ -177,10 +222,28 @@ pub fn expertShare(ls: []const layers.Layer, cfg: *const Config, s: mlx.mlx_stre
 }
 
 fn shareRows(g: *Graph, L: *const layers.Layer, cfg: *const Config, x: Array, pairs: Array, w: Array) !Array {
+    const t = ops.shape(x)[0];
+    const d = ops.shape(x)[1];
     const p = ops.shape(pairs)[0];
-    const rows = try g.reshape(try g.sliceAxis(pairs, 1, 0, 1), &.{p});
-    const sel = try g.reshape(try g.sliceAxis(pairs, 1, 1, 2), &.{p});
-    return pairsSum(g, L, cfg, x, rows, sel, w);
+    const k: usize = cfg.top_k;
+    const at = try g.contiguous(try g.reshape(try g.sliceAxis(pairs, 1, 0, 1), &.{p}));
+    const sel = try g.contiguous(try g.reshape(try g.sliceAxis(pairs, 1, 1, 2), &.{p}));
+    try evalAll(&.{ at, sel, w });
+    const pu: usize = @intCast(p);
+    const mine: Pairs = .{
+        .at = @constCast((mlx.mlx_array_data_uint32(at) orelse return error.Inkling2TpPairs)[0..pu]),
+        .sel = @constCast((mlx.mlx_array_data_uint32(sel) orelse return error.Inkling2TpPairs)[0..pu]),
+        .w = @constCast((mlx.mlx_array_data_float32(w) orelse return error.Inkling2TpPairs)[0..pu]),
+    };
+    const pl = try places(gpa, mine, @as(usize, @intCast(t)) * k, @intCast(p), downScale(L));
+    defer gpa.free(pl.inv);
+    defer gpa.free(pl.w);
+    const dn = try g.concat(&.{ try downs(g, L, cfg, x, at, sel), try g.zeros(&.{ 1, 1, d }, ops.dtype(x)) }, 0);
+    const kc: c_int = @intCast(k);
+    const unused = try g.zeros(&.{1}, .float32);
+    // The sum kernel's MLP output rows; its conv and add over zeros are dropped.
+    const o = try kernels.pickSum(g, dn, try g.zeros(&.{p + 1}, .uint32), try g.fromSlice(u32, pl.inv, &.{t * kc}), unused, try g.fromSlice(f32, pl.w, &.{ 1, t, kc }), try g.zeros(&.{ 1, t, d }, .float32), try g.zeros(&.{ 1, @intCast(cfg.sconv_kernel - 1), d }, .float32), L.mlp_conv, unused, kc, false);
+    return g.reshape(o[1], &.{ t, d });
 }
 
 /// A line through the host's log.
@@ -213,7 +276,7 @@ test "inkling2 tp: a chunk's pairs split by expert, the worker's within its shar
         e.* = @intCast(@min(r.uintLessThan(u32, experts), r.uintLessThan(u32, experts)));
         x.* = @floatFromInt(j);
     }
-    const parts = try split(a, &idx, &w, k, experts, WORKER_SHARE);
+    const parts = try split(a, &idx, &w, experts, WORKER_SHARE);
     defer for (parts) |p| free(a, p);
     try testing.expectEqual(idx.len, parts[0].sel.len + parts[1].sel.len);
     var seen: [idx.len]bool = @splat(false);
@@ -221,11 +284,11 @@ test "inkling2 tp: a chunk's pairs split by expert, the worker's within its shar
     var counts: [experts]usize = @splat(0);
     for (idx) |e| counts[e] += 1;
     for (counts) |c| most = @max(most, c);
-    for (parts) |p| for (p.rows, p.sel, p.w, 0..) |row, e, x, i| {
+    for (parts) |p| for (p.at, p.sel, p.w, 0..) |at, e, x, i| {
         const j: usize = @intFromFloat(x);
         try testing.expect(!seen[j]);
         seen[j] = true;
-        try testing.expectEqual(j / k, row);
+        try testing.expectEqual(j, at);
         try testing.expectEqual(idx[j], e);
         if (i > 0) try testing.expect(p.sel[i - 1] <= e);
     };
