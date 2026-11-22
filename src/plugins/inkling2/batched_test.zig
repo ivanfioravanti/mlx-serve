@@ -348,8 +348,9 @@ fn expectClose(g: *ops.Graph, x: Array, y: Array, bound: f32) !void {
 }
 
 // Bar: a slot's span stacked beside shorter, equal or longer neighbours (padded to the longest with its last real token)
-// keeps exactly its own rows in its cache, conv windows and backoff checkpoint within the width class of its solo
-// prefill, and the next step's top token. Pads come after a slot's real rows and every block is causal over rows.
+// keeps exactly its own rows in its cache, conv windows (bit-equal to the pass's own when unpadded) and backoff
+// checkpoint within the width class of its solo forwards, and the next step's top token. Pads come after a slot's real
+// rows and every block is causal over rows.
 test "inkling2 stacked: a padded span settles to its own rows, whatever its neighbours" {
     const p = (try Served.open()) orelse return error.SkipZigTest;
     defer p.close();
@@ -359,15 +360,19 @@ test "inkling2 stacked: a padded span settles to its own rows, whatever its neig
     for (&prompt, 0..) |*v, i| v.* = @intCast(1000 + (77 * 7919 + 41 * @as(u32, @intCast(i))) % 20000);
     var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
     defer g.deinit();
-    // The solo reference, split at the backoff as the chunk loop splits a prompt.
+    // The solo references: the span in one forward, and its first rows up to the backoff checkpoint.
     var solo: Lane = undefined;
     try solo.init(&p.xfm);
     defer solo.deinit();
     solo.ctx.prefill = true;
-    try ops.eval(try g.adopt(try p.xfm.forwardWith(&solo.ctx, try g.fromSlice(i32, prompt[0 .. span - 30], &.{ 1, span - 30 }))));
-    var solo_cp = try @import("../../engines/mlx/ssm/checkpoint.zig").captureSsmCheckpoint(testing.allocator, solo.ssm, span - 30, p.xfm.s);
+    try ops.eval(try g.adopt(try p.xfm.forwardWith(&solo.ctx, try g.fromSlice(i32, prompt[0..span], &.{ 1, span }))));
+    var head: Lane = undefined;
+    try head.init(&p.xfm);
+    defer head.deinit();
+    head.ctx.prefill = true;
+    try ops.eval(try g.adopt(try p.xfm.forwardWith(&head.ctx, try g.fromSlice(i32, prompt[0 .. span - 30], &.{ 1, span - 30 }))));
+    var solo_cp = try @import("../../engines/mlx/ssm/checkpoint.zig").captureSsmCheckpoint(testing.allocator, head.ssm, span - 30, p.xfm.s);
     defer solo_cp.deinit(testing.allocator);
-    try ops.eval(try g.adopt(try p.xfm.forwardWith(&solo.ctx, try g.fromSlice(i32, prompt[span - 30 .. span], &.{ 1, 30 }))));
     const solo_next = try hostRow(&g, try solo.step(&g, prompt[span]), 0);
     for ([_]usize{ 40, 60, 90 }) |other| {
         const width = @max(span, other);
@@ -380,7 +385,16 @@ test "inkling2 stacked: a padded span settles to its own rows, whatever its neig
             ids[width + k] = @intCast(1000 + (13 * 7919 + 29 * @as(u32, @intCast(@min(k, other - 1)))) % 20000);
         }
         _ = try stackedPrefill(&g, &p.xfm, &.{ &lanes[0], &lanes[1] }, ids[0 .. 2 * width], width);
+        // Unpadded, the windows cut at the span are the ones the pass left, bit for bit.
+        var left: [64]Array = undefined;
+        for (lanes[0].ssm, 0..) |e, i| if (e.conv_state.ctx != null) {
+            left[i] = try g.astype(.{ .ctx = e.conv_state.ctx }, .float32);
+            try ops.eval(left[i]);
+        };
         var cp = (try stacked.settleSpan(testing.allocator, &lanes[0].kv, lanes[0].ssm, span, @intCast(width), true, p.xfm.s)).?;
+        if (width == span) for (lanes[0].ssm, 0..) |e, i| if (e.conv_state.ctx != null) {
+            try ops.expectBitEqual(left[i], try g.astype(.{ .ctx = e.conv_state.ctx }, .float32));
+        };
         defer cp.deinit(testing.allocator);
         lanes[0].off = span;
         try testing.expectEqual(@as(usize, span), lanes[0].kv.step);
