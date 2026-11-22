@@ -88,17 +88,29 @@ pub const Spec = struct {
         sp.owner = slot;
     }
 
-    /// The context rows before `position`; 0 when the ring ends elsewhere.
+    /// The context rows before `position`: the ring's rows up to it (a stacked prompt's pass taps its padding past the
+    /// slot's end); 0 when the ring ends before it or holds none of its rows.
     pub fn rows(sp: *const Spec, position: u64) c_int {
-        return if (sp.ring.ctx != null and sp.end == position) ops.shape(sp.ring)[1] else 0;
+        if (sp.ring.ctx == null or sp.end < position) return 0;
+        const n = ops.shape(sp.ring)[1];
+        const past: u64 = sp.end - position;
+        return if (past < @as(u64, @intCast(n))) n - @as(c_int, @intCast(past)) else 0;
+    }
+
+    /// The ring's rows before `position` (`rows`), the whole ring when it ends there.
+    pub fn ringTo(sp: *const Spec, g: *ops.Graph, position: u64) !Array {
+        const k = sp.rows(position);
+        return if (k == ops.shape(sp.ring)[1]) sp.ring else g.contiguous(try g.sliceAxis(sp.ring, 1, 0, k));
     }
 
     /// `taps` are the rows from `first` on: they extend the ring or restart it.
     fn push(sp: *Spec, g: *ops.Graph, first: u64, taps: ops.Array) !void {
         const n = ops.shape(taps)[1];
         const continues = sp.rows(first) > 0;
-        if (!continues) sp.context.release();
-        var all = if (continues) try g.concat(&.{ sp.ring, taps }, 1) else taps;
+        // A ring past `first` (a stacked pass's padding) keeps its rows before it: the drafter's cached context of
+        // the dropped rows goes with them.
+        if (!continues or sp.end != first) sp.context.release();
+        var all = if (continues) try g.concat(&.{ try sp.ringTo(g, first), taps }, 1) else taps;
         const total = ops.shape(all)[1];
         if (total > sp.keep) all = try g.contiguous(try g.sliceAxis(all, 1, total - sp.keep, total));
         const next = g.escape(all);
@@ -426,7 +438,8 @@ fn openRound(m: *Loaded, f: *const abi.Forward) !Opened {
         const r: run_mod.Run = .{ .mode = .verify, .rows = 1, .positions = &o.position, .caches = f.caches.slice(), .cache_ops = f.cache_ops };
         var c = r.ctx(g, &m.base.shared);
         const anchor = try g.rmsNorm(try b.embed.TableEmbed.forward(&w.embed, &c, try g.reshape(first, &.{ 1, 1 })), w.embed_norm, cfg.rms_norm_eps);
-        const drafted = try m.drafter.?.draft(g, first, anchor, sp.?.ring, @intCast(position), &w.head.lin, w.head.vocab, w.head.softcap, &sp.?.context);
+        if (sp.?.end != position) sp.?.context.release();
+        const drafted = try m.drafter.?.draft(g, first, anchor, try sp.?.ringTo(g, position), @intCast(position), &w.head.lin, w.head.vocab, w.head.softcap, &sp.?.context);
         try ops.evalMany(&.{ drafted.tokens, drafted.confidence });
         const sure = mlx.mlx_array_data_float32(drafted.confidence) orelse return error.Inkling2DraftRound;
         const tokens = mlx.mlx_array_data_int32(drafted.tokens) orelse return error.Inkling2DraftRound;
@@ -527,6 +540,12 @@ fn roundSlots(m: *Loaded, f: *const abi.Forward, rounds: [*]abi.Round) !void {
     var drafts: [max_group]u32 = @splat(0);
     var ids: [max_group][abi.max_round_tokens]u32 = undefined;
     var width: u32 = 1;
+    // Every slot's draft built first and evaluated together: one round-trip to the GPU, not one a slot.
+    var out_tokens: [max_group]ops.Array = undefined;
+    var out_sure: [max_group]ops.Array = undefined;
+    var drafting: [max_group]bool = @splat(false);
+    var pending: [2 * max_group]ops.Array = undefined;
+    var n_pending: usize = 0;
     for (0..n) |i| {
         const t1 = f.tokens.slice()[i];
         ids[i][0] = t1;
@@ -537,14 +556,23 @@ fn roundSlots(m: *Loaded, f: *const abi.Forward, rounds: [*]abi.Round) !void {
         var c = r.ctx(g, &m.base.shared);
         const first = try g.fromSlice(i32, &.{@intCast(t1)}, &.{1});
         const anchor = try g.rmsNorm(try b.embed.TableEmbed.forward(&w.embed, &c, try g.reshape(first, &.{ 1, 1 })), w.embed_norm, cfg.rms_norm_eps);
-        const drafted = try dr.draft(g, first, anchor, sp.ring, @intCast(positions[i]), &w.head.lin, w.head.vocab, w.head.softcap, &sp.context);
-        try ops.evalMany(&.{ drafted.tokens, drafted.confidence });
-        const sure = mlx.mlx_array_data_float32(drafted.confidence) orelse return error.Inkling2DraftRound;
-        const tokens = mlx.mlx_array_data_int32(drafted.tokens) orelse return error.Inkling2DraftRound;
+        if (sp.end != positions[i]) sp.context.release();
+        const drafted = try dr.draft(g, first, anchor, try sp.ringTo(g, positions[i]), @intCast(positions[i]), &w.head.lin, w.head.vocab, w.head.softcap, &sp.context);
+        out_tokens[i] = drafted.tokens;
+        out_sure[i] = drafted.confidence;
+        drafting[i] = true;
+        pending[n_pending] = drafted.tokens;
+        pending[n_pending + 1] = drafted.confidence;
+        n_pending += 2;
+    }
+    if (n_pending > 0) try ops.evalMany(pending[0..n_pending]);
+    for (0..n) |i| if (drafting[i]) {
+        const sure = mlx.mlx_array_data_float32(out_sure[i]) orelse return error.Inkling2DraftRound;
+        const tokens = mlx.mlx_array_data_int32(out_tokens[i]) orelse return error.Inkling2DraftRound;
         drafts[i] = draftsToVerify(sure[0..cap], tokens[0..cap], min_sure, f.stop_ids.slice());
         for (0..drafts[i]) |k| ids[i][1 + k] = @intCast(tokens[k]);
         width = @max(width, 1 + drafts[i]);
-    }
+    };
     var flat: [max_group * abi.max_round_tokens]u32 = undefined;
     for (0..n) |i| for (0..width) |k| {
         flat[i * width + k] = ids[i][@min(k, drafts[i])];
@@ -1135,6 +1163,27 @@ test {
 
 // Bar: two slots that take turns each keep the taps of their own sequence; with every place taken a new slot
 // replaces the ring parked longest.
+test "inkling2 draft taps: a ring past the slot's position serves its rows before it, and a push there continues them" {
+    // Bar: a stacked pass taps its padding past a slot's end; the slot's drafter still reads its real rows.
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    var sp: Spec = .{ .visits = &.{}, .keep = 8 };
+    defer sp.deinit();
+    sp.select(3);
+    try sp.push(&g, 10, try g.ones(&.{ 1, 5, 2 }, .float32));
+    try std.testing.expectEqual(@as(c_int, 5), sp.rows(15));
+    try std.testing.expectEqual(@as(c_int, 2), sp.rows(12));
+    try std.testing.expectEqual(@as(c_int, 0), sp.rows(16));
+    try std.testing.expectEqual(@as(c_int, 0), sp.rows(10));
+    try std.testing.expectEqual(@as(c_int, 2), ops.shape(try sp.ringTo(&g, 12))[1]);
+    try sp.push(&g, 12, try g.zeros(&.{ 1, 3, 2 }, .float32));
+    try std.testing.expectEqual(@as(c_int, 5), sp.rows(15));
+    try std.testing.expectEqual(@as(u64, 15), sp.end);
+}
+
 test "inkling2 draft taps: each engine slot keeps its own ring" {
     const a = std.testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
