@@ -1830,6 +1830,7 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     // `--soak N`: N header + one-row-stream round trips, the shape of a pipeline decode hop.
     var soak: u64 = 0;
     var chain = false;
+    var visit = false;
     var rest: [16][]const u8 = undefined;
     var n_rest: usize = 0;
     var ai: usize = 0;
@@ -1839,6 +1840,8 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
             ai += 1;
         } else if (std.mem.eql(u8, args[ai], "--chain")) {
             chain = true;
+        } else if (std.mem.eql(u8, args[ai], "--visit")) {
+            visit = true;
         } else if (n_rest < rest.len) {
             rest[n_rest] = args[ai];
             n_rest += 1;
@@ -1852,6 +1855,7 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     const other: u32 = if (link.rank == 0) 1 else 0;
     if (soak > 0) return soakLink(io, &link, other, soak, s);
     if (chain) return chainProbe(io, &link, s);
+    if (visit) return visitProbe(io, &link, s);
 
     const sizes = [_]c_int{ 1, 5120, 10240, 262144, 6553600 }; // f32 elements: 4 B .. 25 MB
     for (sizes) |n| {
@@ -2318,4 +2322,74 @@ test "a pair's expert share comes back in the rows' bf16 unless the lever is 0, 
     try std.testing.expectEqual(mlx.mlx_dtype.float32, expertsBack(.float32, null));
     try std.testing.expectEqual(mlx.mlx_dtype.float32, backOf(0));
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, backOf(@intCast(@backingInt(mlx.mlx_dtype.bfloat16))));
+}
+
+fn sortedNs(ts: []u64) void {
+    std.mem.sort(u64, ts, {}, std.sort.asc(u64));
+}
+
+/// `--visit`: the all_sum a symmetric TP visit pays, [rows, 2304] bf16: (1) on an evaluated array, (2) between GPU
+/// ops (the GPU result fenced in, the sum read back by a GPU op), (3) 96 such exchanges back to back, each evaluated.
+fn visitProbe(io: std.Io, link: *const Link, s: mlx.mlx_stream) !void {
+    const half = mlx.mlx_array_new_float(0.5);
+    defer _ = mlx.mlx_array_free(half);
+    for ([_]c_int{ 1, 64, 1024, 4096, 8192 }) |rows| {
+        const shape = [_]c_int{ rows, 2304 };
+        const bytes: f64 = @floatFromInt(@as(u64, @intCast(rows)) * 2304 * 2);
+        var x = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_ones(&x, &shape, 2, .bfloat16, s));
+        defer _ = mlx.mlx_array_free(x);
+        try evalOne(x);
+        var t1: [100]u64 = undefined;
+        var t2: [100]u64 = undefined;
+        for (0..105) |i| {
+            var sw = io_util.Stopwatch.init(io);
+            const r = try link.allSum(x);
+            defer _ = mlx.mlx_array_free(r);
+            try evalOne(r);
+            if (i >= 5) t1[i - 5] = sw.read();
+        }
+        for (0..105) |i| {
+            var sw = io_util.Stopwatch.init(io);
+            var y = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(y);
+            try mlx.check(mlx.mlx_multiply(&y, x, half, s));
+            const r = try link.allSum(y);
+            defer _ = mlx.mlx_array_free(r);
+            var z = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(z);
+            try mlx.check(mlx.mlx_multiply(&z, r, half, s));
+            try evalOne(z);
+            if (i >= 5) t2[i - 5] = sw.read();
+        }
+        var chain_ns: [3]u64 = undefined;
+        for (&chain_ns) |*cn| {
+            var sw = io_util.Stopwatch.init(io);
+            var cur = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&cur, x, half, s));
+            for (0..96) |_| {
+                var y = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_multiply(&y, cur, half, s));
+                _ = mlx.mlx_array_free(cur);
+                const r = try link.allSum(y);
+                _ = mlx.mlx_array_free(y);
+                try evalOne(r);
+                cur = r;
+            }
+            _ = mlx.mlx_array_free(cur);
+            cn.* = sw.read();
+        }
+        sortedNs(&t1);
+        sortedNs(&t2);
+        sortedNs(&chain_ns);
+        const us = struct {
+            fn f(ns: u64) f64 {
+                return @as(f64, @floatFromInt(ns)) / 1000.0;
+            }
+        }.f;
+        log.info("[dist-visit] rows {d:>5} ({d:>9} B): host median {d:>8.1} us p95 {d:>8.1} ({d:>5.2} GB/s each way) | gpu median {d:>8.1} us p95 {d:>8.1} ({d:>5.2} GB/s) | 96 chained median {d:>9.1} us ({d:>8.1} us each)\n", .{
+            rows, @as(u64, @intFromFloat(bytes)), us(t1[50]), us(t1[95]), bytes / (us(t1[50]) * 1000.0), us(t2[50]), us(t2[95]), bytes / (us(t2[50]) * 1000.0), us(chain_ns[1]), us(chain_ns[1]) / 96.0,
+        });
+    }
+    log.info("[dist-probe] done\n", .{});
 }
