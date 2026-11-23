@@ -1042,6 +1042,49 @@ test "inkling2 kernels: the expert tail kernels serve the stream and the conv st
     };
 }
 
+// Bar: a few rows' stream is the wide sum's conv and add over their MLP outputs, bit for bit, on every packed layout,
+// with and without per-expert scales, one conv state for the rows and one a row (batched slots).
+test "inkling2 kernels: a few rows' expert tail is the wide sum's over their MLP outputs" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Stage.init(a);
+    defer s.deinit();
+    var body = s.body.*;
+    body.cfg.moe_intermediate_size = 64;
+    const cfg = &body.cfg;
+    const hidden: c_int = @intCast(cfg.hidden_size);
+    const experts: c_int = @intCast(cfg.num_experts);
+    const kv_dim: c_int = @intCast(cfg.kvDim());
+    const taps: c_int = @intCast(cfg.sconv_kernel);
+    var seed: u64 = 19000;
+    for ([_]ExpertFormat{ .{ .mode = .nvfp4, .bits = 4, .group = 16 }, .{ .mode = .mxfp4, .bits = 4, .group = 32 }, .{ .mode = .mxfp8, .bits = 8, .group = 32 } } ++ affine_formats) |f| for ([_]c_int{ 2, 5, 8 }) |rows| for ([_]bool{ true, false }) |scaled| for ([_]bool{ false, true }) |per_row| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 20;
+        var L = body.layers[3];
+        L.gate_up = try packedBank(&g, a, seed, &.{ experts, 128, hidden }, f.bits, f.group, f.mode.?);
+        L.down = try packedBank(&g, a, seed + 1, &.{ experts, hidden, 64 }, f.bits, f.group, f.mode.?);
+        if (scaled) {
+            L.gate_up_scale = try g.addScalar(try randomRow(&g, a, seed + 2, &.{experts}, 0.3, .float32), 1.5);
+            L.down_scale = try g.addScalar(try randomRow(&g, a, seed + 3, &.{experts}, 0.3, .float32), 1.5);
+        }
+        const x = try randomRow(&g, a, seed + 4, &.{ 1, rows, hidden }, 1.0, .bfloat16);
+        const scores = try g.matmul(try g.astype(x, .float32), try g.transpose(L.router, &.{ 1, 0 }));
+        const residual = try randomRow(&g, a, seed + 5, &.{ 1, rows, hidden }, 1.0, .float32);
+        const st = try randomRow(&g, a, seed + 6, &.{ if (per_row) rows else 1, taps - 1, 2 * kv_dim + 2 * hidden }, 1.0, .float32);
+        const kp = try randomRow(&g, a, seed + 7, &.{ 1, rows, kv_dim }, 1.0, .bfloat16);
+        const vp = try randomRow(&g, a, seed + 8, &.{ 1, rows, kv_dim }, 1.0, .bfloat16);
+        const op = try randomRow(&g, a, seed + 9, &.{ 1, rows, hidden }, 1.0, .bfloat16);
+        const got = try kernels.experts(&g, &L, cfg, &.{ .x = x, .scores = scores, .residual = residual, .blocks = null, .op = op }, kp, vp, st, null);
+        const rows_at = try g.arange(0, @floatFromInt(rows), 1, .uint32);
+        const caps = try g.fromSlice(f32, &.{1}, &.{1});
+        const conv_scale = try g.fromSlice(f32, &.{1.0 / @sqrt(@as(f32, @floatFromInt(taps + 1)))}, &.{1});
+        const want = try kernels.pickSum(&g, try g.reshape(got.xm, &.{ rows, 1, hidden }), rows_at, rows_at, caps, try g.ones(&.{ 1, rows, 1 }, .float32), residual, st, L.mlp_conv, conv_scale, 1, false);
+        try expectClose(got.h, want[0], 0, "a few rows' stream");
+        try expectClose(got.xm, want[1], 0, "a few rows' MLP output");
+    };
+}
+
 // Bar: the gate_up launch that ranks the router's logits itself writes the top-k kernel's picks and weights bit for
 // bit (a tied pair and a NaN logit among them), and the launch given those picks the same rows, on every packed
 // layout, one row and a few, with and without scales.

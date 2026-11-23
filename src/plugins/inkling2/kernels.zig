@@ -962,9 +962,9 @@ pub fn ups(g: *Graph, L: *const Layer, cfg: *const Config, x: Array, route: UpsR
 /// `layers.tail`. The visit's new conv state (off the next visit's path) is `st` behind the rows' k and v projections
 /// `kp`, `vp`, their output projection and the MLP's output.
 /// One row, a packed bank read in place: the router's picks, their gate_up and the soft-capped SwiGLU as one launch,
-/// their down, the weighted sum, the MLP's conv behind `st` and the final add as a second. Another bank, or more rows
-/// (their pairs sorted by expert), go through `topK` and MLX's gather, with the SwiGLU and the sum, conv and add as
-/// launches of their own.
+/// their down, the weighted sum, the MLP's conv behind `st` and the final add as a second; a few rows the same after
+/// one `topK` launch. Another bank, or more rows (their pairs sorted by expert), go through MLX's gather, with the
+/// SwiGLU and the sum, conv and add as launches of their own.
 pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle, kp: Array, vp: Array, st: Array, open: ?*Open) !Tail {
     const dt = ops.dtype(m.x);
     const s = ops.shape(m.x)[1];
@@ -994,20 +994,16 @@ pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle,
         break :blk .{try activation(g, gu, sel, if (L.gate_up_scale.ctx != null) L.gate_up_scale else caps, caps, L.gate_up_scale.ctx != null)};
     };
 
-    // The down kernel's threadgroup holds every pick of its rows.
-    const o = if (if ((s == 1 and 32 * top_k <= sure_threads) or few) packedFormat(&L.down, inter) else null) |fmt| blk: {
-        const packed_out = try launchGrid(g, &downs_kernel, &.{ act[0], L.down.w, L.down.s, biasesOf(&L.down), sel, dn_scale, weights, m.residual, st, L.mlp_conv, conv_scale }, 2, .{ if (few) unused else tail_out[0], tail_out[1] }, .{ 32, top_k, s * @divExact(hidden, bank_rows) }, .{ 32, top_k, 1 }, &.{
+    // The down kernel's threadgroup holds every pick of its rows, for each row.
+    const o = if (if ((s == 1 and 32 * top_k <= sure_threads) or few) packedFormat(&L.down, inter) else null) |fmt|
+        try launchGrid(g, &downs_kernel, &.{ act[0], L.down.w, L.down.s, biasesOf(&L.down), sel, dn_scale, weights, m.residual, st, L.mlp_conv, conv_scale }, 2, tail_out, .{ 32, top_k, @divExact(hidden, bank_rows) }, .{ 32, top_k, 1 }, &.{
             .{ "T", .{ .dtype = dt } },         .{ "WT", .{ .dtype = ops.dtype(L.mlp_conv) } },        .{ "I", .{ .int = inter } },
             .{ "D", .{ .int = hidden } },       .{ "GS", .{ .int = @intCast(L.down.qp.group_size) } }, .{ "FMT", .{ .int = fmt } },
             .{ "ROWS", .{ .int = bank_rows } }, .{ "KSEL", .{ .int = top_k } },                        .{ "KT", .{ .int = kt } },
             .{ "BITS", .{ .int = @intCast(L.down.qp.bits) } }, .{ "S", .{ .dtype = ops.dtype(L.down.s) } },
-            .{ "SCALED", dn_scaled },           .{ "TAIL", .{ .int = @intFromBool(!few) } },
-        });
-        if (!few) break :blk packed_out;
-        // The rows' MLP outputs are whole: the conv over them and the add, as the wide sum over one pick a row.
-        const rows_at = try g.arange(0, @floatFromInt(s), 1, .uint32);
-        break :blk try pickSum(g, try g.reshape(packed_out[1], &.{ s, 1, hidden }), rows_at, rows_at, caps, try g.ones(&.{ 1, s, 1 }, .float32), m.residual, st, L.mlp_conv, conv_scale, 1, false);
-    } else blk: {
+            .{ "SCALED", dn_scaled },           .{ "NR", .{ .int = s } },
+        })
+    else blk: {
         const dn = try layers.gather(g, act[0], &L.down, sel, sorted);
         if (!floating(ops.dtype(dn))) return error.Inkling2StepDtype;
         // Unsorted pairs sit in (row, pick) order already.
