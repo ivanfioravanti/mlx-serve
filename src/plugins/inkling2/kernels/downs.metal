@@ -6,7 +6,9 @@
 // SC[IDX[p]] with SCALED (f32 [E]) and its routing weight WTS[p] (f32); their sum in pick order, rounded to T, is
 // the MLP's output XM [1, S, D]. TAIL: then the conv behind its window (the last D columns of ST [1, KT - 1, SW]
 // f32) with MW [D, KT, 1] (WT), its sum rounded to WT as the conv op does, plus XM, times PR[0], rounded to T, and
-// the residual RES [D] f32 added: HOUT [1, 1, D] (T), the visit's output stream.
+// the residual RES [D] f32 added: HOUT [1, 1, D] (T), the visit's output stream; and the visit's new conv state NST
+// [1, KT - 1, SW] f32 as state.metal leaves it for one row: the old rows moved up one, then the row's conv inputs
+// [KP | VP | OP | XM] (C, C, D and D wide), the last pick's SIMD groups copying all but XM, which the tail writes.
 const uint lane = thread_index_in_simdgroup;
 const uint e = thread_position_in_grid.y;
 const uint srow = thread_position_in_grid.z / (D / ROWS);
@@ -18,6 +20,15 @@ constexpr uint SPR = I / GS;
 const uint SW = ST_shape[2];
 const uint OFF = SW - D;
 threadgroup float part[KSEL * ROWS];
+if (TAIL && e == KSEL - 1) {
+    const uint C = KP_shape[2];
+    for (uint r = 0; r < ROWS; r++) for (uint col = row0 + r + lane * D; col < SW; col += 32 * D) {
+        for (uint j = 0; j + 2 < KT; j++) NST[j * SW + col] = ST[(j + 1) * SW + col];
+        if (col < C) NST[(KT - 2) * SW + col] = float(KP[col]);
+        else if (col < 2 * C) NST[(KT - 2) * SW + col] = float(VP[col - C]);
+        else if (col < OFF) NST[(KT - 2) * SW + col] = float(OP[col - 2 * C]);
+    }
+}
 const size_t base = size_t(IDX[p]) * D + row0;
 const device uint* wrow = WQ + base * WPR;
 const device uchar* scales = (const device uchar*)WS + base * SPR;
@@ -49,4 +60,5 @@ if (e == 0 && lane < ROWS) {
     for (uint j = 0; j < KT; j++) y += ((j + 1 < KT) ? ST[j * SW + OFF + c] : float(xm)) * float(MW[c * KT + j]);
     y = float(WT(y));
     HOUT[c] = T(RES[c] + float(T((y + float(xm)) * PR[0])));
+    NST[(KT - 2) * SW + OFF + c] = float(xm);
 }

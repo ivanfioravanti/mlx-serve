@@ -1017,6 +1017,44 @@ test "inkling2 kernels: the expert tail kernels serve the stream and the conv st
     };
 }
 
+// Bar: one row's new conv state is the state kernel's over the old state and the rows' conv inputs, bit for bit, on
+// every packed layout, with and without per-expert scales.
+test "inkling2 kernels: one row's experts leave the state kernel's conv state" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Stage.init(a);
+    defer s.deinit();
+    var body = s.body.*;
+    body.cfg.moe_intermediate_size = 64;
+    const cfg = &body.cfg;
+    const hidden: c_int = @intCast(cfg.hidden_size);
+    const experts: c_int = @intCast(cfg.num_experts);
+    const kv_dim: c_int = @intCast(cfg.kvDim());
+    const taps: c_int = @intCast(cfg.sconv_kernel);
+    var seed: u64 = 18000;
+    for ([_]ExpertFormat{ .{ .mode = .nvfp4, .bits = 4, .group = 16 }, .{ .mode = .mxfp4, .bits = 4, .group = 32 }, .{ .mode = .mxfp8, .bits = 8, .group = 32 } } ++ affine_formats) |f| for ([_]bool{ true, false }) |scaled| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 20;
+        var L = body.layers[3];
+        L.gate_up = try packedBank(&g, a, seed, &.{ experts, 128, hidden }, f.bits, f.group, f.mode.?);
+        L.down = try packedBank(&g, a, seed + 1, &.{ experts, hidden, 64 }, f.bits, f.group, f.mode.?);
+        if (scaled) {
+            L.gate_up_scale = try g.addScalar(try randomRow(&g, a, seed + 2, &.{experts}, 0.3, .float32), 1.5);
+            L.down_scale = try g.addScalar(try randomRow(&g, a, seed + 3, &.{experts}, 0.3, .float32), 1.5);
+        }
+        const x = try randomRow(&g, a, seed + 4, &.{ 1, 1, hidden }, 1.0, .bfloat16);
+        const scores = try g.matmul(try g.astype(x, .float32), try g.transpose(L.router, &.{ 1, 0 }));
+        const residual = try randomRow(&g, a, seed + 5, &.{ 1, 1, hidden }, 1.0, .float32);
+        const st = try randomRow(&g, a, seed + 6, &.{ 1, taps - 1, 2 * kv_dim + 2 * hidden }, 1.0, .float32);
+        const kp = try randomRow(&g, a, seed + 7, &.{ 1, 1, kv_dim }, 1.0, .bfloat16);
+        const vp = try randomRow(&g, a, seed + 8, &.{ 1, 1, kv_dim }, 1.0, .bfloat16);
+        const op = try randomRow(&g, a, seed + 9, &.{ 1, 1, hidden }, 1.0, .bfloat16);
+        const got = try kernels.experts(&g, &L, cfg, &.{ .x = x, .scores = scores, .residual = residual, .blocks = null, .op = op }, kp, vp, st, null);
+        try expectClose(got.state, try kernels.convState(&g, st, kp, vp, op, got.xm), 0, "one row's conv state");
+    };
+}
+
 // Bar: the gate_up launch that ranks the router's logits itself writes the top-k kernel's picks and weights bit for
 // bit (a tied pair and a NaN logit among them), on every packed layout, one row and a few, with and without scales.
 test "inkling2 kernels: the gate_up launch ranks the router's picks as the top-k kernel does" {
