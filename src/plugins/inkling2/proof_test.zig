@@ -834,6 +834,37 @@ test "inkling2 kernels: the prep kernel serves the values of the chain it replac
     };
 }
 
+// Bar: a looped visit routes as a plain one does: its one row's router logits are MLX's f32 matmul over its MLP
+// input, bit for bit.
+test "inkling2 kernels: a looped visit's router logits are the plain visits' matmul over its MLP input" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Stage.init(a);
+    defer s.deinit();
+    const body = s.body;
+    const cfg = &body.cfg;
+    const hidden: c_int = @intCast(cfg.hidden_size);
+    const taps: c_int = @intCast(cfg.sconv_kernel);
+    const q_dim: c_int = @intCast(cfg.num_attention_heads * cfg.head_dim);
+    var seed: u64 = 17000;
+    for (stage_cases) |case| for ([_]ops.Dtype{ .float32, .bfloat16 }) |dt| for (0..4) |_| {
+        if (!case.messages) continue;
+        const L = &body.layers[case.layer];
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 10;
+        const attn = try randomRow(&g, a, seed, &.{ 1, 1, q_dim }, 1.0, dt);
+        const h = try randomRow(&g, a, seed + 1, &.{ 1, 1, hidden }, 1.0, dt);
+        const normed = try randomRow(&g, a, seed + 2, &.{ 1, 1, hidden }, 1.0, .float32);
+        const blocks = try randomRow(&g, a, seed + 3, &.{ 1, 1, case.blocks, hidden }, 1.0, .float32);
+        const messages = try randomRow(&g, a, seed + 4, &.{ 4, 1, hidden }, 1.0, .float32);
+        const st = try randomRow(&g, a, seed + 5, &.{ 1, taps - 1, 2 * @as(c_int, @intCast(cfg.kvDim())) + 2 * hidden }, 1.0, .float32);
+        const got = try kernels.mid(&g, L, body, attn, null, h, normed, blocks, st, messages);
+        const want = try g.matmul(try g.astype(got.x, .float32), try g.transpose(L.router, &.{ 1, 0 }));
+        try expectClose(got.scores, want, 0, "looped router logits");
+    };
+}
+
 // Bar: at its narrowest group (32 threads) the mid kernel folds every one of its sums: forty open blocks give it more
 // sums than threads, plain and on a looped pass; the chain's values as above (f32, 1e-4; the MLP input 2e-2).
 test "inkling2 kernels: at its narrowest group the mid kernel folds every sum" {

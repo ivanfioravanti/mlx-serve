@@ -50,7 +50,7 @@ pub var oproj_kernel: Kernel = .{ .name = "msv_inkling2_oproj", .ins = &.{ "ATT"
 pub var gated_kernel: Kernel = .{ .name = "msv_inkling2_gated", .ins = &.{ "ATT", "GATE" }, .outs = &.{"OUT"}, .source = kernelSource("plugins/inkling2/kernels/gated.metal") };
 pub var mid_kernel: Kernel = .{ .name = "msv_inkling2_mid", .ins = &.{ "OP", "ST", "AW", "HIN", "NORMED", "BLK", "QY", "PN", "MSG3", "PR" }, .outs = &.{ "RES", "X", "X32", "M", "BOTH" }, .source = kernelSource("plugins/inkling2/kernels/mid.metal") };
 pub var gate_kernel: Kernel = .{ .name = "msv_inkling2_gate", .ins = &.{ "A", "MS", "ST", "F", "G" }, .outs = &.{"Y"}, .source = kernelSource("plugins/inkling2/kernels/gate.metal") };
-pub var norm_kernel: Kernel = .{ .name = "msv_inkling2_norm", .ins = &.{ "Y", "NW0", "NW1", "NW2", "RT", "PR" }, .outs = &.{ "X", "SCORES" }, .source = kernelSource("plugins/inkling2/kernels/norm.metal") };
+pub var norm_kernel: Kernel = .{ .name = "msv_inkling2_norm", .ins = &.{ "Y", "NW0", "NW1", "NW2", "PR" }, .outs = &.{"X"}, .source = kernelSource("plugins/inkling2/kernels/norm.metal") };
 pub var topk_kernel: Kernel = .{ .name = "msv_inkling2_topk", .ins = &.{ "SC", "RB", "PR" }, .outs = &.{ "IDX", "WTS" }, .source = kernelSource("plugins/inkling2/kernels/topk.metal") };
 pub var act_kernel: Kernel = .{ .name = "msv_inkling2_act", .ins = &.{ "GU", "IDX", "SC", "PR" }, .outs = &.{"ACT"}, .source = kernelSource("plugins/inkling2/kernels/act.metal") };
 pub var ups_kernel: Kernel = .{ .name = "msv_inkling2_ups", .ins = &.{ "X", "WQ", "WS", "WB", "SCR", "RB", "RS", "IDX", "SC", "PR" }, .outs = &.{ "ACT", "PIDX", "PWTS" }, .source = kernelSource("plugins/inkling2/kernels/ups.metal"), .header = bank_header };
@@ -235,26 +235,17 @@ pub fn gate(g: *Graph, gates: *const layers.Gates, a: Array, ms: Array, st: Arra
     return o[0];
 }
 
-/// The threads a stream kernel adds to a row for the router: a SIMD group per expert, in whole threadgroups.
-fn routerThreads(cfg: *const Config, tg: c_int) c_int {
-    return @divTrunc(@as(c_int, @intCast(cfg.num_experts)) * 32 + tg - 1, tg) * tg;
-}
-
-/// The `n` streams `y` `[n, S, D]` f32 under their weighted RMS norms, `[n, S, D]` in `dt`; with a `router`, its
-/// scores `[S, E]` f32 over the first.
-fn norm(g: *Graph, cfg: *const Config, y: Array, nw: [3]Array, n: c_int, dt: Dtype, router: ?Array) ![2]Array {
+/// The `n` streams `y` `[n, S, D]` f32 under their weighted RMS norms, `[n, S, D]` in `dt`.
+fn norm(g: *Graph, cfg: *const Config, y: Array, nw: [3]Array, n: c_int, dt: Dtype) !Array {
     const d: c_int = @intCast(cfg.hidden_size);
     const s = ops.shape(y)[1];
-    const experts_n: c_int = if (router != null) @intCast(cfg.num_experts) else 0;
     const eps = try g.fromSlice(f32, &.{cfg.rms_norm_eps}, &.{1});
     while (true) {
         const tg = streamGroup(cfg.hidden_size) orelse return error.ThreadLimit;
-        return launchGrid(g, &norm_kernel, &.{ y, nw[0], nw[1], nw[2], router orelse y, eps }, 2, .{
-            .{ .shape = &.{ n, s, d }, .dtype = dt },
-            if (router != null) .{ .shape = &.{ s, experts_n }, .dtype = .float32 } else unused,
-        }, .{ d + if (router != null) routerThreads(cfg, tg) else 0, s, 1 }, .{ tg, 1, 1 }, &.{
-            .{ "T", .{ .dtype = dt } }, .{ "TG", .{ .int = tg } }, .{ "D", .{ .int = d } }, .{ "J", .{ .int = n } }, .{ "E", .{ .int = experts_n } },
+        const o = launchGrid(g, &norm_kernel, &.{ y, nw[0], nw[1], nw[2], eps }, 1, .{.{ .shape = &.{ n, s, d }, .dtype = dt }}, .{ d, s, 1 }, .{ tg, 1, 1 }, &.{
+            .{ "T", .{ .dtype = dt } }, .{ "TG", .{ .int = tg } }, .{ "D", .{ .int = d } }, .{ "J", .{ .int = n } },
         }) catch |e| if (e == error.ThreadLimit and narrow(cfg.hidden_size)) continue else return e;
+        return o[0];
     }
 }
 
@@ -273,7 +264,7 @@ pub fn pre(g: *Graph, L: *const Layer, w: *const Body, h: Array, blocks: ?Array,
         const gates = &(L.gates orelse return error.Inkling2NoMessageGate);
         const o = try streams(g, cfg, h, blocks, L.attn_query, L.in_norm, 3, .{ .bank = bk[0], .partial = bk[1], .query = L.message_query, .gt = ops.dtype(gates.down) });
         const st = try g.matmul(o[4], try layers.downs(g, gates, 0, 3));
-        x = (try norm(g, cfg, try gate(g, gates, o[2], o[3], st, 0, 3), L.in_norm, 3, dt, null))[0];
+        x = try norm(g, cfg, try gate(g, gates, o[2], o[3], st, 0, 3), L.in_norm, 3, dt);
         normed = o[1];
         messages = o[3];
     } else {
@@ -852,15 +843,16 @@ pub fn mid(g: *Graph, L: *const Layer, w: *const Body, attn: Array, out_gate: ?A
         }) catch |e| if (e == error.ThreadLimit and narrow(cfg.hidden_size)) continue else return e;
     };
     var x = o[1];
-    // A plain visit's router is MLX's matmul; a looped one's rides its norm kernel, where the rows read the stream
-    // as it is (inside `mid.metal` each row would redo the conv and the mix: slower than the launch it saves).
-    var scores: Array = undefined;
+    // The router over the MLP input's f32 rows: MLX's matmul, or a few rows' kernel (its f32 matmul past one row is
+    // slow). A looped visit's rows come from its norm kernel; riding that kernel, the router's per-lane dots cost more
+    // than this launch (inside `mid.metal` each row would redo the conv and the mix).
+    var x32 = o[2];
     if (gates) |gs| {
         const state = try g.matmul(o[4], try layers.downs(g, gs, 3, 1));
-        const xs = try norm(g, cfg, try gate(g, gs, o[3], msg3, state, 3, 1), @splat(L.post_norm), 1, dt, L.router);
-        x = xs[0];
-        scores = xs[1];
-    } else scores = if (s > 1 and s <= small_rows) try routerRows(g, o[2], L.router) else try g.matmul(o[2], try g.transpose(L.router, &.{ 1, 0 }));
+        x = try norm(g, cfg, try gate(g, gs, o[3], msg3, state, 3, 1), @splat(L.post_norm), 1, dt);
+        x32 = try g.astype(x, .float32);
+    }
+    const scores = if (s > 1 and s <= small_rows) try routerRows(g, x32, L.router) else try g.matmul(x32, try g.transpose(L.router, &.{ 1, 0 }));
     var opened: ?Array = null;
     if (L.boundary) {
         const saved = try g.expandDims(normed, 2);
