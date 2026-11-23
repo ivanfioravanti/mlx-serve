@@ -316,7 +316,7 @@ pub fn ssmCapturePos(stride: usize, abs_end: usize, dense_low_grid: bool) bool {
 }
 
 /// Past this many rows one forward over a restored tail, with its capture and cut, is slower than the chunk loop's split.
-pub const ONE_FORWARD_TAIL_ROWS_MAX: usize = 640;
+pub const ONE_FORWARD_TAIL_ROWS_MAX: usize = 1536;
 
 /// PURE: the rows before the snapshot backoff of a restored tail (`offset` > 0) that runs as one forward, its checkpoint
 /// cut from the forward's capture; 0 = the chunk loop's split. Only a tail of at most one chunk, longer than the
@@ -1346,7 +1346,8 @@ test "oneForwardTailRows: a restored tail of one chunk past the backoff runs who
     try std.testing.expectEqual(@as(usize, 0), oneForwardTailRows(65500, 139, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
     try std.testing.expectEqual(@as(usize, 0), oneForwardTailRows(8150, 139, SSM_SNAPSHOT_BACKOFF, 8192, 65536, true));
     try std.testing.expectEqual(@as(usize, 109), oneForwardTailRows(8150, 139, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
-    // A tail past the row bound splits, a 4k tail included.
+    // A tail of 1.5k rows runs whole; one past the row bound splits, a 4k tail included.
+    try std.testing.expectEqual(@as(usize, 1500), oneForwardTailRows(12, 1500 + SSM_SNAPSHOT_BACKOFF, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
     const most = ONE_FORWARD_TAIL_ROWS_MAX + SSM_SNAPSHOT_BACKOFF;
     try std.testing.expectEqual(ONE_FORWARD_TAIL_ROWS_MAX, oneForwardTailRows(12, most, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
     try std.testing.expectEqual(@as(usize, 0), oneForwardTailRows(12, most + 1, SSM_SNAPSHOT_BACKOFF, 8192, 65536, false));
