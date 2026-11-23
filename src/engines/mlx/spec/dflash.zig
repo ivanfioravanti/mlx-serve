@@ -64,6 +64,8 @@ pub const DflashPol = struct {
     copy: dflash_policy.CopyStats = .{},
     /// Since the last pipelined plain tick ended; null once any other kind of round has run.
     plain_watch: ?io_util.Stopwatch = null,
+    /// A round drained the pipelined ticks; the native round after it pays for that (`dspark.pipelineBreakMs`).
+    drained: bool = false,
 };
 
 /// DFlash block-drafter step. ONE assistant forward proposes

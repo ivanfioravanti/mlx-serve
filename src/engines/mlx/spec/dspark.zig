@@ -93,7 +93,10 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         if (pol.pin_rows == 0 and !pol.drafting.shouldDraft() and self.dflashCanPipeline()) return try self.dsparkPlainPipelined(allocator);
         pol.plain_watch = null;
         if (self.has_pending_logits or self.has_pending_token) switch (try self.drainPipelineForSpec(allocator)) {
-            .drained => |tok| return try mtpSerialOneToken(allocator, tok),
+            .drained => |tok| {
+                pol.drained = true;
+                return try mtpSerialOneToken(allocator, tok);
+            },
             .stopped => return null,
             .already_clean, .stay_disabled => return error.PipelineHalfState,
         };
@@ -122,9 +125,21 @@ fn nativeSampledRound(self: *Generator, allocator: std.mem.Allocator, cap: u32) 
     errdefer allocator.free(tokens);
     self.dspark_stats.record(v.round.rows -| 1, verdict.accepted);
     if (self.dspark_pol) |*pol| if (std.math.isFinite(pol.plain.ms)) {
-        pol.drafting.record(@as(f32, @floatFromInt(1 + verdict.accepted)) * pol.plain.ms, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
+        pol.drafting.record(@as(f32, @floatFromInt(1 + verdict.accepted)) * pol.plain.ms, probeCharge(pol) + @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
     };
     return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = verdict.accepted, .next_token = verdict.next_token }, @intCast(position));
+}
+
+/// What a probe costs past its own round: it drained the pipelined ticks before it and restarts them after, and an
+/// unpipelined tick takes about a fifth longer than a pipelined one.
+pub fn pipelineBreakMs(plain_ms: f32) f32 {
+    return 2 * 0.2 * plain_ms;
+}
+
+/// The native round right after a drain pays for the pipeline break (`pipelineBreakMs`).
+fn probeCharge(pol: anytype) f32 {
+    defer pol.drained = false;
+    return if (pol.drained) pipelineBreakMs(pol.plain.ms) else 0;
 }
 
 /// One round of the served plugin's own drafter (`NativeDrafter.step`): its tokens and the trunk token after them.
@@ -145,7 +160,7 @@ fn nativeRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResu
     errdefer allocator.free(tokens);
     self.dspark_stats.record(r.rows -| 1, r.accepted);
     if (self.dspark_pol) |*pol| if (std.math.isFinite(pol.plain.ms)) {
-        pol.drafting.record(@as(f32, @floatFromInt(r.n)) * pol.plain.ms, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
+        pol.drafting.record(@as(f32, @floatFromInt(r.n)) * pol.plain.ms, probeCharge(pol) + @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
     };
     return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = r.accepted, .next_token = r.next_token }, @intCast(r.position));
 }
@@ -875,4 +890,13 @@ test "dspark drafting backoff: prose rounds that lose to the plain step are skip
     try testing.expect(echo.shouldDraft());
     echo.record(5.5 * 17.6, 70);
     try testing.expect(echo.shouldDraft());
+}
+
+test "dspark drafting backoff: a probe that breaks even on its own round loses once its pipeline break is charged" {
+    var even = dflash_policy.Drafting{};
+    even.record(2 * 10, 20);
+    try testing.expect(even.shouldDraft());
+    var charged = dflash_policy.Drafting{};
+    charged.record(2 * 10, 20 + pipelineBreakMs(10));
+    try testing.expect(!charged.shouldDraft());
 }
