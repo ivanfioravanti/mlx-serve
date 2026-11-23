@@ -276,12 +276,22 @@ pub const Drafter = struct {
         }
         const rows = try g.sliceAxis(try g.rmsNorm(h, d.norm, cfg.eps), 1, 1, block);
         const base = try g.astype(try project(g, head, rows), .float32);
-        const fused = kernels.markovRuns(g, d.rnn.w, d.fold, rank);
+        var newest: [max_slots]Array = undefined;
+        var t1s: [max_slots]Array = undefined;
         for (slots, 0..) |sl, i| {
             const n = ops.shape(sl.taps)[1];
-            const newest = try d.mix(g, try tapsOf(g, sl.taps, n - 1, n, cfg.tap_count, hidden), @intCast(d.layers.len), d.rnn_norm);
+            newest[i] = try d.mix(g, try tapsOf(g, sl.taps, n - 1, n, cfg.tap_count, hidden), @intCast(d.layers.len), d.rnn_norm);
+            t1s[i] = sl.t1;
+        }
+        // One slot runs the fused steps; more share each step's read of the RNN and the fold in the op chain.
+        if (slots.len == 1) {
+            out[0] = try d.markov(g, slots[0].t1, rows, newest[0], base, vocab, softcap, kernels.markovRuns(g, d.rnn.w, d.fold, rank));
+            return;
+        }
+        const all = try d.markovOps(g, try g.concat(t1s[0..slots.len], 0), rows, try g.concat(newest[0..slots.len], 0), base, vocab, softcap);
+        for (0..slots.len) |i| {
             const one = @as(c_int, @intCast(i));
-            out[i] = try d.markov(g, sl.t1, try g.sliceAxis(rows, 0, one, one + 1), newest, try g.sliceAxis(base, 0, one, one + 1), vocab, softcap, fused);
+            out[i] = .{ .tokens = try g.reshape(try g.sliceAxis(all.tokens, 0, one, one + 1), &.{-1}), .confidence = try g.reshape(try g.sliceAxis(all.confidence, 0, one, one + 1), &.{-1}) };
         }
     }
 
@@ -347,8 +357,12 @@ pub const Drafter = struct {
     /// from the committed token `t1` and the newest mix `newest` `[1, 1, hidden]`: each step's token and probability.
     /// `fused` runs a step as `kernels.markovStep`'s three launches, else as the op chain.
     pub fn markov(d: *const Drafter, g: *Graph, t1: Array, rows: Array, newest: Array, base: Array, vocab: c_int, softcap: f32, fused: bool) !Block {
-        const rank: c_int = @intCast(d.cfg.rank);
         const steps: usize = @intCast(ops.shape(rows)[1]);
+        if (!fused) {
+            const b = try d.markovOps(g, t1, rows, newest, base, vocab, softcap);
+            return .{ .tokens = try g.reshape(b.tokens, &.{-1}), .confidence = try g.reshape(b.confidence, &.{-1}) };
+        }
+        const rank: c_int = @intCast(d.cfg.rank);
         const dt = ops.dtype(d.norm);
         var state = try g.zeros(&.{ 1, 1, rank }, dt);
         var prev = t1;
@@ -356,16 +370,29 @@ pub const Drafter = struct {
         var sure: [abi.max_round_tokens]Array = undefined;
         const dense_rows = try g.contiguous(rows);
         for (0..steps) |i| {
+            const st = try kernels.markovStep(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, newest, prev, d.fold, d.fold_bias, base, @intCast(i), vocab, softcap);
+            state = st.state;
+            prev = st.token;
+            drafted[i] = st.token;
+            sure[i] = st.confidence;
+        }
+        return .{ .tokens = try g.concat(drafted[0..steps], 0), .confidence = try g.concat(sure[0..steps], 0) };
+    }
+
+    /// The Markov chain as ops for `S` slots at once (`t1` `[S]`, `rows` `[S, steps, hidden]`, `newest` `[S, 1, hidden]`,
+    /// `base` `[S, steps, V]`): one read of the RNN and the fold a step for all of them. Tokens and probabilities `[S, steps]`.
+    pub fn markovOps(d: *const Drafter, g: *Graph, t1: Array, rows: Array, newest: Array, base: Array, vocab: c_int, softcap: f32) !Block {
+        const rank: c_int = @intCast(d.cfg.rank);
+        const ns = ops.shape(rows)[0];
+        const steps: usize = @intCast(ops.shape(rows)[1]);
+        const dt = ops.dtype(d.norm);
+        var state = try g.zeros(&.{ ns, 1, rank }, dt);
+        var prev = t1;
+        var drafted: [abi.max_round_tokens]Array = undefined;
+        var sure: [abi.max_round_tokens]Array = undefined;
+        for (0..steps) |i| {
             const at: c_int = @intCast(i);
-            if (fused) {
-                const st = try kernels.markovStep(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, newest, prev, d.fold, d.fold_bias, base, at, vocab, softcap);
-                state = st.state;
-                prev = st.token;
-                drafted[i] = st.token;
-                sure[i] = st.confidence;
-                continue;
-            }
-            const last = try g.astype(try g.reshape(try g.take(d.prev_rows, prev, 0), &.{ 1, 1, rank }), dt);
+            const last = try g.astype(try g.reshape(try g.take(d.prev_rows, prev, 0), &.{ ns, 1, rank }), dt);
             const fed = try g.concat(&.{ state, last, try g.sliceAxis(rows, 1, at, at + 1), newest }, 2);
             const p = try g.astype(try g.add(try project(g, &d.rnn, fed), d.rnn_bias), .float32);
             const keep = try g.astype(try g.sigmoid(try g.sliceAxis(p, 2, 0, rank)), dt);
@@ -375,12 +402,12 @@ pub const Drafter = struct {
             const bias = try g.astype(try g.add(try g.matmul(latent, d.fold), d.fold_bias), .float32);
             // The soft cap is monotonic: the pick over the real rows is the capped logits'; the probability is not.
             const logits = try g.sliceAxis(try g.add(try g.sliceAxis(base, 1, at, at + 1), bias), 2, 0, vocab);
-            prev = try g.astype(try g.reshape(try g.argmax(logits, -1, false), &.{1}), .int32);
-            drafted[i] = prev;
+            prev = try g.astype(try g.reshape(try g.argmax(logits, -1, false), &.{ns}), .int32);
+            drafted[i] = try g.reshape(prev, &.{ ns, 1 });
             const capped = if (softcap > 0) try g.mulScalar(try g.tanh(try g.mulScalar(logits, 1.0 / softcap)), softcap) else logits;
-            sure[i] = try g.reshape(try g.exp(try g.sub(try g.max(capped, -1, false), try g.call(mlx.mlx_logsumexp_axis, .{ capped, -1, false }))), &.{1});
+            sure[i] = try g.reshape(try g.exp(try g.sub(try g.max(capped, -1, false), try g.call(mlx.mlx_logsumexp_axis, .{ capped, -1, false }))), &.{ ns, 1 });
         }
-        return .{ .tokens = try g.concat(drafted[0..steps], 0), .confidence = try g.concat(sure[0..steps], 0) };
+        return .{ .tokens = try g.concat(drafted[0..steps], 1), .confidence = try g.concat(sure[0..steps], 1) };
     }
 };
 
