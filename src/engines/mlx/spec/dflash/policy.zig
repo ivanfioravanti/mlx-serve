@@ -182,6 +182,8 @@ pub const Drafting = struct {
     owed: u32 = 0,
     /// Plain rounds the next losing round will owe.
     period: u32 = 1,
+    /// Longest rest this request's probes back off to.
+    max_period: u32 = MAX_PERIOD,
     /// Rounds skipped, for stats.
     skipped: u64 = 0,
     /// Drafted rounds that followed a skip stretch.
@@ -219,7 +221,7 @@ pub const Drafting = struct {
             self.period = @max(1, self.period / 2);
         } else {
             self.owed = self.period;
-            self.period = @min(self.period * 2, MAX_PERIOD);
+            self.period = @min(self.period * 2, self.max_period);
         }
     }
 };
@@ -496,6 +498,21 @@ test "Drafting: a losing draft owes plain rounds, doubling to a cap; a winning p
     d.record(60, 10);
     try testing.expect(d.shouldDraft());
     try testing.expect(d.probes > 0 and d.skipped > 0);
+}
+
+test "Drafting: the rests double to max_period, 32 unless set" {
+    for ([_]struct { d: Drafting, want: []const u32 }{
+        .{ .d = .{}, .want = &.{ 1, 2, 4, 8, 16, 32, 32, 32, 32 } },
+        .{ .d = .{ .max_period = 128 }, .want = &.{ 1, 2, 4, 8, 16, 32, 64, 128, 128 } },
+    }) |case| {
+        var d = case.d;
+        for (case.want) |want| {
+            d.record(5, 10);
+            var owed: u32 = 0;
+            while (!d.shouldDraft()) owed += 1;
+            try testing.expectEqual(want, owed);
+        }
+    }
 }
 
 test "Drafting: a thin win with scattered misses keeps drafting, because the rounds are weighed by their time" {
