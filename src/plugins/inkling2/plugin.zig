@@ -88,6 +88,21 @@ pub const Spec = struct {
         sp.owner = slot;
     }
 
+    /// Takes `slot`'s drafter context out (an empty one left in its place), for a draft built past the next `select`.
+    pub fn takeContext(sp: *Spec, slot: u32) draft.ContextKv {
+        sp.select(slot);
+        const c = sp.context;
+        sp.context = .{};
+        return c;
+    }
+
+    /// Gives `slot` back the context `takeContext` lent it.
+    pub fn putContext(sp: *Spec, slot: u32, c: draft.ContextKv) void {
+        sp.select(slot);
+        sp.context.release();
+        sp.context = c;
+    }
+
     /// The context rows before `position`: the ring's rows up to it (a stacked prompt's pass taps its padding past the
     /// slot's end); 0 when the ring ends before it or holds none of its rows.
     pub fn rows(sp: *const Spec, position: u64) c_int {
@@ -540,12 +555,17 @@ fn roundSlots(m: *Loaded, f: *const abi.Forward, rounds: [*]abi.Round) !void {
     var drafts: [max_group]u32 = @splat(0);
     var ids: [max_group][abi.max_round_tokens]u32 = undefined;
     var width: u32 = 1;
-    // Every slot's draft built first and evaluated together: one round-trip to the GPU, not one a slot.
+    // Every slot's draft in one drafter forward and one evaluation, not one a slot.
     var out_tokens: [max_group]ops.Array = undefined;
     var out_sure: [max_group]ops.Array = undefined;
     var drafting: [max_group]bool = @splat(false);
     var pending: [2 * max_group]ops.Array = undefined;
     var n_pending: usize = 0;
+    var batch: [max_group]draft.Drafter.Slot = undefined;
+    var order: [max_group]usize = undefined;
+    var n_drafting: usize = 0;
+    var lent: [max_group]draft.ContextKv = undefined;
+    defer for (lent[0..n_drafting], order[0..n_drafting]) |c, i| sp.putContext(slots[i], c);
     const gate = &m.batch_gate;
     // A group whose recent rounds verified nothing waits out its backoff as plain ticks.
     const resting = gate.skip_left > 0;
@@ -563,15 +583,25 @@ fn roundSlots(m: *Loaded, f: *const abi.Forward, rounds: [*]abi.Round) !void {
         const first = try g.fromSlice(i32, &.{@intCast(t1)}, &.{1});
         const anchor = try g.rmsNorm(try b.embed.TableEmbed.forward(&w.embed, &c, try g.reshape(first, &.{ 1, 1 })), w.embed_norm, cfg.rms_norm_eps);
         if (sp.end != positions[i]) sp.context.release();
-        const drafted = try dr.draft(g, first, anchor, try sp.ringTo(g, positions[i]), @intCast(positions[i]), &w.head.lin, w.head.vocab, w.head.softcap, &sp.context);
-        out_tokens[i] = drafted.tokens;
-        out_sure[i] = drafted.confidence;
+        const taps = try sp.ringTo(g, positions[i]);
+        order[n_drafting] = i;
+        lent[n_drafting] = sp.takeContext(slots[i]);
+        batch[n_drafting] = .{ .t1 = first, .anchor = anchor, .taps = taps, .position = @intCast(positions[i]), .cache = &lent[n_drafting] };
+        n_drafting += 1;
         drafting[i] = true;
-        pending[n_pending] = drafted.tokens;
-        pending[n_pending + 1] = drafted.confidence;
-        n_pending += 2;
     }
-    if (n_pending > 0) try ops.evalMany(pending[0..n_pending]);
+    if (n_drafting > 0) {
+        var blocks: [max_group]draft.Drafter.Block = undefined;
+        try dr.draftMany(g, batch[0..n_drafting], &w.head.lin, w.head.vocab, w.head.softcap, blocks[0..n_drafting]);
+        for (blocks[0..n_drafting], order[0..n_drafting]) |blk, i| {
+            out_tokens[i] = blk.tokens;
+            out_sure[i] = blk.confidence;
+            pending[n_pending] = blk.tokens;
+            pending[n_pending + 1] = blk.confidence;
+            n_pending += 2;
+        }
+        try ops.evalMany(pending[0..n_pending]);
+    }
     var gain: f32 = 0;
     for (0..n) |i| if (drafting[i]) {
         const sure = mlx.mlx_array_data_float32(out_sure[i]) orelse return error.Inkling2DraftRound;
@@ -644,7 +674,7 @@ fn roundSlots(m: *Loaded, f: *const abi.Forward, rounds: [*]abi.Round) !void {
 }
 
 /// Slots a batched round takes: the engine's DSpark group.
-const max_group = 16;
+const max_group = draft.Drafter.max_slots;
 
 /// What a batched round costs and earns, measured as it runs: the plain batched tick by slot count, what a verified
 /// row past each slot's first adds to it, and each engine slot's recent sure drafts and the share of them kept.
@@ -1268,6 +1298,31 @@ test "skipsDraft: a slot expecting no kept draft skips drafting, and re-probes e
     try t.expect(!skipsDraft(1.2, 3));
     try t.expect(skipsDraft(0.3, 3));
     try t.expect(!skipsDraft(0.3, 8));
+}
+
+test "inkling2 draft taps: contexts lent to one round's drafts go back to their own slots" {
+    // Bar: a round drafting several slots at once gives each its own drafter context, not the last selected one's.
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    var sp: Spec = .{ .visits = &.{}, .keep = 8 };
+    defer sp.deinit();
+    for ([_]u32{ 1, 2, 3 }) |slot| {
+        sp.select(slot);
+        try sp.push(&g, 0, try g.ones(&.{ 1, 2, 2 }, .float32));
+        sp.context.end = 10 * slot;
+    }
+    var lent: [3]draft.ContextKv = undefined;
+    for (&lent, [_]u32{ 1, 2, 3 }) |*c, slot| c.* = sp.takeContext(slot);
+    for (lent, [_]u32{ 1, 2, 3 }) |c, slot| try std.testing.expectEqual(@as(u64, 10 * slot), c.end);
+    lent[1].end = 25;
+    for (lent, [_]u32{ 1, 2, 3 }) |c, slot| sp.putContext(slot, c);
+    for ([_]u32{ 3, 1, 2 }, [_]u64{ 30, 10, 25 }) |slot, end| {
+        sp.select(slot);
+        try std.testing.expectEqual(end, sp.context.end);
+    }
 }
 
 test "inkling2 draft taps: a ring past the slot's position serves its rows before it, and a push there continues them" {

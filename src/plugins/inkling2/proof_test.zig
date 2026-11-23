@@ -1228,21 +1228,15 @@ test "inkling2 kernels: the fused Markov chain drafts the op chain's tokens" {
 // Bar: a slot's rounds with the drafter's context keys and values carried over draft what rounds projecting the
 // context afresh draft, the probabilities to 1e-5 (the CPU stream, f32): a ring that grows, slides past its keep, holds
 // still (no new row) and jumps past the cache (projected afresh).
-test "inkling2 draft: rounds that carry the context keys and values draft what fresh ones do" {
-    const a = testing.allocator;
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
-    const saved = fx_stream;
-    fx_stream = cpu;
-    defer fx_stream = saved;
-    var g = ops.Graph.init(a, cpu);
-    defer g.deinit();
+/// A one-layer drafter of random weights on `g` (hidden 32, head dim 16, vocab 64, block 4), its layer in `layer`.
+const TinyDrafter = struct { d: draft.Drafter, head: @import("../../sdk/bases/blocks/linear.zig").Linear, anchor: ops.Array };
+
+fn tinyDrafter(g: *ops.Graph, a: std.mem.Allocator, cpu: mlx.mlx_stream, layer: *draft.Layer, seed: *u64) !TinyDrafter {
     const H = 32;
     const HD = 16;
     const V = 64;
     const R = 8;
     const dt: ops.Dtype = .float32;
-    var seed: u64 = 17000;
     const W = struct {
         fn of(gr: *ops.Graph, al: std.mem.Allocator, sd: *u64, shape: []const c_int, scale: f32) !ops.Array {
             sd.* += 1;
@@ -1255,41 +1249,94 @@ test "inkling2 draft: rounds that carry the context keys and values draft what f
         }
     };
     const one = try g.ones(&.{H}, dt);
-    var layer: draft.Layer = .{
+    layer.* = .{
         .in_norm = one, .post_norm = one, .mix_norm = one,
-        .q = try lin.of(&g, a, &seed, 2 * HD, H), .k = try lin.of(&g, a, &seed, HD, H), .v = try lin.of(&g, a, &seed, HD, H), .o = try lin.of(&g, a, &seed, H, 2 * HD),
-        .k_ctx = try lin.of(&g, a, &seed, HD, H), .v_ctx = try lin.of(&g, a, &seed, HD, H),
+        .q = try lin.of(g, a, seed, 2 * HD, H), .k = try lin.of(g, a, seed, HD, H), .v = try lin.of(g, a, seed, HD, H), .o = try lin.of(g, a, seed, H, 2 * HD),
+        .k_ctx = try lin.of(g, a, seed, HD, H), .v_ctx = try lin.of(g, a, seed, HD, H),
         .q_norm = try g.ones(&.{HD}, dt), .k_norm = try g.ones(&.{HD}, dt), .k_norm_ctx = try g.ones(&.{HD}, dt),
-        .gate = try lin.of(&g, a, &seed, 48, H), .up = try lin.of(&g, a, &seed, 48, H), .down = try lin.of(&g, a, &seed, H, 48),
+        .gate = try lin.of(g, a, seed, 48, H), .up = try lin.of(g, a, seed, 48, H), .down = try lin.of(g, a, seed, H, 48),
     };
     var d: draft.Drafter = .{
         .cfg = .{ .layers = 1, .heads = 2, .kv_heads = 1, .head_dim = HD, .intermediate = 48, .window = 13, .block = 4, .rank = R, .tap_count = 2 },
         .hidden = H,
         .s = cpu,
     };
-    d.layers = (&layer)[0..1];
+    d.layers = layer[0..1];
     d.norm = one;
-    d.mask = try W.of(&g, a, &seed, &.{ 1, 1, H }, 1.0);
-    d.alpha = try g.softmax(try W.of(&g, a, &seed, &.{ 2, 2, 1 }, 1.0), 1, true);
-    d.prev_rows = try W.of(&g, a, &seed, &.{ V, R }, 0.5);
-    d.rnn = .{ .w = try W.of(&g, a, &seed, &.{ 3 * R, 2 * R + 2 * H }, 0.1) };
-    d.rnn_bias = try W.of(&g, a, &seed, &.{3 * R}, 0.1);
+    d.mask = try W.of(g, a, seed, &.{ 1, 1, H }, 1.0);
+    d.alpha = try g.softmax(try W.of(g, a, seed, &.{ 2, 2, 1 }, 1.0), 1, true);
+    d.prev_rows = try W.of(g, a, seed, &.{ V, R }, 0.5);
+    d.rnn = .{ .w = try W.of(g, a, seed, &.{ 3 * R, 2 * R + 2 * H }, 0.1) };
+    d.rnn_bias = try W.of(g, a, seed, &.{3 * R}, 0.1);
     d.rnn_norm = one;
-    d.fold = try W.of(&g, a, &seed, &.{ R, V }, 0.3);
-    d.fold_bias = try W.of(&g, a, &seed, &.{ 1, 1, V }, 0.3);
-    const head = try lin.of(&g, a, &seed, V, H);
-    const anchor = try W.of(&g, a, &seed, &.{ 1, 1, H }, 1.0);
+    d.fold = try W.of(g, a, seed, &.{ R, V }, 0.3);
+    d.fold_bias = try W.of(g, a, seed, &.{ 1, 1, V }, 0.3);
+    return .{ .d = d, .head = try lin.of(g, a, seed, V, H), .anchor = try W.of(g, a, seed, &.{ 1, 1, H }, 1.0) };
+}
+
+test "inkling2 draft: rounds that carry the context keys and values draft what fresh ones do" {
+    const a = testing.allocator;
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const saved = fx_stream;
+    fx_stream = cpu;
+    defer fx_stream = saved;
+    var g = ops.Graph.init(a, cpu);
+    defer g.deinit();
+    var seed: u64 = 17000;
+    var layer: draft.Layer = undefined;
+    const tiny = try tinyDrafter(&g, a, cpu, &layer, &seed);
+    const d = &tiny.d;
     const t1 = try g.fromSlice(i32, &.{7}, &.{1});
-    const full = try W.of(&g, a, &seed, &.{ 1, 40, 2 * H }, 1.0);
+    const full = try randomRow(&g, a, 17100, &.{ 1, 40, 64 }, 1.0, .float32);
     var cache: draft.ContextKv = .{};
     defer cache.release();
     // The ring's rows [lo, hi), ending at the round's position: grows, slides past 12 rows, holds, jumps.
     for ([_][2]c_int{ .{ 0, 5 }, .{ 0, 9 }, .{ 2, 14 }, .{ 6, 18 }, .{ 6, 18 }, .{ 28, 40 } }) |span| {
         const ring = try g.sliceAxis(full, 1, span[0], span[1]);
-        const got = try d.draft(&g, t1, anchor, ring, span[1], &head, V - 4, 30, &cache);
-        const want = try d.draft(&g, t1, anchor, ring, span[1], &head, V - 4, 30, null);
+        const got = try d.draft(&g, t1, tiny.anchor, ring, span[1], &tiny.head, 60, 30, &cache);
+        const want = try d.draft(&g, t1, tiny.anchor, ring, span[1], &tiny.head, 60, 30, null);
         try expectClose(got.tokens, want.tokens, 0, "drafted tokens");
         try expectClose(got.confidence, want.confidence, 1e-5, "draft probabilities");
+    }
+}
+
+test "inkling2 draft: slots drafted in one forward draft what each slot's own draft does" {
+    const a = testing.allocator;
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const saved = fx_stream;
+    fx_stream = cpu;
+    defer fx_stream = saved;
+    var g = ops.Graph.init(a, cpu);
+    defer g.deinit();
+    var seed: u64 = 18000;
+    var layer: draft.Layer = undefined;
+    const tiny = try tinyDrafter(&g, a, cpu, &layer, &seed);
+    const d = &tiny.d;
+    // Rings of different lengths at different positions, some carried over a cache, one a single row.
+    const lens = [_]c_int{ 5, 12, 1, 9 };
+    const ends = [_]c_int{ 5, 30, 3, 17 };
+    var caches: [lens.len]draft.ContextKv = @splat(.{});
+    defer for (&caches) |*c| c.release();
+    var slots: [lens.len]draft.Drafter.Slot = undefined;
+    var want: [lens.len]draft.Drafter.Block = undefined;
+    for (0..2) |round| {
+        for (&slots, &want, 0..) |*sl, *w, i| {
+        const end = ends[i] + @as(c_int, @intCast(round)) * 2;
+        // Each slot's taps one buffer, so a cache carried to the next round still holds its rows.
+        const ring = try g.sliceAxis(try randomRow(&g, a, 18100 + i, &.{ 1, 40, 64 }, 1.0, .float32), 1, end - lens[i], end);
+        const t1 = try g.fromSlice(i32, &.{@intCast(3 + i)}, &.{1});
+        const anchor = try randomRow(&g, a, 18200 + i, &.{ 1, 1, 32 }, 1.0, .float32);
+        sl.* = .{ .t1 = t1, .anchor = anchor, .taps = ring, .position = end, .cache = if (i % 2 == 0) &caches[i] else null };
+        w.* = try d.draft(&g, t1, anchor, ring, end, &tiny.head, 60, 30, null);
+        }
+        var got: [lens.len]draft.Drafter.Block = undefined;
+        try d.draftMany(&g, &slots, &tiny.head, 60, 30, &got);
+        for (got, want) |x, y| {
+            try expectClose(x.tokens, y.tokens, 0, "drafted tokens");
+            try expectClose(x.confidence, y.confidence, 1e-5, "draft probabilities");
+        }
     }
 }
 

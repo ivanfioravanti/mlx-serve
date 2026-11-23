@@ -180,19 +180,7 @@ pub const Drafter = struct {
         const rank: c_int = @intCast(cfg.rank);
         const n = ops.shape(taps)[1];
         const dt = ops.dtype(d.norm);
-        const at: u64 = @intCast(position);
-        // The rows the cache lacks: those committed since its end, when it still reaches back to the ring's first.
-        var fresh: c_int = n;
-        if (cache) |cc| if (cc.k[0].ctx != null and cc.end <= at and at - cc.end <= @as(u64, @intCast(n))) {
-            const since: c_int = @intCast(at - cc.end);
-            if (since + ops.shape(cc.k[0])[2] >= n) fresh = since;
-        };
-        const tapsOf = struct {
-            fn f(gr: *Graph, x: Array, from: c_int, to: c_int, count: u32, width: c_int) !Array {
-                return gr.astype(try gr.reshape(try gr.sliceAxis(x, 1, from, to), &.{ 1, to - from, @intCast(count), width }), .float32);
-            }
-        }.f;
-        const new32 = if (fresh > 0) try tapsOf(g, taps, n - fresh, n, cfg.tap_count, hidden) else null;
+        const ctx = try d.contextKv(g, taps, position, cache);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
         const back = [_]c_int{ 0, 2, 1, 3 };
 
@@ -200,38 +188,10 @@ pub const Drafter = struct {
         for (d.layers, 0..) |*L, i| {
             var lg = g.scope();
             defer lg.deinit();
-            var kc: Array = .{};
-            var vc: Array = .{};
-            if (new32) |rows32| {
-                const context = try d.mix(&lg, rows32, @intCast(i), L.mix_norm);
-                kc = try d.heads(&lg, try project(&lg, &L.k_ctx, context), cfg.kv_heads, L.k_norm_ctx, position - fresh);
-                vc = try d.heads(&lg, try project(&lg, &L.v_ctx, context), cfg.kv_heads, null, null);
-            }
-            if (fresh < n) {
-                const cc = cache.?;
-                if (fresh > 0) {
-                    kc = try lg.concat(&.{ cc.k[i], kc }, 2);
-                    vc = try lg.concat(&.{ cc.v[i], vc }, 2);
-                } else {
-                    kc = cc.k[i];
-                    vc = cc.v[i];
-                }
-                const total = ops.shape(kc)[2];
-                kc = try lg.sliceAxis(kc, 2, total - n, total);
-                vc = try lg.sliceAxis(vc, 2, total - n, total);
-            }
-            if (cache) |cc| {
-                const k_held = lg.escape(kc);
-                const v_held = lg.escape(vc);
-                if (cc.k[i].ctx != null) _ = mlx.mlx_array_free(cc.k[i]);
-                if (cc.v[i].ctx != null) _ = mlx.mlx_array_free(cc.v[i]);
-                cc.k[i] = k_held;
-                cc.v[i] = v_held;
-            }
             const x = try lg.rmsNorm(h, L.in_norm, cfg.eps);
             const q = try d.heads(&lg, try project(&lg, &L.q, x), cfg.heads, L.q_norm, position);
-            const keys = try lg.concat(&.{ kc, try d.heads(&lg, try project(&lg, &L.k, x), cfg.kv_heads, L.k_norm, position) }, 2);
-            const values = try lg.concat(&.{ vc, try d.heads(&lg, try project(&lg, &L.v, x), cfg.kv_heads, null, null) }, 2);
+            const keys = try lg.concat(&.{ ctx.k[i], try d.heads(&lg, try project(&lg, &L.k, x), cfg.kv_heads, L.k_norm, position) }, 2);
+            const values = try lg.concat(&.{ ctx.v[i], try d.heads(&lg, try project(&lg, &L.v, x), cfg.kv_heads, null, null) }, 2);
             const read = try lg.reshape(try lg.transpose(try lg.sdpa(q, keys, values, scale, .none), &back), &.{ 1, block, -1 });
             const mid = try lg.add(h, try project(&lg, &L.o, read));
             const y = try lg.rmsNorm(mid, L.post_norm, cfg.eps);
@@ -240,11 +200,147 @@ pub const Drafter = struct {
         }
         const rows = try g.sliceAxis(try g.rmsNorm(h, d.norm, cfg.eps), 1, 1, block);
         const base = try g.astype(try project(g, head, rows), .float32);
-
-        if (cache) |cc| cc.end = at;
         // The RNN restarts each block from the newest committed position's mix.
         const newest = try d.mix(g, try tapsOf(g, taps, n - 1, n, cfg.tap_count, hidden), @intCast(d.layers.len), d.rnn_norm);
         return d.markov(g, t1, rows, newest, base, vocab, softcap, kernels.markovRuns(g, d.rnn.w, d.fold, rank));
+    }
+
+    /// One slot of `draftMany`: what `draft` takes for it.
+    pub const Slot = struct { t1: Array, anchor: Array, taps: Array, position: c_int, cache: ?*ContextKv };
+
+    /// `draft` for every slot in one forward: the blocks stacked on the batch axis, each reading its own context (padded
+    /// to the longest, masked) at its own positions; the Markov chain runs per slot. `out[i]` is slot `i`'s block.
+    pub fn draftMany(d: *const Drafter, g: *Graph, slots: []const Slot, head: *const Linear, vocab: c_int, softcap: f32, out: []Block) !void {
+        const cfg = &d.cfg;
+        const hidden: c_int = @intCast(d.hidden);
+        const block: c_int = @intCast(cfg.block);
+        const rank: c_int = @intCast(cfg.rank);
+        const hd: c_int = @intCast(cfg.head_dim);
+        const ns: c_int = @intCast(slots.len);
+        const dt = ops.dtype(d.norm);
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+        const back = [_]c_int{ 0, 2, 1, 3 };
+        var ctx: [max_slots]Context = undefined;
+        var longest: c_int = 0;
+        var at: [max_slots]i32 = undefined;
+        var rows_in: [max_slots]Array = undefined;
+        for (slots, 0..) |sl, i| {
+            ctx[i] = try d.contextKv(g, sl.taps, sl.position, sl.cache);
+            longest = @max(longest, ops.shape(sl.taps)[1]);
+            at[i] = sl.position;
+            rows_in[i] = try g.concat(&.{ try g.astype(sl.anchor, dt), try g.broadcast(try g.astype(d.mask, dt), &.{ 1, block - 1, hidden }) }, 1);
+        }
+        const offsets = try g.fromSlice(i32, at[0..slots.len], &.{ns});
+        // A slot reads its own context's rows (left-padded to the longest) and its whole block.
+        var allow: [max_slots]Array = undefined;
+        for (slots, 0..) |sl, i| {
+            const pad = longest - ops.shape(sl.taps)[1];
+            allow[i] = try g.concat(&.{ try g.zeros(&.{ 1, 1, block, pad }, .bool_), try g.ones(&.{ 1, 1, block, longest - pad + block }, .bool_) }, 3);
+        }
+        const mask = try g.concat(allow[0..slots.len], 0);
+        var h = try g.concat(rows_in[0..slots.len], 0);
+        const headsOf = struct {
+            fn f(gr: *Graph, x: Array, count: u32, dim: c_int, norm: ?Array, eps: f32) !Array {
+                var y = try gr.reshape(x, &.{ ops.shape(x)[0], ops.shape(x)[1], @intCast(count), dim });
+                if (norm) |w| y = try gr.rmsNorm(y, w, eps);
+                return gr.transpose(y, &.{ 0, 2, 1, 3 });
+            }
+        }.f;
+        for (d.layers, 0..) |*L, li| {
+            var lg = g.scope();
+            defer lg.deinit();
+            var ks: [max_slots]Array = undefined;
+            var vs: [max_slots]Array = undefined;
+            for (slots, 0..) |sl, i| {
+                const pad = longest - ops.shape(sl.taps)[1];
+                const shape = [_]c_int{ 1, @intCast(cfg.kv_heads), pad, hd };
+                ks[i] = if (pad > 0) try lg.concat(&.{ try lg.zeros(&shape, ops.dtype(ctx[i].k[li])), ctx[i].k[li] }, 2) else ctx[i].k[li];
+                vs[i] = if (pad > 0) try lg.concat(&.{ try lg.zeros(&shape, ops.dtype(ctx[i].v[li])), ctx[i].v[li] }, 2) else ctx[i].v[li];
+            }
+            const x = try lg.rmsNorm(h, L.in_norm, cfg.eps);
+            const rope = struct {
+                fn f(gr: *Graph, y: Array, dims: c_int, theta: f32, off: Array) !Array {
+                    return gr.call(mlx.mlx_fast_rope_dynamic, .{ y, dims, false, mlx.mlx_optional_float.some(theta), 1.0, off, Array{} });
+                }
+            }.f;
+            const q = try rope(&lg, try headsOf(&lg, try project(&lg, &L.q, x), cfg.heads, hd, L.q_norm, cfg.eps), hd, cfg.theta, offsets);
+            const k_new = try rope(&lg, try headsOf(&lg, try project(&lg, &L.k, x), cfg.kv_heads, hd, L.k_norm, cfg.eps), hd, cfg.theta, offsets);
+            const v_new = try headsOf(&lg, try project(&lg, &L.v, x), cfg.kv_heads, hd, null, cfg.eps);
+            const keys = try lg.concat(&.{ try lg.concat(ks[0..slots.len], 0), k_new }, 2);
+            const values = try lg.concat(&.{ try lg.concat(vs[0..slots.len], 0), v_new }, 2);
+            const read = try lg.reshape(try lg.transpose(try lg.sdpa(q, keys, values, scale, .{ .array = mask }), &back), &.{ ns, block, -1 });
+            const mid = try lg.add(h, try project(&lg, &L.o, read));
+            const y = try lg.rmsNorm(mid, L.post_norm, cfg.eps);
+            const mlp = try project(&lg, &L.down, try lg.mul(try lg.silu(try project(&lg, &L.gate, y)), try project(&lg, &L.up, y)));
+            h = try g.keep(try lg.add(mid, mlp));
+        }
+        const rows = try g.sliceAxis(try g.rmsNorm(h, d.norm, cfg.eps), 1, 1, block);
+        const base = try g.astype(try project(g, head, rows), .float32);
+        const fused = kernels.markovRuns(g, d.rnn.w, d.fold, rank);
+        for (slots, 0..) |sl, i| {
+            const n = ops.shape(sl.taps)[1];
+            const newest = try d.mix(g, try tapsOf(g, sl.taps, n - 1, n, cfg.tap_count, hidden), @intCast(d.layers.len), d.rnn_norm);
+            const one = @as(c_int, @intCast(i));
+            out[i] = try d.markov(g, sl.t1, try g.sliceAxis(rows, 0, one, one + 1), newest, try g.sliceAxis(base, 0, one, one + 1), vocab, softcap, fused);
+        }
+    }
+
+    /// Slots `draftMany` takes: the engine's DSpark group.
+    pub const max_slots = 16;
+
+    /// A layer's context keys and values `[1, kv_heads, n, hd]` for the ring `taps`'s `n` rows before `position`, owned
+    /// by `g`: those `cache` holds reused, the rows committed since its end projected, and `cache` moved to them.
+    const Context = struct { k: [max_layers]Array = undefined, v: [max_layers]Array = undefined };
+
+    fn contextKv(d: *const Drafter, g: *Graph, taps: Array, position: c_int, cache: ?*ContextKv) !Context {
+        const cfg = &d.cfg;
+        const hidden: c_int = @intCast(d.hidden);
+        const n = ops.shape(taps)[1];
+        const at: u64 = @intCast(position);
+        // The rows the cache lacks: those committed since its end, when it still reaches back to the ring's first.
+        var fresh: c_int = n;
+        if (cache) |cc| if (cc.k[0].ctx != null and cc.end <= at and at - cc.end <= @as(u64, @intCast(n))) {
+            const since: c_int = @intCast(at - cc.end);
+            if (since + ops.shape(cc.k[0])[2] >= n) fresh = since;
+        };
+        const new32 = if (fresh > 0) try tapsOf(g, taps, n - fresh, n, cfg.tap_count, hidden) else null;
+        var out: Context = .{};
+        for (d.layers, 0..) |*L, i| {
+            var kc: Array = .{};
+            var vc: Array = .{};
+            if (new32) |rows32| {
+                const context = try d.mix(g, rows32, @intCast(i), L.mix_norm);
+                kc = try d.heads(g, try project(g, &L.k_ctx, context), cfg.kv_heads, L.k_norm_ctx, position - fresh);
+                vc = try d.heads(g, try project(g, &L.v_ctx, context), cfg.kv_heads, null, null);
+            }
+            if (fresh < n) {
+                const cc = cache.?;
+                if (fresh > 0) {
+                    kc = try g.concat(&.{ cc.k[i], kc }, 2);
+                    vc = try g.concat(&.{ cc.v[i], vc }, 2);
+                } else {
+                    kc = try g.keep(cc.k[i]);
+                    vc = try g.keep(cc.v[i]);
+                }
+                const total = ops.shape(kc)[2];
+                kc = try g.sliceAxis(kc, 2, total - n, total);
+                vc = try g.sliceAxis(vc, 2, total - n, total);
+            }
+            if (cache) |cc| {
+                if (cc.k[i].ctx != null) _ = mlx.mlx_array_free(cc.k[i]);
+                if (cc.v[i].ctx != null) _ = mlx.mlx_array_free(cc.v[i]);
+                cc.k[i] = g.escape(try g.keep(kc));
+                cc.v[i] = g.escape(try g.keep(vc));
+            }
+            out.k[i] = kc;
+            out.v[i] = vc;
+        }
+        if (cache) |cc| cc.end = at;
+        return out;
+    }
+
+    fn tapsOf(g: *Graph, x: Array, from: c_int, to: c_int, count: u32, width: c_int) !Array {
+        return g.astype(try g.reshape(try g.sliceAxis(x, 1, from, to), &.{ 1, to - from, @intCast(count), width }), .float32);
     }
 
     /// The Markov head's chain over the block rows `rows` `[1, block - 1, hidden]` and their head logits `base` f32,
