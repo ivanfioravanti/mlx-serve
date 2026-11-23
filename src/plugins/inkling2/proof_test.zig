@@ -127,7 +127,7 @@ test "inkling2 pack: the lm_head over the last head_tail_rows rows serves the la
     defer _ = mlx.mlx_map_string_to_array_free(map);
     var meta = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta);
-    try mlx.check(mlx.mlx_load_safetensors(&map, &meta, try std.fmt.allocPrintSentinel(ar, "{s}/{s}", .{ dir, shard }, 0), s));
+    try mlx.check(mlx.mlx_load_safetensors(&map, &meta, try std.fmt.allocPrintSentinel(ar, "{s}/{s}", .{ dir, shard }, 0), mlx.weightLoadStream()));
     var lin: layers.Linear = .{ .bits = q.bits, .group_size = q.group_size };
     for ([_]*ops.Array{ &lin.w, &lin.s, &lin.b }, [_][:0]const u8{ "lm_head.weight", "lm_head.scales", "lm_head.biases" }) |p, name| {
         var x = mlx.mlx_array_new();
