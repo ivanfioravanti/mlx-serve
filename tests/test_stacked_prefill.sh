@@ -66,9 +66,9 @@ got = [None] * 4
 th = [threading.Thread(target=lambda i=i: got.__setitem__(i, call(prompt(i, "stack"), False))) for i in range(4)]
 before = lines()
 [t.start() for t in th]; [t.join() for t in th]
-# A repeat of a stacked prompt restores where the pass left its checkpoints: one row short of its end on a model that
-# declares the end-1 cut (inkling2), else the backoff's.
-end1 = tie >= 0.75 and not fail
+# A repeat of a stacked prompt restores where the pass left its checkpoint: the snapshot backoff, 31 rows short of its
+# end, so its tail re-runs as the cold prompt's final span did (no model declares the end-1 cut).
+stacked_cut = tie >= 0.75 and not fail
 def restores():
     try: return [l for l in open(slog) if "[hot-cache] restore pos=" in l]
     except OSError: return []
@@ -76,11 +76,11 @@ seen = len(restores())
 rep = post("/v1/completions", {"prompt": prompt(0, "stack"), "max_tokens": 1, "temperature": 0})
 n_prompt = rep.get("usage", {}).get("prompt_tokens", 0)
 cached = (rep.get("usage", {}).get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-if end1:
-    if cached != n_prompt - 1:
-        print(f"❌ FAIL: a repeat of a stacked prompt restored {cached} of {n_prompt} (want {n_prompt - 1}: the end-1 cut)"); ec = 1
+if stacked_cut:
+    if cached != n_prompt - 31:
+        print(f"❌ FAIL: a repeat of a stacked prompt restored {cached} of {n_prompt} (want {n_prompt - 31}: the backoff cut)"); ec = 1
     else:
-        print("✅ a repeat of a stacked prompt restores one row short of its end")
+        print("✅ a repeat of a stacked prompt restores at the pass's backoff cut")
 alone = [call(prompt(i, "stack")) for i in range(4)]
 for a in alone:
     a["ids"] = [str(t) for t in post("/tokenize", {"content": "".join(a["tokens"])})["tokens"]]

@@ -348,7 +348,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         c.draft = readDraft(mc.object, &c);
     };
 
-    var p: abi.Parsed = .{ .caps = .{ .moe = true, .images = c.vision != null, .batches_decode = fusedOn(), .captures_conv_input = true, .stacks_prompts = fusedOn(), .end_snapshot = true, .prompt_last_row = true } };
+    var p: abi.Parsed = .{ .caps = .{ .moe = true, .images = c.vision != null, .batches_decode = fusedOn(), .captures_conv_input = true, .stacks_prompts = fusedOn(), .prompt_last_row = true } };
     if (c.draft) |d| if (!stub and dir.exists(dir.ctx, abi.Str.of(draft_file))) {
         p.spec.native_stages = d.layers;
         p.spec.native_block = d.block;
@@ -486,8 +486,8 @@ test "inkling2 config: a vision_config declares images at the image placeholder;
     defer freeParsed(&p);
     const v = of(&p).vision.?;
     try testing.expect(p.caps.images and p.placeholder_ids.image == 200054);
-    // Its one-row forward of the prompt's last token decodes what the final span's row does: the end-1 checkpoint.
-    try testing.expect(p.caps.end_snapshot);
+    // Its one-row forward of the prompt's last token rounds apart from that row inside the final span: no end-1 checkpoint.
+    try testing.expect(!p.caps.end_snapshot);
     try testing.expectEqual(@as(u32, 40), v.block());
     try testing.expectEqual(@as(u32, 4096), v.intermediate());
 
